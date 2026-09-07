@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# Claude Trader — everything below is either a secret, personal financial data,
+# or machine-local state. Reviewed 2026-09-07 before making the repo public.
+# ---------------------------------------------------------------------------
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Secrets: OAuth token for the Claude subscription, SEC contact address.
+.env
+.env.*
+!.env.example
+
+# Database — holds positions, average costs, research reports, P&L history.
+# The -wal/-shm sidecars can hold recently written pages, so exclude them too:
+# ignoring only trader.db would still leak fresh position rows via the WAL.
+data/trader.db
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.sqlite*
+
+# Free-data caches (hundreds of files/day, no value in git).
+data/cache/
+
+# Point-in-time history store, backtest reports, trained models, trials log —
+# tens of MB, fully regenerable with `python -m scripts.data_refresh`.
+data/history/
+
+# Weekly digests — these name your ACTUAL holdings and target weights.
+data/digests/
+
+# Run logs — deep.log/light.log contain IBKR account numbers and holdings.
+*.log
+*.err
+logs/
+data/*.log
+data/*.err
+
+# Machine-local Claude Code state: absolute paths, session ids, allow-list.
+.claude/settings.local.json
+
+# Windows shortcuts parked by scripts/stop_automation.ps1 — binary blobs
+# carrying absolute local paths.
+scripts/disabled_startup/
+*.lnk
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

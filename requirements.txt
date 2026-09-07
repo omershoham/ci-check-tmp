@@ -1,0 +1,21 @@
+# Claude Trader dependencies
+yfinance>=0.2.40
+pandas>=2.2
+numpy>=1.26
+requests>=2.31
+feedparser>=6.0
+pyyaml>=6.0
+python-dotenv>=1.0
+pandas_market_calendars>=4.0
+plotly>=5.22
+streamlit>=1.36
+streamlit-autorefresh>=1.0
+# IBKR (optional at runtime; pipeline degrades gracefully if Gateway is offline)
+ib_async>=1.0
+# Point-in-time history store + backtests (parquet) and the learned ranking pillar
+pyarrow>=15.0
+lightgbm>=4.0
+# Optional: cross-platform process-tree kill for the Claude CLI provider
+psutil>=5.9
+# Dev
+pytest>=8.0

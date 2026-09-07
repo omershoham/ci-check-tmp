@@ -1,0 +1,8 @@
+# Normalise line endings so a Windows checkout and a Mac/Linux checkout produce the
+# same files. PowerShell scripts keep CRLF (Windows tooling expects it).
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.png binary
+*.parquet binary
+*.db binary

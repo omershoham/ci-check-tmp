@@ -1,0 +1,549 @@
+"""Point-in-time fundamentals from SEC XBRL `companyfacts`.
+
+One JSON per company (https://data.sec.gov/api/xbrl/companyfacts/CIK##########.json)
+carries every reported fact with the date it was FILED. Keying on `filed` — never on
+the period end — is the whole point: a 10-K for FY2024 (period end Dec-31) that was
+filed on Feb-25 did not exist for a January decision.
+
+Pipeline:  fetch -> long facts frame -> `raw_asof(symbol, date)` (TTM flows, latest
+instants, price × as-filed shares) -> `analytics.metrics.derive()` -> monthly snapshots.
+
+Scope: the curated universe (one request per CIK). The market-wide Financial
+Statement Data Sets can feed the same `facts` table later for a SIC-derived,
+survivorship-aware universe.
+"""
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from datetime import date
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import requests
+
+from .. import news
+from ..analytics.metrics import derive
+
+_CF_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+
+# concept -> ordered fallback list of us-gaap tags. Flows are period totals; instants
+# are balance-sheet points. Names on the left are what analytics.metrics.derive reads.
+FLOW_TAGS: dict[str, list[str]] = {
+    "totalRevenue": ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
+                     "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueNet"],
+    "netIncome": ["NetIncomeLoss", "NetIncomeLossAvailableToCommonStockholdersBasic",
+                  "ProfitLoss"],
+    "grossProfits": ["GrossProfit"],
+    "operatingIncome": ["OperatingIncomeLoss"],
+    "cfo": ["NetCashProvidedByUsedInOperatingActivities",
+            "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"],
+    "capex": ["PaymentsToAcquirePropertyPlantAndEquipment",
+              "PaymentsToAcquireProductiveAssets"],
+    "dna": ["DepreciationDepletionAndAmortization", "DepreciationAndAmortization",
+            "DepreciationAmortizationAndAccretionNet", "Depreciation"],
+}
+INSTANT_TAGS: dict[str, list[str]] = {
+    "totalAssets": ["Assets"],
+    "totalStockholderEquity": ["StockholdersEquity",
+                               "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
+    "totalCash": ["CashAndCashEquivalentsAtCarryingValue",
+                  "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],
+    "debt_lt": ["LongTermDebtNoncurrent", "LongTermDebt", "LongTermDebtAndCapitalLeaseObligations"],
+    "debt_st": ["LongTermDebtCurrent", "DebtCurrent", "ShortTermBorrowings",
+                "LongTermDebtAndCapitalLeaseObligationsCurrent"],
+}
+SHARES_TAG = ("dei", "EntityCommonStockSharesOutstanding")
+
+_Q_DAYS = (75, 105)      # a fiscal quarter
+_A_DAYS = (340, 380)     # a fiscal year
+
+
+# ---------------------------------------------------------------- fetch/parse
+def fetch_companyfacts(cik: str, pause: float = 0.15) -> dict[str, Any] | None:
+    url = _CF_URL.format(cik=str(cik).zfill(10))
+    try:
+        resp = requests.get(url, headers=news._sec_headers(), timeout=30)
+        time.sleep(pause)                      # SEC fair access: stay well under 10 req/s
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def facts_frame(symbol: str, cik: str, cf: dict[str, Any]) -> pd.DataFrame:
+    """Flatten the tags we use into a long frame. Values in USD (flows/instants) or
+    shares (dei). `start` is NaT for instants."""
+    rows = []
+    facts = cf.get("facts") or {}
+    wanted: list[tuple[str, str, str]] = []           # (namespace, tag, concept)
+    for concept, tags in FLOW_TAGS.items():
+        wanted += [("us-gaap", t, concept) for t in tags]
+    for concept, tags in INSTANT_TAGS.items():
+        wanted += [("us-gaap", t, concept) for t in tags]
+    wanted.append((SHARES_TAG[0], SHARES_TAG[1], "sharesOutstanding"))
+    for ns, tag, concept in wanted:
+        units = ((facts.get(ns) or {}).get(tag) or {}).get("units") or {}
+        unit = "shares" if concept == "sharesOutstanding" else "USD"
+        for it in units.get(unit, []):
+            if it.get("val") is None or not it.get("end") or not it.get("filed"):
+                continue
+            rows.append({"symbol": symbol, "cik": str(cik).zfill(10), "concept": concept,
+                         "tag": tag, "unit": unit, "start": it.get("start"),
+                         "end": it["end"], "val": float(it["val"]), "filed": it["filed"],
+                         "form": it.get("form"), "frame": it.get("frame"),
+                         "fy": it.get("fy"), "fp": it.get("fp")})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    for c in ("start", "end", "filed"):
+        df[c] = pd.to_datetime(df[c], errors="coerce")
+    return df
+
+
+def refresh_facts(store, symbols: list[str], pause: float = 0.15,
+                  log=print) -> dict[str, int]:
+    """Fetch companyfacts for each symbol with a known CIK; replace its rows in the store."""
+    cikmap = news._ticker_cik_map()
+    frames, missing, empty = [], [], []
+    for i, sym in enumerate(symbols, 1):
+        cik = cikmap.get(sym.upper())
+        if not cik:
+            missing.append(sym)
+            continue
+        cf = fetch_companyfacts(cik, pause=pause)
+        if not cf:
+            missing.append(sym)
+            continue
+        df = facts_frame(sym.upper(), cik, cf)
+        if df.empty:
+            empty.append(sym)
+            continue
+        frames.append(df)
+        if i % 10 == 0 or i == len(symbols):
+            log(f"  facts {i}/{len(symbols)}")
+    n = store.upsert_facts(pd.concat(frames, ignore_index=True)) if frames else 0
+    if missing:
+        log(f"  no CIK / fetch failed: {missing}")
+    if empty:
+        log(f"  no usable us-gaap facts: {empty}")
+    return {"rows": n, "fetched": len(frames), "missing": len(missing), "empty": len(empty)}
+
+
+# ------------------------------------------------------ PIT assembly (fast path)
+# Quarter derivation depends only on WHICH filings exist, not on the as-of date, so it
+# is done ONCE per symbol+tag with each period's `filed` date kept; a date then costs a
+# numpy mask (filed<=d & end<=d) instead of a pandas groupby. 55s/symbol -> <1s.
+
+@dataclass
+class _Tab:
+    """Sorted numpy views of one (concept, tag): periods with value + filing date."""
+    start: np.ndarray
+    end: np.ndarray
+    val: np.ndarray
+    filed: np.ndarray
+
+    @classmethod
+    def from_df(cls, df: pd.DataFrame) -> "_Tab":
+        df = df.sort_values(["end", "filed"])
+        return cls(df["start"].values.astype("datetime64[ns]") if "start" in df else np.array([], dtype="datetime64[ns]"),
+                   df["end"].values.astype("datetime64[ns]"), df["val"].values.astype(float),
+                   df["filed"].values.astype("datetime64[ns]"))
+
+    def knowable(self, as_of: np.datetime64) -> "_Tab":
+        m = (self.filed <= as_of) & (self.end <= as_of)
+        return _Tab(self.start[m], self.end[m], self.val[m], self.filed[m])
+
+    def dedupe_by_end(self) -> "_Tab":
+        """Latest filing per period end (restatements count once they are public)."""
+        if len(self.end) == 0:
+            return self
+        # sorted by (end, filed): the last row of each end-group is the latest filing
+        keep = np.r_[self.end[1:] != self.end[:-1], True]
+        return _Tab(self.start[keep], self.end[keep], self.val[keep], self.filed[keep])
+
+
+def _derive_quarters(flow: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(quarters, annual) frames for one tag from ALL its facts. Missing Q4s are derived
+    as FY minus the three quarters inside the FY that were known when the 10-K was
+    filed, and carry the 10-K's filing date — so a derived Q4 is knowable exactly when
+    the annual figure was."""
+    f = flow.dropna(subset=["start"]).copy()
+    if f.empty:
+        e = pd.DataFrame(columns=["start", "end", "val", "filed"])
+        return e, e
+    f["days"] = (f["end"] - f["start"]).dt.days
+    q = f[(f["days"] >= _Q_DAYS[0]) & (f["days"] <= _Q_DAYS[1])][["start", "end", "val", "filed"]]
+    a = f[(f["days"] >= _A_DAYS[0]) & (f["days"] <= _A_DAYS[1])][["start", "end", "val", "filed"]]
+    derived = []
+    if not a.empty and not q.empty:
+        qe, qs, qv, qf = q["end"].values, q["start"].values, q["val"].values, q["filed"].values
+        for ys, ye, yv, yf in zip(a["start"].values, a["end"].values, a["val"].values, a["filed"].values):
+            m = (qs >= ys - np.timedelta64(10, "D")) & (qe < ye) & (qf <= yf)
+            if not m.any():
+                continue
+            # latest filing per quarter end among those knowable at the 10-K filing
+            sub = pd.DataFrame({"end": qe[m], "val": qv[m], "filed": qf[m]}).sort_values(["end", "filed"])
+            sub = sub.drop_duplicates("end", keep="last")
+            already_q4 = np.any(np.abs((qe - ye).astype("timedelta64[D]").astype(int)) <= 10)
+            if len(sub) == 3 and not already_q4:
+                last_end = sub["end"].max()
+                derived.append({"start": last_end + pd.Timedelta(days=1), "end": ye,
+                                "val": float(yv - sub["val"].sum()), "filed": yf})
+    if derived:
+        q = pd.concat([q, pd.DataFrame(derived)], ignore_index=True)
+    return q.sort_values(["end", "filed"]).reset_index(drop=True), a.sort_values(["end", "filed"]).reset_index(drop=True)
+
+
+def _ttm_tab(qt: _Tab, at: _Tab, as_of: np.datetime64) -> float | None:
+    q = qt.knowable(as_of).dedupe_by_end()
+    if len(q.end) >= 4:
+        s, e, v = q.start[-4:], q.end[-4:], q.val[-4:]
+        gaps = (s[1:] - e[:-1]).astype("timedelta64[D]").astype(int)
+        if np.all(gaps <= 12):
+            return float(v.sum())
+    a = at.knowable(as_of).dedupe_by_end()
+    return float(a.val[-1]) if len(a.end) else None
+
+
+def _ttm_prev_tab(qt: _Tab, at: _Tab, as_of: np.datetime64) -> float | None:
+    q = qt.knowable(as_of).dedupe_by_end()
+    if len(q.end) >= 8:
+        s, e, v = q.start[-8:], q.end[-8:], q.val[-8:]
+        gaps = (s[1:] - e[:-1]).astype("timedelta64[D]").astype(int)
+        if np.all(gaps <= 12):
+            return float(v[:4].sum())
+    if len(q.end) == 0:
+        return None
+    latest_end = q.end[-1]
+    a = at.knowable(as_of).dedupe_by_end()
+    if len(a.end) == 0:
+        return None
+    lo, hi = latest_end - np.timedelta64(460, "D"), latest_end - np.timedelta64(240, "D")
+    m = (a.end >= lo) & (a.end <= hi)
+    # If the TTM itself had to fall back to the latest FY (no 4-quarter chain), the
+    # year-earlier base must be strictly older than that FY — otherwise growth reads
+    # exactly 0.0. With a real quarter chain the latest FY is a legitimate base.
+    chain4 = len(q.end) >= 4 and np.all(
+        (q.start[-4:][1:] - q.end[-4:][:-1]).astype("timedelta64[D]").astype(int) <= 12)
+    if not chain4:
+        m &= a.end < a.end[-1]
+    if not m.any():
+        return None
+    target = latest_end - np.timedelta64(365, "D")
+    idx = np.argmin(np.abs((a.end[m] - target).astype("timedelta64[D]").astype(int)))
+    return float(a.val[m][idx])
+
+
+def _instant_tab(it: _Tab, as_of: np.datetime64) -> float | None:
+    k = it.knowable(as_of).dedupe_by_end()
+    return float(k.val[-1]) if len(k.end) else None
+
+
+@dataclass
+class PreparedFacts:
+    """One symbol's facts pre-split per concept/tag into period tables."""
+    flows: dict[str, list[tuple[_Tab, _Tab]]]      # concept -> [(quarters, annual)] in tag order
+    instants: dict[str, list[_Tab]]                # concept -> [tab] in tag order
+
+
+def prepare_symbol(sym_facts: pd.DataFrame) -> PreparedFacts:
+    flows: dict[str, list[tuple[_Tab, _Tab]]] = {}
+    insts: dict[str, list[_Tab]] = {}
+    for concept, tags in FLOW_TAGS.items():
+        g = sym_facts[sym_facts["concept"] == concept]
+        lst = []
+        for tag in tags:
+            gt = g[g["tag"] == tag]
+            if gt.empty:
+                continue
+            q, a = _derive_quarters(gt)
+            lst.append((_Tab.from_df(q) if not q.empty else _Tab.from_df(pd.DataFrame(
+                {"start": pd.Series(dtype="datetime64[ns]"), "end": pd.Series(dtype="datetime64[ns]"),
+                 "val": pd.Series(dtype=float), "filed": pd.Series(dtype="datetime64[ns]")})),
+                        _Tab.from_df(a) if not a.empty else _Tab.from_df(pd.DataFrame(
+                {"start": pd.Series(dtype="datetime64[ns]"), "end": pd.Series(dtype="datetime64[ns]"),
+                 "val": pd.Series(dtype=float), "filed": pd.Series(dtype="datetime64[ns]")}))))
+        if lst:
+            flows[concept] = lst
+    for concept, tags in list(INSTANT_TAGS.items()) + [("sharesOutstanding", [SHARES_TAG[1]])]:
+        g = sym_facts[(sym_facts["concept"] == concept) & (sym_facts["start"].isna())]
+        lst = []
+        for tag in tags:
+            gt = g[g["tag"] == tag]
+            if not gt.empty:
+                lst.append(_Tab.from_df(gt.assign(start=pd.NaT)))
+        if lst:
+            insts[concept] = lst
+    return PreparedFacts(flows, insts)
+
+
+def raw_asof_prepared(pf: PreparedFacts, as_of: date, price: float | None,
+                      ma50: float | None = None, ma200: float | None = None) -> dict[str, Any] | None:
+    ts = np.datetime64(pd.Timestamp(as_of), "ns")
+
+    def flow(concept: str, prev: bool = False) -> float | None:
+        for qt, at in pf.flows.get(concept, []):
+            v = _ttm_prev_tab(qt, at, ts) if prev else _ttm_tab(qt, at, ts)
+            if v is not None:
+                return v
+        return None
+
+    def inst(concept: str) -> float | None:
+        for it in pf.instants.get(concept, []):
+            v = _instant_tab(it, ts)
+            if v is not None:
+                return v
+        return None
+
+    if not pf.flows and not pf.instants:
+        return None
+    rev, rev_prev = flow("totalRevenue"), flow("totalRevenue", prev=True)
+    ni, ni_prev = flow("netIncome"), flow("netIncome", prev=True)
+    cfo, capex = flow("cfo"), flow("capex")
+    opinc, dna = flow("operatingIncome"), flow("dna")
+    shares = inst("sharesOutstanding")
+    d_lt, d_st = inst("debt_lt"), inst("debt_st")
+    debt = None if (d_lt is None and d_st is None) else (d_lt or 0.0) + (d_st or 0.0)
+    if rev is None and ni is None and shares is None and inst("totalAssets") is None:
+        return None
+    return {
+        "price": price,
+        "sharesOutstanding": shares,
+        "marketCap": (price * shares) if (price and shares) else None,
+        "totalRevenue": rev,
+        "netIncome": ni,
+        "grossProfits": flow("grossProfits"),
+        "operatingIncome": opinc,
+        "freeCashflow": (cfo - abs(capex)) if (cfo is not None and capex is not None) else cfo,
+        "ebitda": (opinc + dna) if (opinc is not None and dna is not None) else None,
+        "totalAssets": inst("totalAssets"),
+        "totalStockholderEquity": inst("totalStockholderEquity"),
+        "totalCash": inst("totalCash"),
+        "totalDebt": debt,
+        "revenueGrowth": (rev / rev_prev - 1) if (rev and rev_prev and rev_prev > 0) else None,
+        "earningsGrowth": (ni / ni_prev - 1) if (ni is not None and ni_prev and ni_prev > 0) else None,
+        "fiftyDayAverage": ma50,
+        "twoHundredDayAverage": ma200,
+        "financialCurrency": "USD",
+    }
+
+
+# -------------------------------------------------- PIT assembly (reference path)
+# Kept for tests and single-date use; `build_snapshots` uses the prepared fast path,
+# which implements the same rules.
+def _pit(df: pd.DataFrame, as_of: pd.Timestamp) -> pd.DataFrame:
+    """Facts KNOWABLE on as_of: filed on/before it, period ended on/before it. Among
+    duplicates of the same period keep the latest filing (restatements count only once
+    they were public)."""
+    d = df[(df["filed"] <= as_of) & (df["end"] <= as_of)]
+    if d.empty:
+        return d
+    # Dedupe per concept+tag+period: two concepts reported for the same period are
+    # different facts, not duplicates.
+    return (d.sort_values("filed")
+             .groupby(["concept", "tag", "start", "end"], dropna=False).tail(1))
+
+
+def _quarters(flow: pd.DataFrame) -> pd.DataFrame:
+    """Quarterly periods from a concept's PIT flow facts; derive missing Q4s from FY
+    minus the three quarters inside that fiscal year."""
+    f = flow.dropna(subset=["start"]).copy()
+    if f.empty:
+        return f
+    f["days"] = (f["end"] - f["start"]).dt.days
+    q = f[(f["days"] >= _Q_DAYS[0]) & (f["days"] <= _Q_DAYS[1])].copy()
+    a = f[(f["days"] >= _A_DAYS[0]) & (f["days"] <= _A_DAYS[1])]
+    derived = []
+    for _, yr in a.iterrows():
+        inside = q[(q["start"] >= yr["start"] - pd.Timedelta(days=10)) & (q["end"] < yr["end"])]
+        if len(inside) == 3 and not ((q["end"] - yr["end"]).abs() <= pd.Timedelta(days=10)).any():
+            last_end = inside["end"].max()
+            derived.append({"start": last_end + pd.Timedelta(days=1), "end": yr["end"],
+                            "val": float(yr["val"] - inside["val"].sum()),
+                            "filed": yr["filed"], "days": (yr["end"] - last_end).days})
+    if derived:
+        q = pd.concat([q, pd.DataFrame(derived)], ignore_index=True)
+    return q.sort_values("end").drop_duplicates("end", keep="last")
+
+
+def _ttm(flow: pd.DataFrame, as_of: pd.Timestamp, lag_days: int = 0) -> float | None:
+    """Sum of the 4 most recent consecutive quarters ending <= as_of - lag; falls back
+    to the latest fiscal-year figure when quarters can't be chained."""
+    cutoff = as_of - pd.Timedelta(days=lag_days)
+    q = _quarters(flow)
+    q = q[q["end"] <= cutoff]
+    if len(q) >= 4:
+        last4 = q.tail(4)
+        gaps = last4["start"].values[1:] - last4["end"].values[:-1]
+        if all(pd.Timedelta(g) <= pd.Timedelta(days=12) for g in gaps):
+            return float(last4["val"].sum())
+    f = flow.dropna(subset=["start"]).copy()
+    f["days"] = (f["end"] - f["start"]).dt.days
+    a = f[(f["days"] >= _A_DAYS[0]) & (f["days"] <= _A_DAYS[1]) & (f["end"] <= cutoff)]
+    return float(a.sort_values("end")["val"].iloc[-1]) if not a.empty else None
+
+
+def _ttm_prev(flow: pd.DataFrame, as_of: pd.Timestamp) -> float | None:
+    """The TTM one year BEFORE the latest TTM: quarters 5-8 back when eight chain,
+    else the fiscal year that ended at least ~300 days before the latest quarter end.
+    Defined on quarter boundaries (not a fixed 365-day lag) so YoY growth compares
+    like with like regardless of where as_of falls inside a quarter."""
+    q = _quarters(flow)
+    q = q[q["end"] <= as_of]
+    if len(q) >= 8:
+        last8 = q.tail(8)
+        gaps = last8["start"].values[1:] - last8["end"].values[:-1]
+        if all(pd.Timedelta(g) <= pd.Timedelta(days=12) for g in gaps):
+            return float(last8.head(4)["val"].sum())
+    if q.empty:
+        return None
+    latest_end = q["end"].max()
+    # Fallback: the fiscal-year total whose end is closest to one year before the
+    # latest quarter end (accept 8-15 months back — a FY ending one quarter "late"
+    # is still the best available year-earlier base).
+    f = flow.dropna(subset=["start"]).copy()
+    f["days"] = (f["end"] - f["start"]).dt.days
+    annual_all = f[(f["days"] >= _A_DAYS[0]) & (f["days"] <= _A_DAYS[1]) & (f["end"] <= as_of)]
+    a = annual_all[(annual_all["end"] <= latest_end - pd.Timedelta(days=240))
+                   & (annual_all["end"] >= latest_end - pd.Timedelta(days=460))]
+    # Same rule as the fast path: only when the TTM fell back to the latest FY must the
+    # year-earlier base be strictly older than it.
+    last4 = q.tail(4)
+    chain4 = len(last4) == 4 and all(
+        pd.Timedelta(g) <= pd.Timedelta(days=12)
+        for g in (last4["start"].values[1:] - last4["end"].values[:-1]))
+    if not chain4 and not annual_all.empty:
+        a = a[a["end"] < annual_all["end"].max()]
+    if a.empty:
+        return None
+    target = latest_end - pd.Timedelta(days=365)
+    best = a.iloc[(a["end"] - target).abs().argsort().iloc[0]]
+    return float(best["val"])
+
+
+def _instant(inst: pd.DataFrame, as_of: pd.Timestamp) -> float | None:
+    d = inst[inst["start"].isna()] if "start" in inst else inst
+    if d.empty:
+        return None
+    d = d[d["end"] <= as_of]
+    if d.empty:
+        return None
+    last_end = d["end"].max()
+    return float(d[d["end"] == last_end].sort_values("filed")["val"].iloc[-1])
+
+
+def raw_asof(sym_facts: pd.DataFrame, as_of: date, price: float | None,
+             ma50: float | None = None, ma200: float | None = None) -> dict[str, Any] | None:
+    """Build the raw dict `derive()` expects, as knowable on `as_of`."""
+    ts = pd.Timestamp(as_of)
+    pit = _pit(sym_facts, ts)
+    if pit.empty:
+        return None
+    by = {c: g for c, g in pit.groupby("concept")}
+
+    def flow(concept: str, prev: bool = False) -> float | None:
+        g = by.get(concept)
+        if g is None:
+            return None
+        # honour the tag fallback order: first tag with data wins
+        for tag in FLOW_TAGS.get(concept, []):
+            gt = g[g["tag"] == tag]
+            if not gt.empty:
+                v = _ttm_prev(gt, ts) if prev else _ttm(gt, ts)
+                if v is not None:
+                    return v
+        return None
+
+    def inst(concept: str) -> float | None:
+        g = by.get(concept)
+        if g is None:
+            return None
+        for tag in INSTANT_TAGS.get(concept, []) + [SHARES_TAG[1]]:
+            gt = g[g["tag"] == tag]
+            if not gt.empty:
+                v = _instant(gt, ts)
+                if v is not None:
+                    return v
+        return None
+
+    rev, rev_prev = flow("totalRevenue"), flow("totalRevenue", prev=True)
+    ni, ni_prev = flow("netIncome"), flow("netIncome", prev=True)
+    cfo, capex = flow("cfo"), flow("capex")
+    opinc, dna = flow("operatingIncome"), flow("dna")
+    shares = inst("sharesOutstanding")
+    debt = (inst("debt_lt") or 0.0) + (inst("debt_st") or 0.0)
+    if inst("debt_lt") is None and inst("debt_st") is None:
+        debt = None
+    # Nothing core is knowable yet (e.g. before the first 10-K) -> no snapshot row,
+    # rather than a row of Nones that would score as neutral everywhere.
+    if rev is None and ni is None and shares is None and inst("totalAssets") is None:
+        return None
+    raw: dict[str, Any] = {
+        "price": price,
+        "sharesOutstanding": shares,
+        "marketCap": (price * shares) if (price and shares) else None,
+        "totalRevenue": rev,
+        "netIncome": ni,
+        "grossProfits": flow("grossProfits"),
+        "operatingIncome": opinc,
+        "freeCashflow": (cfo - abs(capex)) if (cfo is not None and capex is not None) else cfo,
+        "ebitda": (opinc + dna) if (opinc is not None and dna is not None) else None,
+        "totalAssets": inst("totalAssets"),
+        "totalStockholderEquity": inst("totalStockholderEquity"),
+        "totalCash": inst("totalCash"),
+        "totalDebt": debt,
+        "revenueGrowth": (rev / rev_prev - 1) if (rev and rev_prev and rev_prev > 0) else None,
+        "earningsGrowth": (ni / ni_prev - 1) if (ni is not None and ni_prev and ni_prev > 0) else None,
+        "fiftyDayAverage": ma50,
+        "twoHundredDayAverage": ma200,
+        "financialCurrency": "USD",
+    }
+    return raw
+
+
+# ---------------------------------------------------------------- snapshots
+def build_snapshots(store, symbols: list[str], dates: list[pd.Timestamp],
+                    log=print) -> pd.DataFrame:
+    """Derived metrics per (as_of, symbol) using only facts filed by as_of and the
+    raw close on/before as_of. Writes to the store and returns the frame."""
+    facts = store.facts(symbols)
+    closes = store.close_matrix(symbols, adjusted=False)
+    if facts.empty or closes.empty:
+        log("  snapshots: facts or prices missing")
+        return pd.DataFrame()
+    ma50 = closes.rolling(50).mean()
+    ma200 = closes.rolling(200).mean()
+    out = []
+    for i, sym in enumerate(symbols, 1):
+        sf = facts[facts["symbol"] == sym]
+        if sf.empty or sym not in closes.columns:
+            continue
+        pf = prepare_symbol(sf)            # once per symbol; each date is then a mask
+        px = closes[sym].dropna()
+        for d in dates:
+            pxd = px[px.index <= d]
+            if pxd.empty:
+                continue
+            price = float(pxd.iloc[-1])
+            m50 = ma50[sym].get(pxd.index[-1])
+            m200 = ma200[sym].get(pxd.index[-1])
+            raw = raw_asof_prepared(pf, d.date(), price,
+                                    None if pd.isna(m50) else float(m50),
+                                    None if pd.isna(m200) else float(m200))
+            if raw is None:
+                continue
+            m = derive(raw, as_of=d.date())
+            m.update({"as_of": d, "symbol": sym, "sharesOutstanding": raw.get("sharesOutstanding"),
+                      "netIncome": raw.get("netIncome"), "totalAssets": raw.get("totalAssets"),
+                      "totalDebt": raw.get("totalDebt"), "totalCash": raw.get("totalCash")})
+            m.pop("earnings_date", None); m.pop("days_to_earnings", None)
+            out.append(m)
+        if i % 10 == 0 or i == len(symbols):
+            log(f"  snapshots {i}/{len(symbols)}")
+    df = pd.DataFrame(out)
+    if not df.empty:
+        store.write_snapshots(df)
+    return df

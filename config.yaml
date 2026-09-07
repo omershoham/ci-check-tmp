@@ -1,0 +1,151 @@
+# Claude Trader configuration
+# Edit thresholds/weights here; no code changes needed for tuning.
+
+paths:
+  db: data/trader.db
+  cache: data/cache
+
+universe:
+  # Hard liquidity/size floor applied BEFORE scoring (Q&A: "standard floor")
+  liquidity_floor:
+    min_market_cap: 300000000      # $300M
+    min_price: 5.0                 # $
+    min_avg_dollar_volume: 5000000 # $5M average daily traded value
+
+  # Curated AI-infra universe across the four sub-sectors.
+  # Sub-sector membership also feeds the Deal score (relevance to hyperscaler capex).
+  # You can pin/exclude names from the dashboard later; this is the auto-built base.
+  sectors:
+    semis_equipment:
+      [NVDA, AMD, AVGO, TSM, ASML, AMAT, LRCX, KLAC, MU, INTC, QCOM, MRVL,
+       TXN, ARM, ADI, NXPI, "ON", MCHP, MPWR, SWKS, QRVO, TER, ENTG, ACLS,
+       CRDO, ALAB, SITM, RMBS, AMBA, WOLF, POWI, LSCC, ONTO, FORM, AEHR, INDI]
+    datacenter_power:
+      [VRT, ETN, PWR, GEV, CEG, VST, NRG, TLN, OKLO, SMR, NNE, EQIX, DLR,
+       CARR, JCI, NVT, HUBB, FLEX, BWXT, SMCI, DELL, HPE, MOD, PEG, SO, DUK, D, IREN]
+    networking_optical:
+      [ANET, CSCO, COHR, LITE, CIEN, AAOI, FN, GLW, NTGR, EXTR]   # JNPR removed 2026-09-07: acquired/delisted (no prices, no SEC filings)
+    cloud_ai_software:
+      [MSFT, GOOGL, GOOG, AMZN, ORCL, META, CRM, NOW, SNOW, DDOG, NET, MDB, PLTR,
+       CRWD, ZS, PANW, FTNT, ESTC, GTLB, S, DT, ADBE, IBM, AI, PATH,   # CFLT removed 2026-09-07: delisted (Yahoo 404, no SEC filings)
+       AKAM, FSLY, TWLO, OKTA, WDAY, INTU]
+
+screen:
+  shortlist_size: 35   # passed from quant screen to local-LLM signal stage
+  finalist_size: 10    # passed to Claude deep research (the cost cap)
+  earnings_soon_days: 7  # tag a name "earnings-soon" if it reports within this many days
+
+# Your investment policy — every stage (deep dives, PM reconcile, sizing hints, digest)
+# optimizes against THESE numbers, not implicit defaults. Edit to taste.
+policy:
+  max_position_weight: 20        # % of portfolio; above this requires high conviction
+  high_weight_min_conviction: 7  # conviction needed to keep a >max_position_weight position in full
+  conviction_weight_caps:        # conviction -> max % weight (binding sizing rules)
+    3: 10                        # conviction <=3 -> max 10% weight
+    5: 15                        # conviction 4-5 -> max 15% weight
+  max_subsector_weight: 40       # % of portfolio in a single sub-sector before it's flagged
+  min_ballast_weight: 10         # % target of non-AI-theme ballast the synthesis should aim for
+  risk_per_position_pct: 1.0     # % of portfolio value risked per new position (sizing hint)
+  vol_target_pct: 12             # realized book vol above this -> PM scales gross exposure down (never up)
+  drawdown_tighten_pct: 10       # book this far below its 90d peak -> conviction caps tighten a further 25%
+  # Non-AI diversifier candidates the portfolio stage may recommend (outside the screen universe).
+  ballast_watchlist: [TLT, IEF, GLD, XLP, XLV, SCHD, VXUS]
+
+# How past calls are graded (Accuracy tab, learning loop). Honest measurement rules:
+# buy calls pay a round-trip cost; hold/screen-only are the do-nothing alternative.
+evaluation:
+  cost_bps: 30                   # round-trip spread+slippage charged to buy/strong_buy calls
+  min_n_for_ci: 8                # calibration cells with fewer graded calls are flagged unreliable
+
+risk:
+  benchmark: QQQ                 # portfolio beta reference
+  theme_benchmark: SMH           # theme-shock proxy (defaults to technical.rs_benchmark if unset)
+
+regime:
+  enabled: true
+  benchmark: SPY                 # regime anchor: price vs 200dma
+  breadth_threshold_pct: 40      # universe breadth below this (% above 50dma) = stress
+
+scoring:
+  # Three-pillar composite ranking score (balanced; tune for your horizon).
+  pillars:
+    technical: 0.35    # RSI, MACD, SMA trend/crosses, 52w position, volume (src/technical.py)
+    fundamental: 0.30  # valuation, cashflow, growth, quality (yfinance)
+    sentiment: 0.35    # local-LLM news sentiment + hyperscaler-deal signal
+    learned: 0.0       # ML ranking pillar (src/ml). SHIPPED DARK: raise only after
+                       # `python -m scripts.train_ranker` reports every kill criterion PASSED.
+                       # Any value > 0 bumps score_version to 4 automatically.
+  learned:
+    enabled: true      # compute + persist the pillar when a trained model exists (even at weight 0)
+    force: false       # weight the pillar even if the kill criteria did not pass (don't)
+  quality:
+    require_positive_fcf_for_tag: true
+    subweights:        # each subscore normalized 0..1 across the universe
+      valuation: 0.30  # PE, fwd PE, P/FCF, PEG, EV/EBITDA (cheaper = higher)
+      cashflow: 0.30   # FCF yield, FCF growth
+      growth: 0.20     # revenue & EPS growth
+      quality: 0.20    # margins, ROE/ROIC, low debt
+  deal:
+    subweights:
+      subsector_relevance: 0.35  # static base by sub-sector
+      hyperscaler_signal: 0.45   # from local LLM (Stage 2)
+      momentum: 0.20             # price vs 50/200 DMA
+  tags:
+    deal_threshold: 0.60
+    quality_threshold: 0.60
+    higher_risk:
+      flag_if_unprofitable: true
+      pe_risk_ceiling: 60        # PE above this (or N/A) is flagged higher-risk
+
+news:
+  # SEC EDGAR fair-access wants a contact address in the request User-Agent.
+  # Prefer SEC_CONTACT_EMAIL in .env (git-ignored) — this file IS committed, so an
+  # address left here becomes public the moment the repo does.
+  sec_contact: ""
+
+local_llm:
+  enabled: true
+  model: qwen3.5:9b
+  think: false                   # qwen3.5 is a reasoning model; disable <think> for fast clean JSON
+  host: http://localhost:11434
+  timeout_seconds: 120
+
+# Technical-analysis data sources.
+technical:
+  benchmark: SPY        # pick-snapshot benchmark (recorded alongside picks for grading)
+  rs_benchmark: SMH     # relative-strength peer benchmark ("leadership" = beating the theme)
+
+llm:
+  # claude_cli   = headless `claude -p` on your Claude Code SUBSCRIPTION (default; the only
+  #                provider with --resume sessions and file/shell tools for Investigate mode)
+  # anthropic_api = official SDK with ANTHROPIC_API_KEY (bring your own key, per-token billing)
+  provider: claude_cli
+
+claude:
+  # Runs on the Claude Code subscription via CLAUDE_CODE_OAUTH_TOKEN.
+  # IMPORTANT: ANTHROPIC_API_KEY must be UNSET or it switches to per-token billing.
+  model: claude-opus-4-8
+  force_subscription: true       # strip ANTHROPIC_API_KEY from the subprocess env
+  allowed_tools: "WebSearch,WebFetch"
+  timeout_seconds: 600           # per-call timeout (subprocess is tree-killed on expiry)
+  chat_timeout_seconds: 240      # dashboard chat: quick-mode per-question timeout
+  chat_investigate_timeout_seconds: 900  # investigate mode (agentic, reads code+DB)
+  deep_run_budget_seconds: 5400  # overall wall-clock cap for the finalist loop (90 min; 0 = no cap)
+  max_finalists: 10              # hard cap on Claude calls per deep run
+  red_team: true                 # devil's-advocate pass on buy-rated finalists (extra call each)
+
+ibkr:
+  enabled: true
+  host: 127.0.0.1
+  port: 4001                     # IB Gateway live=4001 (via IBC); TWS live=7496, paper=7497
+  client_id: 17
+  connect_timeout: 8
+  positions_wait: 3.0            # minimum wait (s) for per-account position bursts
+  positions_quiet: 3.0           # stop once no new position rows arrive for this long
+  positions_max_wait: 25.0       # hard cap; a cold Gateway can take ~8s to send the first row
+  market_data_type: 3            # 1=realtime (needs paid API data), 3=delayed (free), 4=delayed-frozen
+
+schedule:
+  # Run times live in the Windows scheduled tasks (scripts/setup_windows_tasks.ps1
+  # -DeepTime/-LightTime): deep ~07:00 ET, light ~16:15 ET (convert to your local time).
+  skip_when_market_closed: true  # skip weekends + NYSE holidays (run_daily checks before running)
