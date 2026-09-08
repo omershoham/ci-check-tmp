@@ -56,3 +56,6 @@ scripts/disabled_startup/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Personal documents dropped in the repo root must never be committed (README: code and config only)
+*.pdf
