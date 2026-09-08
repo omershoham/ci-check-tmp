@@ -46,10 +46,13 @@ def run_one(name: str, store: HistoryStore, start: date, top_frac: float, top_n:
     uni = universe.build_universe()
     syms = [u["symbol"] for u in uni]
     subs = {u["symbol"]: u["subsector"] for u in uni}
-    closes = store.close_matrix(None, adjusted=True)
-    if closes.empty:
+    have = set(store.symbols_with_prices())
+    if not have:
         raise SystemExit("history store has no prices — run scripts.data_refresh first")
-    syms = [s for s in syms if s in closes.columns]
+    # Membership is a set question; it used to be answered by pivoting the whole store
+    # into a date x symbol matrix and reading `.columns`.
+    syms = [s for s in syms if s in have]
+    closes = store.close_matrix(None, adjusted=True)
     dates = month_ends(start, date.today())
     _log(f"{name}: {len(syms)} symbols, {len(dates)} month-ends from {start}")
     scores = build_signal(name, store, syms, subs, dates, closes)

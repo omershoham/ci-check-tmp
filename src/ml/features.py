@@ -15,7 +15,7 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 
-from .. import technical
+from .. import parallel, technical
 
 FEATURE_VERSION = 1
 
@@ -41,56 +41,65 @@ def _cross_days(sma_fast: pd.Series, sma_slow: pd.Series, lookback: int = 250) -
     return 999.0, 999.0
 
 
+def _technical_features_one(payload: tuple) -> list[dict]:
+    """One symbol's feature rows across every as-of date. Module-level and frame-only
+    so a spawned worker can run it (see src/parallel.py)."""
+    sym, g, dates, bench_close = payload
+    rows = []
+    b63 = b126 = None
+    f = (g["adj_close"] / g["close"]).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    frame = pd.DataFrame({"Open": g["open"] * f, "High": g["high"] * f, "Low": g["low"] * f,
+                          "Close": g["adj_close"], "Volume": g["volume"]})
+    for d in dates:
+        win = frame.loc[:d].tail(520)
+        if len(win) < 260:
+            continue
+        try:
+            ind = technical._compute_one(win)
+        except Exception:  # noqa: BLE001
+            ind = None
+        if not ind:
+            continue
+        close = win["Close"]
+        rets = close.pct_change().dropna()
+        rec = {"as_of": d, "symbol": sym,
+               "rsi": ind.get("rsi"), "macd_hist": ind.get("macd_hist"),
+               "atr_pct": ind.get("atr_pct"), "pos_52w": ind.get("pos_52w"),
+               "vol_trend": ind.get("vol_trend"), "ret_20": ind.get("ret_20"),
+               "ret_63": ind.get("ret_63"), "ret_126": ind.get("ret_126"),
+               "ret_252_21": ind.get("ret_252_21"), "mom_va": ind.get("mom_va"),
+               "technical_score": ind.get("technical_score"),
+               "px_sma50": (ind["price"] / ind["sma50"]) if ind.get("sma50") else None,
+               "px_sma200": (ind["price"] / ind["sma200"]) if ind.get("sma200") else None,
+               "sma50_200": (ind["sma50"] / ind["sma200"]) if ind.get("sma50") and ind.get("sma200") else None,
+               "vol_20": float(rets.tail(20).std() * np.sqrt(252)) if len(rets) >= 20 else None,
+               "vol_60": float(rets.tail(60).std() * np.sqrt(252)) if len(rets) >= 60 else None,
+               "mdd_63": float((close.tail(63) / close.tail(63).cummax() - 1).min()),
+               "dollar_vol": float(np.log1p((close.tail(20) * win["Volume"].tail(20)).mean()))
+               if "Volume" in win and win["Volume"].notna().any() else None}
+        g_days, d_days = _cross_days(close.rolling(50).mean(), close.rolling(200).mean())
+        rec["golden_cross_days"], rec["death_cross_days"] = g_days, d_days
+        if bench_close is not None:
+            bc = bench_close.loc[:d].dropna()
+            b63, b126 = technical._ret(bc, 63), technical._ret(bc, 126)
+        rec["rs_3m"] = (rec["ret_63"] - b63) if (rec["ret_63"] is not None and b63 is not None) else None
+        rec["rs_6m"] = (rec["ret_126"] - b126) if (rec["ret_126"] is not None and b126 is not None) else None
+        rows.append(rec)
+    return rows
+
+
 def technical_replay(ohlcv: pd.DataFrame, dates: list[pd.Timestamp], bench_close: pd.Series | None,
-                     log: Callable[[str], None] | None = None) -> pd.DataFrame:
+                     log: Callable[[str], None] | None = None,
+                     workers: int | None = None) -> pd.DataFrame:
     """Long frame (as_of, symbol, <TECH_FEATURES minus sector_rel_mom>) from trailing
     windows of adjusted OHLCV. Shared with backtest.signals.technical_pillar."""
-    rows = []
     by_sym = {s: g.set_index("date").sort_index() for s, g in ohlcv.groupby("symbol")}
-    n = len(by_sym)
-    b63 = b126 = None
-    for i, (sym, g) in enumerate(by_sym.items(), 1):
-        f = (g["adj_close"] / g["close"]).replace([np.inf, -np.inf], np.nan).fillna(1.0)
-        frame = pd.DataFrame({"Open": g["open"] * f, "High": g["high"] * f, "Low": g["low"] * f,
-                              "Close": g["adj_close"], "Volume": g["volume"]})
-        for d in dates:
-            win = frame.loc[:d].tail(520)
-            if len(win) < 260:
-                continue
-            try:
-                ind = technical._compute_one(win)
-            except Exception:  # noqa: BLE001
-                ind = None
-            if not ind:
-                continue
-            close = win["Close"]
-            rets = close.pct_change().dropna()
-            rec = {"as_of": d, "symbol": sym,
-                   "rsi": ind.get("rsi"), "macd_hist": ind.get("macd_hist"),
-                   "atr_pct": ind.get("atr_pct"), "pos_52w": ind.get("pos_52w"),
-                   "vol_trend": ind.get("vol_trend"), "ret_20": ind.get("ret_20"),
-                   "ret_63": ind.get("ret_63"), "ret_126": ind.get("ret_126"),
-                   "ret_252_21": ind.get("ret_252_21"), "mom_va": ind.get("mom_va"),
-                   "technical_score": ind.get("technical_score"),
-                   "px_sma50": (ind["price"] / ind["sma50"]) if ind.get("sma50") else None,
-                   "px_sma200": (ind["price"] / ind["sma200"]) if ind.get("sma200") else None,
-                   "sma50_200": (ind["sma50"] / ind["sma200"]) if ind.get("sma50") and ind.get("sma200") else None,
-                   "vol_20": float(rets.tail(20).std() * np.sqrt(252)) if len(rets) >= 20 else None,
-                   "vol_60": float(rets.tail(60).std() * np.sqrt(252)) if len(rets) >= 60 else None,
-                   "mdd_63": float((close.tail(63) / close.tail(63).cummax() - 1).min()),
-                   "dollar_vol": float(np.log1p((close.tail(20) * win["Volume"].tail(20)).mean()))
-                   if "Volume" in win and win["Volume"].notna().any() else None}
-            g_days, d_days = _cross_days(close.rolling(50).mean(), close.rolling(200).mean())
-            rec["golden_cross_days"], rec["death_cross_days"] = g_days, d_days
-            if bench_close is not None:
-                bc = bench_close.loc[:d].dropna()
-                b63, b126 = technical._ret(bc, 63), technical._ret(bc, 126)
-            rec["rs_3m"] = (rec["ret_63"] - b63) if (rec["ret_63"] is not None and b63 is not None) else None
-            rec["rs_6m"] = (rec["ret_126"] - b126) if (rec["ret_126"] is not None and b126 is not None) else None
-            rows.append(rec)
-        if log and (i % 20 == 0 or i == n):
-            log(f"  technical replay {i}/{n}")
-    return pd.DataFrame(rows)
+    chunks = parallel.replay_symbols(
+        _technical_features_one,
+        [(sym, g, dates, bench_close) for sym, g in by_sym.items()],
+        workers=workers, log=log, label="technical replay",
+        work=len(by_sym) * len(dates))
+    return pd.DataFrame(parallel.flatten(chunks))
 
 
 def regime_replay(closes_adj: pd.DataFrame, bench: str, dates: list[pd.Timestamp]) -> pd.DataFrame:

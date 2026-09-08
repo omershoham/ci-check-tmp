@@ -46,10 +46,11 @@ def main() -> None:
     uni = universe.build_universe()
     syms = [u["symbol"] for u in uni]
     subs = {u["symbol"]: u["subsector"] for u in uni}
-    closes = store.close_matrix(None, adjusted=True)
-    if closes.empty:
+    have = set(store.symbols_with_prices())
+    if not have:
         raise SystemExit("no prices in the history store — run scripts.data_refresh first")
-    syms = [s for s in syms if s in closes.columns]
+    syms = [s for s in syms if s in have]   # a set question, not a full pivot
+    closes = store.close_matrix(None, adjusted=True)
     dates = month_ends(date.fromisoformat(args.start), date.today())
 
     fpath = root / "features.parquet"

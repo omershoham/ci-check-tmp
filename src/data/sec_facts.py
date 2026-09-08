@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-from .. import news
+from .. import news, parallel
 from ..analytics.metrics import derive
 
 _CF_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
@@ -617,45 +617,59 @@ def raw_asof(sym_facts: pd.DataFrame, as_of: date, price: float | None,
 
 
 # ---------------------------------------------------------------- snapshots
+def _snapshot_symbol(payload: tuple) -> list[dict[str, Any]]:
+    """One symbol's rows across every as-of date. Module-level and store-free so it can
+    be shipped to a spawned worker (see src/parallel.py); it receives plain frames."""
+    sym, sf, px, ma50, ma200, dates = payload
+    pf = prepare_symbol(sf)                # once per symbol; each date is then a mask
+    out = []
+    for d in dates:
+        pxd = px[px.index <= d]
+        if pxd.empty:
+            continue
+        price = float(pxd.iloc[-1])
+        m50 = ma50.get(pxd.index[-1])
+        m200 = ma200.get(pxd.index[-1])
+        raw = raw_asof_prepared(pf, d.date(), price,
+                                None if pd.isna(m50) else float(m50),
+                                None if pd.isna(m200) else float(m200))
+        if raw is None:
+            continue
+        m = derive(raw, as_of=d.date())
+        m.update({"as_of": d, "symbol": sym, "sharesOutstanding": raw.get("sharesOutstanding"),
+                  "netIncome": raw.get("netIncome"), "totalAssets": raw.get("totalAssets"),
+                  "totalDebt": raw.get("totalDebt"), "totalCash": raw.get("totalCash")})
+        m.pop("earnings_date", None); m.pop("days_to_earnings", None)
+        out.append(m)
+    return out
+
+
 def build_snapshots(store, symbols: list[str], dates: list[pd.Timestamp],
-                    log=print) -> pd.DataFrame:
+                    log=print, workers: int | None = None) -> pd.DataFrame:
     """Derived metrics per (as_of, symbol) using only facts filed by as_of and the
-    raw close on/before as_of. Writes to the store and returns the frame."""
+    raw close on/before as_of. Writes to the store and returns the frame.
+
+    Symbols are independent, so the O(symbols x dates) double loop is farmed out to a
+    process pool; `workers=1` is the old serial loop, byte for byte."""
     facts = store.facts(symbols)
-    closes = store.close_matrix(symbols, adjusted=False)
+    # Bound the pivot to the window the snapshot grid can actually read: the 200-day
+    # moving average needs ~a year of lead-in, nothing needs the years before that.
+    lo = (min(dates) - pd.Timedelta(days=600)).date() if dates else None
+    hi = max(dates).date() if dates else None
+    closes = store.close_matrix(symbols, adjusted=False, start=lo, end=hi)
     if facts.empty or closes.empty:
         log("  snapshots: facts or prices missing")
         return pd.DataFrame()
     ma50 = closes.rolling(50).mean()
     ma200 = closes.rolling(200).mean()
-    out = []
-    for i, sym in enumerate(symbols, 1):
-        sf = facts[facts["symbol"] == sym]
-        if sf.empty or sym not in closes.columns:
-            continue
-        pf = prepare_symbol(sf)            # once per symbol; each date is then a mask
-        px = closes[sym].dropna()
-        for d in dates:
-            pxd = px[px.index <= d]
-            if pxd.empty:
-                continue
-            price = float(pxd.iloc[-1])
-            m50 = ma50[sym].get(pxd.index[-1])
-            m200 = ma200[sym].get(pxd.index[-1])
-            raw = raw_asof_prepared(pf, d.date(), price,
-                                    None if pd.isna(m50) else float(m50),
-                                    None if pd.isna(m200) else float(m200))
-            if raw is None:
-                continue
-            m = derive(raw, as_of=d.date())
-            m.update({"as_of": d, "symbol": sym, "sharesOutstanding": raw.get("sharesOutstanding"),
-                      "netIncome": raw.get("netIncome"), "totalAssets": raw.get("totalAssets"),
-                      "totalDebt": raw.get("totalDebt"), "totalCash": raw.get("totalCash")})
-            m.pop("earnings_date", None); m.pop("days_to_earnings", None)
-            out.append(m)
-        if i % 10 == 0 or i == len(symbols):
-            log(f"  snapshots {i}/{len(symbols)}")
-    df = pd.DataFrame(out)
+    by_sym = {s: g for s, g in facts.groupby("symbol", sort=False)}
+    payloads = [(sym, by_sym[sym], closes[sym].dropna(), ma50[sym], ma200[sym], dates)
+                for sym in symbols
+                if sym in by_sym and not by_sym[sym].empty and sym in closes.columns]
+    chunks = parallel.replay_symbols(_snapshot_symbol, payloads, workers=workers,
+                                     log=log, label="snapshots", every=10,
+                                     work=len(payloads) * len(dates))
+    df = pd.DataFrame(parallel.flatten(chunks))
     if not df.empty:
         store.write_snapshots(df)
     return df

@@ -39,6 +39,9 @@ def main() -> None:
                          "every filer. O(1) in universe size; use for a broad universe")
     ap.add_argument("--from-quarter", default="2015q1",
                     help="first FSDS quarter to ingest, e.g. 2015q1")
+    ap.add_argument("--refetch-quarters", action="store_true",
+                    help="re-ingest FSDS quarters already in the store (only needed "
+                         "when the PARSE changed; a published ZIP never does)")
     ap.add_argument("--snapshots", action="store_true")
     ap.add_argument("--symbols", nargs="*", help="subset (default: whole universe)")
     ap.add_argument("--period", default="10y", help="yfinance period for prices")
@@ -49,6 +52,10 @@ def main() -> None:
     store = HistoryStore()
     syms = [s.upper() for s in args.symbols] if args.symbols else universe.symbols()
     _log(f"store: {store.root}")
+    # A store written before Phase 2 is one file per table; convert it before anything
+    # reads it, so the first refresh after an upgrade is where the cost is paid and
+    # logged rather than inside whatever happened to touch the store first.
+    store.migrate_layout(log=_log)
     _log(f"universe: {len(syms)} symbols")
 
     if do_all or args.prices:
@@ -65,7 +72,7 @@ def main() -> None:
         _log(f"facts (bulk): FSDS quarters from {args.from_quarter}")
         # `symbols` restricts the ingest; pass None once the universe is broad.
         res = sec_fsds.refresh_facts_bulk(store, syms, start_quarter=args.from_quarter,
-                                          log=_log)
+                                          force=args.refetch_quarters, log=_log)
         _log(f"facts (bulk): {res}")
 
     if do_all or args.snapshots:

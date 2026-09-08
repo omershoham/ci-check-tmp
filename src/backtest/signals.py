@@ -15,7 +15,7 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 
-from .. import config, scoring, technical
+from .. import config, parallel, scoring, technical
 
 
 def _rank01(row: pd.Series) -> pd.Series:
@@ -34,30 +34,46 @@ def momentum_12_1(closes_adj: pd.DataFrame, dates: list[pd.Timestamp]) -> pd.Dat
     return pd.DataFrame(out).T.sort_index()
 
 
+def _technical_scores_one(payload: tuple) -> dict:
+    """One symbol's technical_score per date. Module-level and frame-only so a spawned
+    worker can run it (see src/parallel.py)."""
+    g, dates = payload
+    # adjust OHLC by the same factor as close so indicators see a consistent series
+    f = (g["adj_close"] / g["close"]).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    frame = pd.DataFrame({"Open": g["open"] * f, "High": g["high"] * f, "Low": g["low"] * f,
+                          "Close": g["adj_close"], "Volume": g["volume"]})
+    out: dict = {}
+    for d in dates:
+        win = frame.loc[:d].tail(520)
+        if len(win) < 260:
+            continue
+        try:
+            ind = technical._compute_one(win)
+        except Exception:  # noqa: BLE001
+            ind = None
+        if ind:
+            out[d] = ind["technical_score"]
+    return out
+
+
 def technical_pillar(ohlcv: pd.DataFrame, dates: list[pd.Timestamp],
-                     log: Callable[[str], None] | None = None) -> pd.DataFrame:
+                     log: Callable[[str], None] | None = None,
+                     workers: int | None = None) -> pd.DataFrame:
     """Replay `technical._compute_one` per symbol per date on the trailing 2y window.
-    `ohlcv` is the long price frame from the store (adjusted OHLC used for indicators)."""
-    out: dict[pd.Timestamp, dict[str, float]] = {}
+    `ohlcv` is the long price frame from the store (adjusted OHLC used for indicators).
+
+    Symbols are independent; the pool keeps results in symbol order so the score
+    frame's column order — which breaks ties when the engine cuts the top decile —
+    is exactly what the serial loop produced."""
     by_sym = {s: g.set_index("date").sort_index() for s, g in ohlcv.groupby("symbol")}
-    n = len(by_sym)
-    for i, (sym, g) in enumerate(by_sym.items(), 1):
-        # adjust OHLC by the same factor as close so indicators see a consistent series
-        f = (g["adj_close"] / g["close"]).replace([np.inf, -np.inf], np.nan).fillna(1.0)
-        frame = pd.DataFrame({"Open": g["open"] * f, "High": g["high"] * f, "Low": g["low"] * f,
-                              "Close": g["adj_close"], "Volume": g["volume"]})
-        for d in dates:
-            win = frame.loc[:d].tail(520)
-            if len(win) < 260:
-                continue
-            try:
-                ind = technical._compute_one(win)
-            except Exception:  # noqa: BLE001
-                ind = None
-            if ind:
-                out.setdefault(d, {})[sym] = ind["technical_score"]
-        if log and (i % 20 == 0 or i == n):
-            log(f"  technical replay {i}/{n}")
+    scored = parallel.replay_symbols(_technical_scores_one,
+                                     [(g, dates) for g in by_sym.values()],
+                                     workers=workers, log=log, label="technical replay",
+                                     work=len(by_sym) * len(dates))
+    out: dict[pd.Timestamp, dict[str, float]] = {}
+    for sym, per_date in zip(by_sym, scored):
+        for d, v in per_date.items():
+            out.setdefault(d, {})[sym] = v
     return pd.DataFrame(out).T.sort_index()
 
 

@@ -161,3 +161,92 @@ def test_history_store_roundtrip_and_pit_snapshot_lookup(tmp_path):
     assert "recorded snapshot" in store.universe_source(date(2024, 3, 1))
     assert "hindsight" in store.universe_source(date(2023, 1, 1))
     assert store.manifest()["prices"]["rows"] == 3
+
+
+# ---------------------------------------------------- partitioned store (Phase 2)
+def _px(sym, dates, close):
+    return pd.DataFrame({"date": pd.to_datetime(dates), "symbol": sym,
+                         "open": close, "high": close, "low": close, "close": close,
+                         "adj_close": close, "volume": [1_000.0] * len(dates)})
+
+
+def test_append_plus_compact_equals_upsert(tmp_path):
+    """`upsert_prices` is append + compact; the two must land the same bytes, or the
+    daily fast path and the batch path have quietly forked."""
+    a = _px("AAA", ["2023-12-28", "2023-12-29", "2024-01-02"], [10.0, 11.0, 12.0])
+    b = _px("AAA", ["2024-01-02", "2024-01-03"], [99.0, 13.0])       # 01-02 restated
+    ref = HistoryStore(tmp_path / "ref")
+    ref.upsert_prices(a)
+    ref.upsert_prices(b)
+
+    inc = HistoryStore(tmp_path / "inc")
+    inc.append_prices(a)
+    inc.append_prices(b)
+    # before compaction the duplicate is visible — that is the documented contract
+    assert len(inc.prices()) == 5
+    inc.compact_prices([2024])
+    assert ref.prices().equals(inc.prices())
+    assert inc.prices().set_index(["symbol", "date"]).loc[("AAA", pd.Timestamp("2024-01-02")), "close"] == 99.0
+    assert ref.manifest()["prices"]["rows"] == inc.manifest()["prices"]["rows"] == 4
+    # one directory per year, and 2023 was never rewritten by the second write
+    assert sorted(p.name for p in (inc.prices_dir).glob("year=*")) == ["year=2023", "year=2024"]
+
+
+def test_partition_pruning_matches_a_full_read(tmp_path):
+    store = HistoryStore(tmp_path / "hist")
+    store.upsert_prices(pd.concat([
+        _px("AAA", ["2022-06-01", "2023-06-01", "2024-06-01"], [1.0, 2.0, 3.0]),
+        _px("BBB", ["2022-06-01", "2023-06-01", "2024-06-01"], [4.0, 5.0, 6.0])]))
+    full = store.prices()
+    win = store.prices(["AAA"], start=date(2023, 1, 1), end=date(2023, 12, 31))
+    expect = full[(full["symbol"] == "AAA") & (full["date"].dt.year == 2023)].reset_index(drop=True)
+    assert win.equals(expect)
+    assert store.close_matrix(start=date(2023, 1, 1), end=date(2023, 12, 31)).shape == (1, 2)
+    assert store.symbols_with_prices() == ["AAA", "BBB"]
+    assert store.last_date() == pd.Timestamp("2024-06-01")
+
+
+def test_shares_asof_never_sees_the_future(tmp_path, facts):
+    store = HistoryStore(tmp_path / "hist")
+    store.upsert_facts(facts)
+    # the 2024-10-31 count was filed 2024-11-07: invisible the day before, served after
+    assert store.shares_asof(["TST"], date(2024, 11, 6)).loc["TST"] == 50
+    assert store.shares_asof(["TST"], date(2024, 11, 8)).loc["TST"] == 52
+    assert store.shares_asof(["TST"], date(2024, 2, 1)).empty
+    assert store.facts_quarters() == ["2023q2", "2023q3", "2023q4", "2024q1", "2024q2",
+                                      "2024q3", "2024q4"]
+    # A quarter directory exists because companyfacts filed into it — the bulk path
+    # must not read that as "the DERA ZIP for 2024q1 is already ingested".
+    assert store.facts_quarters(source="fsds") == []
+    store.append_facts_quarter("2024q1", facts[facts["filed"] == "2024-02-25"],
+                               source="fsds")
+    assert store.facts_quarters(source="fsds") == ["2024q1"]
+
+
+def test_legacy_single_file_store_is_migrated_in_place(tmp_path):
+    """The layout an existing checkout has on disk must survive the upgrade untouched."""
+    root = tmp_path / "hist"
+    px = _px("AAA", ["2023-12-29", "2024-01-02"], [10.0, 11.0])
+    (root / "prices").mkdir(parents=True)
+    px.to_parquet(root / "prices" / "daily.parquet", index=False)
+    store = HistoryStore(root)
+    got = store.prices()                                   # lazy migration on first read
+    assert got["close"].tolist() == [10.0, 11.0]
+    assert not (root / "prices" / "daily.parquet").exists()
+    assert (root / "prices" / "daily.parquet.migrated").exists()   # original kept
+    assert sorted(p.name for p in (root / "prices" / "daily").glob("year=*")) == \
+        ["year=2023", "year=2024"]
+
+
+def test_snapshot_replay_is_identical_serial_and_parallel(tmp_path, facts):
+    """The process pool exists to be faster, not different: same rows, same order."""
+    from src.data import sec_facts as SF
+    store = HistoryStore(tmp_path / "hist")
+    store.upsert_facts(pd.concat([facts, facts.assign(symbol="TST2")], ignore_index=True))
+    days = pd.bdate_range("2023-01-02", "2024-12-31")
+    store.upsert_prices(pd.concat([
+        _px("TST", days, [20.0] * len(days)), _px("TST2", days, [30.0] * len(days))]))
+    dates = [pd.Timestamp("2024-06-28"), pd.Timestamp("2024-12-31")]
+    one = SF.build_snapshots(store, ["TST", "TST2"], dates, log=lambda m: None, workers=1)
+    many = SF.build_snapshots(store, ["TST", "TST2"], dates, log=lambda m: None, workers=2)
+    assert not one.empty and one.equals(many)

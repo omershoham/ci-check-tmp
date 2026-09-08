@@ -216,12 +216,24 @@ def parse_quarter(zip_path: Path, keep_ciks: set[str] | None = None,
 
 def refresh_facts_bulk(store, symbols: list[str] | None = None,
                        start_quarter: str = "2015q1", end_quarter: str | None = None,
+                       force: bool = False,
                        log: Callable[[str], None] = print) -> dict[str, Any]:
-    """Ingest quarterly ZIPs into the store's `facts` table.
+    """Ingest quarterly ZIPs into the store's `facts` table, one quarter at a time.
 
     `symbols` restricts to those tickers (None = every filer, which is the point of
-    this path for a broad universe). Quarters already present are re-parsed only if
-    their ZIP is missing from the cache, so re-runs are cheap.
+    this path for a broad universe).
+
+    A quarter is written straight into its own `filed_quarter=` partition and never
+    read back, so the whole backfill costs one parse per ZIP instead of a table
+    rewrite per ZIP. Quarters this path has already ingested are skipped by directory
+    listing — the ZIP is immutable, so re-parsing it can only produce what is already
+    there. The listing asks for `source="fsds"` specifically: a quarter directory also
+    exists when the per-CIK companyfacts path happened to file a row into it, and
+    treating that as "already ingested" would silently skip the whole backfill.
+
+    `force=True` re-ingests them, and REPLACES each quarter's directory — use it when
+    the PARSE changed (a new tag in FLOW_TAGS, a namespace fix), and re-run
+    `--facts` afterwards if this store also carries companyfacts rows.
     """
     cikmap = news._ticker_cik_map()
     cik_to_symbol: dict[str, str] = {}
@@ -232,8 +244,12 @@ def refresh_facts_bulk(store, symbols: list[str] | None = None,
     keep_ciks = set(cik_to_symbol) if symbols is not None else None
 
     quarters = quarters_between(start_quarter, end_quarter)
-    frames, got, missing = [], [], []
+    have = set(store.facts_quarters(source="fsds"))
+    rows, syms, got, missing, skipped = 0, set(), [], [], []
     for i, q in enumerate(quarters, 1):
+        if q in have and not force:
+            skipped.append(q)
+            continue
         path = download_quarter(q)
         if path is None:
             missing.append(q)
@@ -245,15 +261,16 @@ def refresh_facts_bulk(store, symbols: list[str] | None = None,
             missing.append(q)
             continue
         if not df.empty:
-            frames.append(df)
+            # Same (symbol, tag, period, filing) key the companyfacts path produces.
+            df = df.drop_duplicates(["symbol", "tag", "end", "start", "filed"], keep="last")
+            store.append_facts_quarter(q, df, replace=force, source="fsds",
+                                       touch_manifest=False)
+            rows += len(df)
+            syms |= set(df["symbol"].dropna())
         got.append(q)
         log(f"  {q}: {len(df):7d} rows  ({i}/{len(quarters)})")
 
-    if not frames:
-        return {"rows": 0, "quarters": got, "missing": missing}
-    allf = pd.concat(frames, ignore_index=True)
-    # Same (symbol, tag, period, filing) key the companyfacts path produces.
-    allf = allf.drop_duplicates(["symbol", "tag", "end", "start", "filed"], keep="last")
-    n = store.upsert_facts(allf)
-    return {"rows": int(len(allf)), "stored": int(n), "quarters": got,
-            "missing": missing, "symbols": int(allf["symbol"].nunique())}
+    # One distinct-symbol scan for the whole backfill, not one per quarter.
+    store.refresh_facts_manifest()
+    return {"rows": int(rows), "quarters": got, "missing": missing,
+            "skipped": skipped, "symbols": len(syms)}
