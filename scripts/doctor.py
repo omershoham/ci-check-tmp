@@ -17,6 +17,11 @@ from datetime import datetime, timezone
 
 from src import config, health, storage
 
+# Health badges contain emoji; a Windows console defaults to cp1252 and would raise
+# UnicodeEncodeError mid-report, hiding the remaining checks and the summary line.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 OK, WARN, FAIL = "OK  ", "WARN", "FAIL"
 _rows: list[tuple[str, str, str]] = []
 
@@ -108,8 +113,8 @@ def check_ibkr() -> None:
         return
     host, port = config.get("ibkr.host", "127.0.0.1"), int(config.get("ibkr.port", 4001))
     up = _port_open(host, port)
-    _rec(OK if up else WARN, "ibkr gateway", f"{host}:{port} {'open' if up else 'closed — '
-         'holdings/quotes will come from the last snapshot'}")
+    detail = "open" if up else ("closed — holdings/quotes will come from the last snapshot")
+    _rec(OK if up else WARN, "ibkr gateway", f"{host}:{port} {detail}")
 
 
 def check_db() -> None:
