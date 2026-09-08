@@ -52,6 +52,12 @@ def main() -> None:
                 if row.get("held_position") else None)
         report = deep_research.research_one(sym, row.get("name") or sym,
                                             row.get("subsector", ""), ctx, holding=hold)
+        # Same horizon provenance as the pipeline: the quant label stored beside
+        # Claude's own choice, and horizon_source saying which one is which.
+        from src import technical
+        report["quant_horizon"] = technical.default_horizon(
+            {**(row.get("metrics") or {}), "tags": row.get("tags")})
+        report["horizon_source"] = "claude" if report.get("horizon") else "quant"
         # Same red-team discipline as the scheduled pipeline — otherwise a
         # button-refreshed rating is systematically more bullish than a pipeline one.
         if (config.get("claude.red_team", True)

@@ -19,7 +19,7 @@ from src import universe
 from src.backtest import signals
 from src.backtest.engine import BacktestSpec, log_trial, n_trials, run_rank_backtest
 from src.data.history_store import HistoryStore
-from src.data.yfinance_live import month_ends
+from src.data.yfinance_live import every_n_trading_days, month_ends
 
 
 def _log(msg: str) -> None:
@@ -75,7 +75,7 @@ def universe_note(store: HistoryStore, eligible: dict, source: str) -> str:
 
 
 def run_one(name: str, store: HistoryStore, start: date, top_frac: float, top_n: int | None,
-            cost_bps: float) -> None:
+            cost_bps: float, horizon_days: int | None = None) -> None:
     src = universe.configured_source()
     uni = universe.current_universe(store=store)
     syms = [u["symbol"] for u in uni]
@@ -83,7 +83,12 @@ def run_one(name: str, store: HistoryStore, start: date, top_frac: float, top_n:
     have = set(store.symbols_with_prices())
     if not have:
         raise SystemExit("history store has no prices — run scripts.data_refresh first")
-    dates = month_ends(start, date.today())
+    # The rebalance grid IS the label horizon: the engine's forward return runs from one
+    # grid date to the next. So `--horizon-days 10` measures the signal on a swing clock
+    # and `126` on a long one — the non-overlapping version of learning.pillar_ic's
+    # question. Default (None) = month-ends, byte-identical to every prior report.
+    dates = (list(every_n_trading_days(start, date.today(), horizon_days))
+             if horizon_days else month_ends(start, date.today()))
     if src == "broad":
         # Score every name that was EVER a member, not only today's. Restricting the
         # scored set to the current universe would re-introduce exactly the survivorship
@@ -102,14 +107,16 @@ def run_one(name: str, store: HistoryStore, start: date, top_frac: float, top_n:
     # inside the same sectors the live screen does.
     secs = universe.sector_map(store=store, symbols=syms)
     spec = BacktestSpec(name=name, top_frac=top_frac, top_n=top_n, cost_bps_side=cost_bps,
-                        params={"start": str(start), "rebalance": "BME"})
+                        params={"start": str(start),
+                                "rebalance": f"{horizon_days}d" if horizon_days else "BME"})
     # Read ONLY the scored names plus the report benchmarks. `close_matrix(None)` looked
     # harmless and was not: the engine takes its rebalance calendar from this frame's
     # index, so every unrelated symbol in the store could move a curated backtest's
     # dates and every metric with them. A result must be a function of the universe it
     # claims to test, not of what else happens to have been downloaded.
     closes = store.close_matrix(sorted(set(syms) | set(spec.benchmarks)), adjusted=True)
-    _log(f"{name}: {len(syms)} symbols, {len(dates)} month-ends from {start}")
+    _log(f"{name}: {len(syms)} symbols, {len(dates)} "
+         f"{f'{horizon_days}-day rebalances' if horizon_days else 'month-ends'} from {start}")
     scores = build_signal(name, store, syms, subs, dates, closes, secs)
     if scores.empty:
         raise SystemExit(f"{name}: signal produced no scores (missing data?)")
@@ -122,7 +129,9 @@ def run_one(name: str, store: HistoryStore, start: date, top_frac: float, top_n:
                             universe_note=note)
     log_trial(trials_root, name, {**spec.params, "top_frac": top_frac, "top_n": top_n,
                                   "cost_bps": cost_bps}, res.summary)
-    out = store.root / "backtests" / f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    suffix = f"_h{horizon_days}" if horizon_days else ""
+    out = (store.root / "backtests"
+           / f"{name}{suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     res.save(out)
     print(res.to_markdown())
     _log(f"saved -> {out}")
@@ -136,14 +145,20 @@ def main() -> None:
     ap.add_argument("--top-frac", type=float, default=0.10)
     ap.add_argument("--top-n", type=int, default=None)
     ap.add_argument("--cost-bps", type=float, default=15.0)
+    ap.add_argument("--horizon-days", type=int, default=None,
+                    help="rebalance AND label horizon in trading days (e.g. 10 swing, "
+                         "42 position, 126 long). Omit for the default month-end grid.")
     args = ap.parse_args()
+    if args.horizon_days is not None and args.horizon_days < 1:
+        ap.error("--horizon-days must be >= 1")
     store = HistoryStore()
     start = date.fromisoformat(args.start)
     names = ["momentum", "technical", "fundamental", "composite"] if args.all else [args.signal]
     if not names or names == [None]:
         ap.error("--signal or --all required")
     for n in names:
-        run_one(n, store, start, args.top_frac, args.top_n, args.cost_bps)
+        run_one(n, store, start, args.top_frac, args.top_n, args.cost_bps,
+                horizon_days=args.horizon_days)
 
 
 if __name__ == "__main__":

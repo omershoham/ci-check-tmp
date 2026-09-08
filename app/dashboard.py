@@ -28,7 +28,8 @@ try:
 except Exception:  # noqa: BLE001
     st_autorefresh = None
 
-from src import charts, config, health, news, recommend, regime, storage, theme  # noqa: E402
+from src import (charts, config, health, news, recommend, regime, storage, technical,  # noqa: E402
+                 theme)
 from src.local_llm import CATALYST_KEYS  # noqa: E402
 from src.universe import SUBSECTOR_LABELS  # noqa: E402
 
@@ -147,6 +148,17 @@ def vs_sector(val, med) -> str:
     prem = val / med - 1
     arrow = "▲" if prem > 0 else "▼"
     return f"{val:.1f} vs {med:.1f} ({arrow}{abs(prem)*100:.0f}%)"
+
+
+def row_horizon(row) -> str:
+    """The clock this idea is on: Claude's when it was researched, else the same
+    deterministic quant default record_picks would have stored. Shown so the board's
+    three horizon lists cover every name, not only the ~10 that were researched."""
+    h = row.get("horizon")
+    if h:
+        return h
+    return technical.default_horizon({**(row.get("metrics") or {}),
+                                      "tags": row.get("tags")})
 
 
 def tag_str(tags) -> str:
@@ -335,16 +347,22 @@ def load_active_triggers_by_symbol() -> dict:
 
 
 @st.cache_data(ttl=3600)
-def load_calibration():
+def load_calibration(clock: str = "fixed"):
     from src import performance
-    return performance.rating_calibration(), performance.shadow_vs_actual()
+    return performance.rating_calibration(clock=clock), performance.shadow_vs_actual()
 
 
 @st.cache_data(ttl=3600)
-def load_calibration_extra():
-    """Claude-vs-screen attribution, precision-with-CI table, per-prompt-version cut."""
+def load_calibration_extra(clock: str = "fixed"):
+    """Claude-vs-screen attribution, precision-with-CI table, per-prompt-version cut.
+
+    `clock` picks the ruler: 'fixed' = the 1w/4w/13w windows every pick has always been
+    graded on; 'horizon' = each pick on the clock it claimed. The per-prompt-version cut
+    stays on the fixed clock — it exists to compare analysts, and v6 is the first version
+    that states a horizon at all."""
     from src import performance
-    return (performance.claude_vs_screen("4w"), performance.calibration_table("4w"),
+    return (performance.claude_vs_screen("4w", clock=clock),
+            performance.calibration_table("4w", clock=clock),
             performance.calibration_by_prompt_version("4w"))
 
 
@@ -755,6 +773,15 @@ with tab_board:
         filtered = [r for r in filtered if set(tag_filter) & set(r.get("tags") or [])]
     if sub_filter:
         filtered = [r for r in filtered if r.get("subsector") in sub_filter]
+    # Horizon: three ranked lists behind one board. A swing idea and a long idea are
+    # different decisions, and ranking them against each other hides that.
+    hz_filter = st.radio("Horizon", ["All", "swing", "position", "long"],
+                         horizontal=True, key="horizon_filter",
+                         help="The clock each idea claimed (Claude's when it was "
+                              "researched, the quant default otherwise). Ideas are "
+                              "GRADED on this clock in the Accuracy tab.")
+    if hz_filter != "All":
+        filtered = [r for r in filtered if row_horizon(r) == hz_filter]
     if hide_excluded:
         filtered = [r for r in filtered if watch.get(r["symbol"]) != "excluded"]
 
@@ -810,6 +837,7 @@ with tab_board:
             "name": (r.get("name") or "")[:26],
             "sub": SUBSECTOR_LABELS.get(r.get("subsector"), r.get("subsector")),
             "setup": SETUP_EMOJI.get((m.get("setup") or ""), ""),
+            "horizon": row_horizon(r) + ("" if r.get("horizon") else " *"),
             "composite": r["blended"],
             "📊": m.get("pillar_technical"), "💰": m.get("pillar_fundamental"), "📰": m.get("pillar_sentiment"),
             "RS 3m": m.get("rs_3m"),
@@ -841,6 +869,11 @@ with tab_board:
                 "⚡ catalyst", width="small",
                 help="Strongest catalyst keys from this run's headline scan (0–10). "
                      "Dark: not in the ranking score."),
+            "horizon": st.column_config.TextColumn(
+                "horizon", width="small",
+                help="swing / position / long — the clock this idea claimed, and the "
+                     "clock it is graded on. Trailing * = the quant default, not a "
+                     "researched call."),
             "tags": st.column_config.TextColumn(width="small"),
         })
     st.caption(f"RS 3m = 3-month return vs {config.get('technical.rs_benchmark', 'SMH')} "
@@ -957,6 +990,19 @@ with tab_board:
                     _dl = r.get("deal_likelihood")   # legacy: prompts <= v4 only
                     st.markdown(f"**Claude conviction:** {r['conviction']}/10"
                                 + (f" · **deal likelihood:** {_dl}" if _dl else ""))
+                if r.get("horizon"):
+                    _src = r.get("horizon_source") or "—"
+                    _em, _iv = r.get("expected_move_pct"), r.get("invalidation_level")
+                    _bits = [f"**Horizon:** {r['horizon']} ({_src})"]
+                    if isinstance(_em, (int, float)):
+                        _bits.append(f"**expected move:** {_em:+.1f}%")
+                    if isinstance(_iv, (int, float)):
+                        _bits.append(f"**invalidated below:** ${_iv:,.2f}")
+                    if r.get("quant_horizon") and r.get("quant_horizon") != r["horizon"]:
+                        _bits.append(f"quant default said _{r['quant_horizon']}_")
+                    st.markdown(" · ".join(_bits))
+                    if r.get("horizon_rationale"):
+                        st.caption(f"⏱ {md(r['horizon_rationale'])}")
                 if r.get("rating") is not None or r.get("conviction") is not None:
                     st.caption(f"🔬 Analyzed {ago(r.get('research_at'))} · {freshness(r.get('data_as_of'))}")
                 if r.get("thesis"):
@@ -1595,12 +1641,28 @@ with tab_acc:
                "not theme beta) of past picks, grouped by the rating given at pick time — "
                "plus the PM's target-weight portfolio vs your actual weights. "
                "Judge the tool before trusting it.")
+    _clock_lbl = st.radio(
+        "Clock", ["Fixed windows (1w/4w/13w)", "Each idea's own horizon"],
+        horizontal=True, key="cal_clock",
+        help="Fixed = the ruler every pick has always been graded on, unbroken across "
+             "the horizon cutover. Own horizon = each idea graded on the clock it "
+             "claimed; that series starts at n=0 on the first Phase-6 run.")
+    _clock = "horizon" if _clock_lbl.startswith("Each") else "fixed"
     try:
-        cal_df, shadow = load_calibration()
+        cal_df, shadow = load_calibration(_clock)
     except Exception as exc:  # noqa: BLE001
         cal_df, shadow = pd.DataFrame(), []
         st.warning(f"Calibration unavailable: {exc}")
-    if cal_df is not None and not cal_df.empty:
+    if _clock == "horizon":
+        if cal_df is not None and not cal_df.empty:
+            st.markdown("**Own-clock calibration** — by horizon first, then horizon × "
+                        "rating. Deeper cuts wait for sample size.")
+            st.dataframe(cal_df, width="stretch", hide_index=True)
+        else:
+            st.info("No picks graded on their own horizon yet — the series starts at "
+                    "n=0 with the first deep run that tags horizons, and a `long` call "
+                    "takes ~6 months to complete its window.")
+    elif cal_df is not None and not cal_df.empty:
         st.markdown("**Rating calibration** — in a calibrated system the bars should step "
                     "down from strong_buy to sell:")
         # Shape question -> chart first (sign-colored, n= labels bake in the sample-size
@@ -1636,13 +1698,14 @@ with tab_acc:
                 "trading days after a deep run).")
     # ---- Does the Claude layer add value over the quant screen? -------------------
     try:
-        _attr, _cal_tbl, _by_pv = load_calibration_extra()
+        _attr, _cal_tbl, _by_pv = load_calibration_extra(_clock)
     except Exception as exc:  # noqa: BLE001
         _attr, _cal_tbl, _by_pv = {}, pd.DataFrame(), pd.DataFrame()
         st.warning(f"Attribution unavailable: {exc}")
+    _clock_txt = ("each idea's own horizon" if _clock == "horizon" else "4-week")
     st.markdown("**Does the Claude layer add value over the quant screen?** — buy-rated picks "
                 "vs. finalists that reached the same slots without research (screen-only), "
-                "both graded on 4-week excess vs the universe, **net of a "
+                f"both graded on {_clock_txt} excess vs the universe, **net of a "
                 f"{config.get('evaluation.cost_bps', 30)} bp round-trip cost** on the buys.")
     if _attr.get("edge_pp") is not None:
         _ac1, _ac2, _ac3 = st.columns(3)

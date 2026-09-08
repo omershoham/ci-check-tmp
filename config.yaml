@@ -63,6 +63,15 @@ policy:
 evaluation:
   cost_bps: 30                   # round-trip spread+slippage charged to buy/strong_buy calls
   min_n_for_ci: 8                # calibration cells with fewer graded calls are flagged unreliable
+  # Per-idea grading clocks, in TRADING days (same convention as performance._WINDOWS).
+  # An idea is graded on the clock it CLAIMED: a swing call and a long call scored on
+  # the same 4-week ruler are not being measured, they are being averaged.
+  # The fixed 1w/4w/13w windows keep being computed alongside these, forever.
+  horizons:
+    swing: 10                    # ~2 weeks: a catalyst/setup that resolves fast
+    position: 42                 # ~2 months: the default when neither extreme applies
+    long: 126                    # ~6 months: a re-rating thesis, not a catalyst
+  default_horizon: position      # used when nobody stated one
 
 risk:
   benchmark: QQQ                 # portfolio beta reference

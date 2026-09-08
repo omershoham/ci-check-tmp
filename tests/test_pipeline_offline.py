@@ -53,8 +53,14 @@ def _fake_claude(prompt, allowed_tools=None, timeout=None, extra_args=None):
     else:
         body = {"ticker": "X", "rating": "buy", "conviction": 7, "deal_likelihood": "high",
                 "thesis": "faked", "chart_pattern": "up", "metrics_read": "m",
+                "horizon": "swing", "horizon_rationale": "orders land at the next print",
+                "expected_move_pct": 9.0, "invalidation_level": 88.0,
                 "catalysts": ["c"], "risks": ["r"], "bull": "b", "bear": "b",
                 "data_as_of": "2026-09-07", "latest_price_seen": 100}
+        # One name comes back with an unusable horizon, so the run also exercises the
+        # quant fallback: a pick must ALWAYS end up with a clock and an honest source.
+        if "(TSM)" in prompt:
+            body["horizon"] = "a few weeks"
     text = json.dumps(body)
     return text, json.dumps({"result": text, "session_id": "fake"})
 
@@ -139,6 +145,27 @@ def test_deep_run_offline_records_degraded_health(offline, storage):
     assert psets == {"technical,fundamental,sentiment"}
     assert deals == {None}
     assert not any({"deal", "both"} & set(r.get("tags") or []) for r in board)
+
+    # Every pick carries the clock it will be graded on, and says who chose it. TSM's
+    # report named an unusable horizon, so it falls back to the quant default.
+    with storage.get_conn() as cn:
+        picks = {r["symbol"]: dict(r) for r in
+                 cn.execute("SELECT * FROM picks WHERE run_id=?", (rid,))}
+        reports = {r["symbol"]: dict(r) for r in
+                   cn.execute("SELECT * FROM research_reports WHERE run_id=?", (rid,))}
+    assert len(picks) == 10
+    assert all(p["horizon"] in ("swing", "position", "long") for p in picks.values())
+    assert picks["NVDA"]["horizon"] == "swing" and picks["NVDA"]["horizon_source"] == "claude"
+    assert picks["TSM"]["horizon_source"] == "quant"
+    assert picks["TSM"]["horizon"] == "position"          # technical.default_horizon
+    # The report keeps Claude's own claim (NULL when it made none) plus the quant label
+    # alongside it, so agreement(claude, quant) stays a query.
+    assert reports["NVDA"]["horizon"] == "swing"
+    assert reports["NVDA"]["expected_move_pct"] == 9.0
+    assert reports["NVDA"]["invalidation_level"] == 88.0
+    assert reports["NVDA"]["horizon_rationale"].startswith("orders land")
+    assert reports["TSM"]["horizon"] is None
+    assert all(r["quant_horizon"] == "position" for r in reports.values())
 
 
 def test_light_run_skips_research(offline, storage):

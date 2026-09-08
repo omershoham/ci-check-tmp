@@ -148,6 +148,29 @@ def refresh_prices(store, symbols: Iterable[str], period: str = "10y",
 
 
 def month_ends(start: date, end: date) -> list[pd.Timestamp]:
-    """Business month-end dates in [start, end] — the snapshot grid."""
+    """Business month-end dates in [start, end] — the snapshot grid.
+
+    DELIBERATELY business month-ends, not NYSE session ends, and the one remaining
+    business-day approximation in the codebase: these dates ARE the default rebalance
+    calendar and the snapshot grid, so moving them to the exchange calendar would shift
+    every stored snapshot and invalidate every byte-identical backtest baseline. The
+    engine fills at the next available close, so a month-end on a holiday costs a day
+    of lag, not a wrong number. Horizon grids use `every_n_trading_days`, which does
+    count real sessions."""
     idx = pd.date_range(pd.Timestamp(start), pd.Timestamp(end), freq="BME")
     return [d for d in idx]
+
+
+def every_n_trading_days(start: date, end: date, n: int):
+    """Yield every n-th NYSE SESSION in [start, end] — the rebalance grid for a
+    horizon-specific backtest, where the spacing IS the label horizon.
+
+    Real sessions, not business days: `performance._fwd_return` counts horizons in
+    bars, so the harness has to count them the same way or `--horizon-days 10` is not
+    the 10-day clock the config names. n<=0 is a caller bug, not a silent no-op."""
+    if int(n) <= 0:
+        raise ValueError(f"every_n_trading_days needs n >= 1, got {n}")
+    from ..market_calendar import trading_days
+    idx = trading_days(start, end)
+    for i in range(0, len(idx), int(n)):
+        yield idx[i]

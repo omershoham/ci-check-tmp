@@ -111,7 +111,10 @@ def run() -> int:
                 sym, name, subs.get(sym, "Other"), hctx,
                 portfolio_block=portfolio_block,
                 history_block=learning.learning_block(sym),
-                risk_ctx=rm)
+                risk_ctx=rm,
+                # The clock this position is already on (its latest pick's horizon,
+                # else the configured default) — the same one it will be graded on.
+                horizon=deep_research.position_horizon(sym))
             _log(f"    validating recency: {sym}")
             storage.set_progress(rid, f"holding {i}/{len(holdings)}: {sym} — validating recency",
                                  table="portfolio_runs")

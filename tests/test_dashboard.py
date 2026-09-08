@@ -53,8 +53,10 @@ def seeded(storage, monkeypatch):
     storage.upsert_research(rid, {
         "symbol": "VRT", "rating": "buy", "conviction": 7.0, "thesis": "t",
         "chart_pattern": "up", "metrics_read": "m", "catalysts": ["c"], "risks": ["r"],
-        "bull": "b", "bear": "b", "data_as_of": "2026-09-08", "prompt_version": 5,
-        "model": "m"})
+        "bull": "b", "bear": "b", "data_as_of": "2026-09-08", "prompt_version": 6,
+        "model": "m", "horizon": "swing", "horizon_rationale": "print on the 21st",
+        "horizon_source": "claude", "quant_horizon": "position",
+        "expected_move_pct": 9.0, "invalidation_level": 101.0})
     storage.finish_run(rid, "ok")
     return rid
 
@@ -76,6 +78,41 @@ def test_board_table_shows_the_catalyst_column_and_no_deal_tag(seeded):
     assert row["⚡ catalyst"] == "deal 8 · product 6"   # top 2 non-zero keys
     # The deleted tags must not come back through a stale badge map.
     assert "deal" not in " ".join(board["tags"].tolist())
+
+
+def test_board_shows_the_horizon_column(seeded):
+    at = AppTest.from_file(APP, default_timeout=120).run()
+    assert not at.exception, at.exception
+    board = at.dataframe[0].value
+    assert "horizon" in board.columns
+    vrt = board[board["symbol"].str.startswith("VRT")].iloc[0]
+    assert vrt["horizon"] == "swing"              # Claude's own clock, no marker
+    nvda = board[board["symbol"].str.startswith("NVDA")].iloc[0]
+    # Never researched: the quant default, flagged as such.
+    assert nvda["horizon"].endswith(" *")
+    assert nvda["horizon"].split()[0] in ("swing", "position", "long")
+
+
+def test_board_has_a_horizon_filter(seeded):
+    at = AppTest.from_file(APP, default_timeout=120).run()
+    assert not at.exception, at.exception
+    radios = {r.label: r for r in at.radio}
+    assert "Horizon" in radios
+    assert radios["Horizon"].options == ["All", "swing", "position", "long"]
+    at.radio(key="horizon_filter").set_value("long").run()
+    assert not at.exception, at.exception
+    # VRT claimed 'swing', so filtering to 'long' must drop it from the board.
+    board = at.dataframe[0].value
+    assert board.empty or not board["symbol"].str.startswith("VRT").any()
+
+
+def test_accuracy_tab_has_a_clock_toggle(seeded):
+    at = AppTest.from_file(APP, default_timeout=120).run()
+    assert not at.exception, at.exception
+    clock = at.radio(key="cal_clock")
+    assert clock.options == ["Fixed windows (1w/4w/13w)", "Each idea's own horizon"]
+    at.radio(key="cal_clock").set_value("Each idea's own horizon").run()
+    assert not at.exception, at.exception
 
 
 def test_tag_filter_offers_no_deal_options(seeded):

@@ -28,6 +28,10 @@ import yfinance as yf
 from . import config, risk, storage
 
 _WINDOWS = {"1w": 5, "4w": 21, "13w": 65}  # trading days
+# NEVER change _WINDOWS. rating_calibration, calibration_table, claude_vs_screen,
+# calibration_by_prompt_version, learning.graded_calls and learning.reflect all read
+# these three keys; a pick's own-horizon grade is ADDED next to them (the *_h keys),
+# never in place of them, so the fixed-window series stays unbroken across the cutover.
 # The theme proxy is config-driven; risk._theme() is the single resolver
 # (risk.theme_benchmark -> technical.rs_benchmark -> SMH).
 
@@ -56,6 +60,22 @@ def _cost_pct(rating: str | None) -> float:
     if str(rating or "").lower() in ("buy", "strong_buy"):
         return float(config.get("evaluation.cost_bps", 30)) / 100.0
     return 0.0
+
+
+def _horizon_days(rec: dict) -> int | None:
+    """Trading days for a pick's OWN stated horizon, from `evaluation.horizons`.
+
+    None when the pick never claimed one (every pre-Phase-6 pick, and the benchmark
+    snapshot row). Those are graded on the fixed windows only — assigning them a
+    default clock here would fabricate a decision the analyst never made."""
+    h = str(rec.get("horizon") or "").strip().lower()
+    if not h:
+        return None
+    try:
+        d = int((config.get("evaluation.horizons", {}) or {}).get(h))
+    except (TypeError, ValueError):
+        return None
+    return d if d > 0 else None
 
 
 def _price_history(symbols: list[str], period: str = "1y") -> pd.DataFrame | None:
@@ -144,7 +164,11 @@ def _uni_mean_fwd(px: pd.DataFrame, run_id: int, t0: pd.Timestamp,
 
 
 def pick_outcomes() -> list[dict[str, Any]]:
-    """Per-pick forward returns with excess vs universe mean / SMH / SPY."""
+    """Per-pick forward returns with excess vs universe mean / theme / SPY.
+
+    Two clocks per pick, always both: the three FIXED windows (unchanged forever) and,
+    when the pick stated a horizon, the same measurements over that horizon's own day
+    count (`*_h`). Legacy picks carry horizon=None and every `*_h` key None."""
     key = _memo_key("pick_outcomes")
     if key in _MEMO:
         return _MEMO[key]
@@ -152,6 +176,7 @@ def pick_outcomes() -> list[dict[str, Any]]:
     with storage.get_conn() as cn:
         rows = [dict(r) for r in cn.execute(
             """SELECT p.run_id, p.symbol, p.surfaced_at, p.price_at_surface,
+                      p.horizon, p.horizon_source,
                       r.rating, r.conviction, r.prompt_version, r.model,
                       s.blended, s.rank, ru.regime
                FROM picks p
@@ -195,7 +220,7 @@ def pick_outcomes() -> list[dict[str, Any]]:
             rec[f"excess_{label}"] = (round(fr - spy, 2)
                                       if fr is not None and spy is not None else None)
             rec[f"excess_theme_{label}"] = (round(fr - thm, 2)
-                                          if fr is not None and smh is not None else None)
+                                          if fr is not None and thm is not None else None)
             rec[f"excess_uni_{label}"] = (round(fr - uni, 2)
                                           if fr is not None and uni is not None else None)
         # Net of the cost a real trade would have paid; hold/screen-only cost 0.
@@ -203,6 +228,29 @@ def pick_outcomes() -> list[dict[str, Any]]:
         for label in _WINDOWS:
             e = rec.get(f"excess_uni_{label}")
             rec[f"net_excess_uni_{label}"] = round(e - rec["cost_pct"], 2) if e is not None else None
+        # ---- the pick's OWN clock, computed alongside the fixed windows.
+        # _uni_mean_fwd memoizes on (run_id, days), so an arbitrary horizon costs one
+        # extra universe pass per (run, horizon) and nothing thereafter.
+        rec["horizon_source"] = r.get("horizon_source") or "legacy"
+        hd = _horizon_days(rec)
+        rec["horizon_days"] = hd
+        for k in ("ret_h", "excess_uni_h", "excess_bench_h", "excess_theme_h",
+                  "net_excess_uni_h"):
+            rec[k] = None
+        if hd:
+            frh = _fwd_return(px, r["symbol"], t0, hd, base_override=base)
+            spyh = _fwd_return(px, bench, t0, hd)
+            thmh = _fwd_return(px, theme, t0, hd)
+            unih = _uni_mean_fwd(px, r["run_id"], t0, hd)
+            if frh is not None:
+                rec["ret_h"] = round(frh, 2)
+                if spyh is not None:
+                    rec["excess_bench_h"] = round(frh - spyh, 2)
+                if thmh is not None:
+                    rec["excess_theme_h"] = round(frh - thmh, 2)
+                if unih is not None:
+                    rec["excess_uni_h"] = round(frh - unih, 2)
+                    rec["net_excess_uni_h"] = round(frh - unih - rec["cost_pct"], 2)
         out.append(rec)
     _MEMO[key] = out
     return out
@@ -216,12 +264,23 @@ def _bucket(r: dict) -> str:
     return "screen_only"
 
 
-def rating_calibration(basis: str = "uni") -> pd.DataFrame:
+_HORIZON_ORDER = ("swing", "position", "long")
+
+
+def rating_calibration(basis: str = "uni", clock: str = "fixed") -> pd.DataFrame:
     """Aggregate pick outcomes by rating bucket. basis: 'uni' (selection skill,
-    default), 'smh' (theme-relative) or 'spy' (market-relative)."""
+    default), 'smh' (theme-relative) or 'spy' (market-relative).
+
+    clock='fixed' (default) reports the three fixed windows and is byte-identical to
+    the pre-Phase-6 output. clock='horizon' grades each pick on the horizon it CLAIMED
+    and reports MARGINALLY - by horizon alone first, then horizon x rating. The deeper
+    cuts wait for sample size: horizon x rating x conviction x regime is ~81 cells,
+    which needs ~650 graded picks per horizon before any of them means anything."""
     rows = pick_outcomes()
     if not rows:
         return pd.DataFrame()
+    if clock == "horizon":
+        return _horizon_calibration(rows, basis)
     # "smh" accepted as a legacy alias for the now-configurable theme basis.
     prefix = {"uni": "excess_uni_", "theme": "excess_theme_",
               "smh": "excess_theme_", "spy": "excess_"}[basis]
@@ -248,6 +307,48 @@ def rating_calibration(basis: str = "uni") -> pd.DataFrame:
     return pd.DataFrame(agg_rows)
 
 
+# The own-clock counterpart of the excess_* prefixes above. One mapping, so the two
+# clocks can never drift into different benchmark conventions.
+_HORIZON_BASIS = {"uni": "excess_uni_h", "theme": "excess_theme_h",
+                  "smh": "excess_theme_h", "spy": "excess_bench_h"}
+
+
+def _horizon_calibration(rows: list[dict], basis: str) -> pd.DataFrame:
+    """Own-clock calibration: one row per horizon ('(all)' ratings), then per rating."""
+    col = _HORIZON_BASIS[basis]
+    df = pd.DataFrame(rows)
+    if col not in df or "horizon" not in df:
+        return pd.DataFrame()
+    df = df[df["horizon"].notna()]
+    if df.empty:
+        return pd.DataFrame()
+    df["bucket"] = df.apply(_bucket, axis=1)
+    order = ["strong_buy", "buy", "hold", "sell", "strong_sell", "screen_only"]
+    out = []
+    for h in _HORIZON_ORDER:
+        gh = df[df["horizon"] == h]
+        if gh.empty:
+            continue
+        cuts = [("(all)", gh)] + [(b, gh[gh["bucket"] == b]) for b in order]
+        for label, g in cuts:
+            if g.empty:
+                continue
+            e = g[col].dropna()
+            days = g["horizon_days"].dropna()
+            row: dict[str, Any] = {
+                "horizon": h,
+                "horizon_days": int(days.iloc[0]) if len(days) else None,
+                "rating": label, "picks": len(g), "n": len(e),
+                "avg_excess": round(float(e.mean()), 2) if len(e) else None,
+                "hit_pct": round(float((e > 0).mean()) * 100) if len(e) else None}
+            if basis == "uni":
+                ne = (g["net_excess_uni_h"].dropna() if "net_excess_uni_h" in g
+                      else pd.Series(dtype=float))
+                row["net_avg_excess"] = round(float(ne.mean()), 2) if len(ne) else None
+            out.append(row)
+    return pd.DataFrame(out)
+
+
 # ------------------------------------------------------------- calibration w/ CIs
 def wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     """Wilson score interval for a proportion k/n (in %). Well-behaved at small n and
@@ -267,17 +368,25 @@ def _conv_bucket(c) -> str:
     return "<=4" if c <= 4 else ("5-6" if c < 7 else ">=7")
 
 
-def calibration_table(window: str = "4w", min_n: int | None = None) -> pd.DataFrame:
+def calibration_table(window: str = "4w", min_n: int | None = None,
+                      clock: str = "fixed") -> pd.DataFrame:
     """Precision of past calls by (rating × conviction bucket × regime at pick time),
     with Wilson 95% CIs. This is the honest form of 'how much to trust this kind of
     call' — the same numbers a meta-labeling model would learn from, shown raw until
     there is enough history for a model (plan Track E gate: ≥1,000 graded picks).
 
-    'hit' = net excess vs the equal-weight universe > 0 (costs charged to buy calls)."""
+    'hit' = net excess vs the equal-weight universe > 0 (costs charged to buy calls).
+
+    clock='horizon' grades each pick on its own stated clock and reports the marginal
+    cuts first (horizon; horizon x rating); the full horizon x rating x conviction x
+    regime cut is emitted ONLY for cells that already reach min_n, because publishing
+    81 mostly-empty cells is how a noise pattern becomes a house rule."""
     rows = pick_outcomes()
     if not rows:
         return pd.DataFrame()
     min_n = int(config.get("evaluation.min_n_for_ci", 8)) if min_n is None else min_n
+    if clock == "horizon":
+        return _horizon_calibration_table(rows, min_n)
     df = pd.DataFrame(rows)
     col = f"net_excess_uni_{window}"
     if col not in df:
@@ -303,22 +412,65 @@ def calibration_table(window: str = "4w", min_n: int | None = None) -> pd.DataFr
     return res.sort_values(["_o", "conviction", "regime"]).drop(columns="_o").reset_index(drop=True)
 
 
-def claude_vs_screen(window: str = "4w", n_boot: int = 2000, seed: int = 7) -> dict[str, Any]:
+def _horizon_calibration_table(rows: list[dict], min_n: int) -> pd.DataFrame:
+    col = "net_excess_uni_h"
+    df = pd.DataFrame(rows)
+    if col not in df or "horizon" not in df:
+        return pd.DataFrame()
+    df = df.dropna(subset=[col])
+    df = df[df["horizon"].notna()]
+    if df.empty:
+        return pd.DataFrame()
+    df["bucket"] = df.apply(_bucket, axis=1)
+    df["conv"] = df["conviction"].apply(_conv_bucket)
+    df["regime"] = df["regime"].fillna("unknown")
+
+    def _cell(cut, h, rating, conv, reg, g) -> dict[str, Any]:
+        n = len(g)
+        k = int((g[col] > 0).sum())
+        lo, hi = wilson_ci(k, n)
+        return {"cut": cut, "horizon": h, "rating": rating, "conviction": conv,
+                "regime": reg, "n": n, "precision_pct": round(k / n * 100, 1),
+                "ci_lo": lo, "ci_hi": hi,
+                "avg_net_excess": round(float(g[col].mean()), 2), "reliable": n >= min_n}
+
+    out = []
+    for h in _HORIZON_ORDER:
+        gh = df[df["horizon"] == h]
+        if gh.empty:
+            continue
+        out.append(_cell("horizon", h, "(all)", "(all)", "(all)", gh))
+        for b, g in gh.groupby("bucket", sort=False):
+            out.append(_cell("horizon x rating", h, b, "(all)", "(all)", g))
+        # The full cut is reported only where it is already readable.
+        for (b, cv, rg), g in gh.groupby(["bucket", "conv", "regime"], sort=False):
+            if len(g) >= min_n:
+                out.append(_cell("full", h, b, cv, rg, g))
+    return pd.DataFrame(out)
+
+
+def claude_vs_screen(window: str = "4w", n_boot: int = 2000, seed: int = 7,
+                     clock: str = "fixed") -> dict[str, Any]:
     """Does the Claude layer add value over the quant screen?
 
     Treatment = picks Claude rated buy/strong_buy; control = picks that reached the
     finalist slots but got no research (screen_only). Both are top-of-board names
     surfaced the same way, so the difference in NET excess vs the universe is the
     marginal value of the research + red-team layer (after paying to act on it).
-    Bootstrap CI on the difference of means; sign and CI are the story, not the point."""
+    Bootstrap CI on the difference of means; sign and CI are the story, not the point.
+
+    clock='horizon' compares each cohort on its OWN stated clock. Note what that makes
+    the control: screen-only picks carry the QUANT default horizon, so the horizon-clock
+    comparison also carries whatever difference the two horizon assignments make."""
     import numpy as np
     rows = pick_outcomes()
-    col = f"net_excess_uni_{window}"
+    col = "net_excess_uni_h" if clock == "horizon" else f"net_excess_uni_{window}"
     treat = np.array([r[col] for r in rows if r.get(col) is not None
                       and _bucket(r) in ("buy", "strong_buy")], dtype=float)
     ctrl = np.array([r[col] for r in rows if r.get(col) is not None
                      and _bucket(r) == "screen_only"], dtype=float)
-    out: dict[str, Any] = {"window": window, "n_claude": int(len(treat)),
+    out: dict[str, Any] = {"window": "own horizon" if clock == "horizon" else window,
+                           "clock": clock, "n_claude": int(len(treat)),
                            "n_screen": int(len(ctrl))}
     if len(treat) < 5 or len(ctrl) < 5:
         out["note"] = "not enough graded picks in both cohorts yet"

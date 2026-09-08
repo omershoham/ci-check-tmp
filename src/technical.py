@@ -273,6 +273,37 @@ def _compute_one(df: pd.DataFrame) -> dict[str, Any] | None:
     return ind
 
 
+def default_horizon(tech: dict) -> str:
+    """The QUANT default clock for a name — swing | position | long.
+
+    Purely a LABEL. It is recorded next to Claude's own choice so that
+    agreement(claude, quant) is measurable later, and it is the fallback horizon for a
+    pick nobody researched; nothing in the system sizes, ranks or trades off it.
+
+    Deterministic by design (no model, no config-tunable thresholds beyond the default):
+    a fallback that drifts would make the agreement statistic meaningless. Reads the
+    fields `_compute_one` emits, so it works on a technicals dict or on a score row's
+    `metrics` (which carries the same keys) with `tags` merged in.
+    """
+    atr = tech.get("atr_pct")
+    pos = tech.get("pos_52w")
+    setup = str(tech.get("setup") or "")
+    tags = set(tech.get("tags") or ())
+    # 1. Fast tape or an extended/breakout position: whatever happens, it happens soon.
+    #    0.98 is the same "extended" line _score_and_state already uses.
+    if (isinstance(atr, (int, float)) and atr >= 0.035) or \
+       (isinstance(pos, (int, float)) and pos >= 0.98):
+        return "swing"
+    # 2. Low-volatility quality on an intact trend: the thesis is compounding, not an event.
+    if isinstance(atr, (int, float)) and atr <= 0.02 and setup == "bullish" and "quality" in tags:
+        return "long"
+    # 3. An established uptrend (both bullish branches of _classify_setup require price
+    #    above the 200dma) is the ordinary multi-month idea.
+    if setup == "bullish":
+        return "position"
+    return str(config.get("evaluation.default_horizon", "position"))
+
+
 def _download_with_deadline(syms: list[str], period: str = "2y",
                             deadline_s: float = 150.0):
     """yf.download that CANNOT hang the pipeline.

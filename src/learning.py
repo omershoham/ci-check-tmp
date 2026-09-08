@@ -29,30 +29,38 @@ _FALLBACK_WINDOW = "1w"    # used while 4w windows are still filling
 def graded_calls(symbol: str | None = None) -> list[dict[str, Any]]:
     """All research calls with realized outcomes, newest first.
 
-    Grade = excess vs the EQUAL-WEIGHT UNIVERSE MEAN (selection skill), falling back
-    to SMH then SPY when the universe benchmark is unavailable. Grading vs SPY alone
-    on an SMH-beta>1 universe would teach the loop beta timing, not stock picking.
+    A call is graded on the clock IT CLAIMED when it claimed one (`net_excess_uni_h`,
+    net of the cost a buy would have paid) — grading a swing call and a long call on
+    the same 4-week ruler measures neither. Calls with no horizon (every pre-Phase-6
+    pick) fall back to the fixed 4w->1w ladder over universe -> theme -> SPY. Grading
+    vs SPY alone on an SMH-beta>1 universe would teach the loop beta timing, not stock
+    picking. `grade_clock` records which of the two produced the number, because
+    pooling them without saying so is the same error one level up.
     """
     rows = performance.pick_outcomes()
     out = []
     for r in rows:
         if symbol and r["symbol"] != symbol.upper():
             continue
-        grade, window, basis = None, None, None
-        for w in (_GRADE_WINDOW, _FALLBACK_WINDOW):
-            for pref, b in (("excess_uni_", "universe"),
-                            ("excess_theme_", performance.risk._theme()),
-                            ("excess_", "SPY")):
-                v = r.get(f"{pref}{w}")
-                if v is not None:
-                    grade, window, basis = v, w, b
+        grade, window, basis, clock = None, None, None, None
+        own = r.get("net_excess_uni_h")
+        if own is not None:
+            grade, window, basis, clock = own, str(r.get("horizon")), "universe", "horizon"
+        else:
+            for w in (_GRADE_WINDOW, _FALLBACK_WINDOW):
+                for pref, b in (("excess_uni_", "universe"),
+                                ("excess_theme_", performance.risk._theme()),
+                                ("excess_", "SPY")):
+                    v = r.get(f"{pref}{w}")
+                    if v is not None:
+                        grade, window, basis, clock = v, w, b, "fixed"
+                        break
+                if grade is not None:
                     break
-            if grade is not None:
-                break
         if grade is None:
             continue  # too fresh to grade
         out.append({**r, "grade_excess": grade, "grade_window": window,
-                    "grade_basis": basis})
+                    "grade_basis": basis, "grade_clock": clock})
     out.sort(key=lambda x: x["run_id"], reverse=True)
     return out
 
@@ -68,19 +76,35 @@ def symbol_track_record(symbol: str, max_n: int = 5) -> str:
         when = str(c.get("surfaced_at", ""))[:10]
         rating = c.get("rating") or "screen-only"
         conv = f" conv {c['conviction']}" if c.get("conviction") is not None else ""
+        # Say WHICH clock the number is on: "over your stated swing horizon" is a
+        # different (and more pointed) fact than "over 4w".
+        over = (f"over your stated {c['grade_window']} horizon"
+                if c.get("grade_clock") == "horizon" else f"over {c['grade_window']}")
         lines.append(f"  - {when}: {rating}{conv} @ ${c.get('price_at_surface')} -> "
                      f"{c['grade_excess']:+.1f}% vs {c.get('grade_basis','universe')} "
-                     f"over {c['grade_window']}")
+                     f"{over}")
     lines.append("Weigh what your previous theses got right or wrong before rating again.")
     return "\n".join(lines)
 
 
+def _pick_horizons() -> dict[str, str]:
+    """Latest stated horizon per symbol, from the picks table. A position's clock is
+    the clock its most recent idea claimed; nothing else in the schema knows one."""
+    with storage.get_conn() as cn:
+        rows = cn.execute("SELECT symbol, horizon FROM picks WHERE horizon IS NOT NULL "
+                          "ORDER BY run_id").fetchall()
+    return {r["symbol"]: r["horizon"] for r in rows}
+
+
 def portfolio_action_outcomes(symbol: str | None = None) -> list[dict[str, Any]]:
     """Grade past portfolio deep-dive ACTIONS (add/hold/trim/exit): the holding's
-    excess return vs SMH (theme benchmark; SPY fallback) after each dive. 'Add'
-    graded well = positive excess; 'trim/exit' graded well = NEGATIVE excess (you
-    avoided a laggard). 'Hold' is graded with a ±3pp dead band — a hold that merely
-    drifts with the theme is neither right nor wrong."""
+    excess return vs the THEME benchmark (risk._theme(); market benchmark as fallback)
+    after each dive. 'Add' graded well = positive excess; 'trim/exit' graded well =
+    NEGATIVE excess (you avoided a laggard). 'Hold' is graded with a ±3pp dead band —
+    a hold that merely drifts with the theme is neither right nor wrong.
+
+    The window is the position's OWN horizon when its latest pick claimed one, else
+    the fixed 4w->1w ladder."""
     with storage.get_conn() as cn:
         rows = [dict(r) for r in cn.execute(
             """SELECT p.run_id, p.symbol, p.action, p.conviction, p.last,
@@ -92,7 +116,11 @@ def portfolio_action_outcomes(symbol: str | None = None) -> list[dict[str, Any]]
     rows = [r for r in rows if not symbol or r["symbol"] == symbol.upper()]
     if not rows:
         return []
-    syms = sorted({r["symbol"] for r in rows} | {"SPY", "SMH"})
+    theme = performance.risk._theme()
+    market = config.get("technical.benchmark", "SPY")
+    hz_by_sym = _pick_horizons()
+    hz_days = config.get("evaluation.horizons", {}) or {}
+    syms = sorted({r["symbol"] for r in rows} | {market, theme})
     t_all = []
     for r in rows:
         try:
@@ -110,12 +138,16 @@ def portfolio_action_outcomes(symbol: str | None = None) -> list[dict[str, Any]]
             continue
         graded = None
         window = None
-        for label, days in (("4w", 21), ("1w", 5)):
+        own = hz_by_sym.get(r["symbol"])
+        ladder = [(lbl, performance._WINDOWS[lbl]) for lbl in ("4w", "1w")]
+        if own and isinstance(hz_days.get(own), int) and hz_days[own] > 0:
+            ladder = [(own, int(hz_days[own]))] + ladder
+        for label, days in ladder:
             fr = performance._fwd_return(px, r["symbol"], t0, days)
-            # Theme benchmark first (holdings are AI-cluster); SPY as fallback.
-            br = performance._fwd_return(px, "SMH", t0, days)
+            # Theme benchmark first (the book clusters on the theme); market as fallback.
+            br = performance._fwd_return(px, theme, t0, days)
             if br is None:
-                br = performance._fwd_return(px, "SPY", t0, days)
+                br = performance._fwd_return(px, market, t0, days)
             if fr is not None and br is not None:
                 graded, window = round(fr - br, 2), label
                 break
@@ -140,7 +172,8 @@ def portfolio_track_record(symbol: str, max_n: int = 4) -> str:
     calls = portfolio_action_outcomes(symbol)[:max_n]
     if not calls:
         return ""
-    lines = [f"YOUR PRIOR PORTFOLIO ACTIONS ON {symbol.upper()} (graded vs SPY):"]
+    theme = performance.risk._theme()
+    lines = [f"YOUR PRIOR PORTFOLIO ACTIONS ON {symbol.upper()} (graded vs {theme}):"]
     for c in calls:
         when = str(c.get("finished_at", ""))[:10]
         verdict = "RIGHT" if c["was_right"] else "WRONG"
@@ -148,7 +181,7 @@ def portfolio_track_record(symbol: str, max_n: int = 4) -> str:
               if c.get("weight_pct") is not None and c.get("target_weight_pct") is not None
               else "")
         lines.append(f"  - {when}: {c['action']} conv {c['conviction']}{tw} -> "
-                     f"{c['grade_excess']:+.1f}% vs SPY over {c['grade_window']} "
+                     f"{c['grade_excess']:+.1f}% vs {theme} over {c['grade_window']} "
                      f"[{verdict} call]")
     return "\n".join(lines)
 
@@ -243,8 +276,9 @@ def portfolio_learning_block() -> str:
 
 # ---------------------------------------------------------------- reflection
 _REFLECT_TMPL = """Today is {today}. You are reviewing YOUR OWN past stock calls to extract
-durable lessons. Below are your worst and best graded calls (excess return vs SPY over the
-stated window), with the thesis you wrote at the time.
+durable lessons. Below are your worst and best graded calls (excess return vs the stated
+benchmark, over the stated window or the idea's own horizon), with the thesis you wrote at
+the time.
 
 WORST CALLS:
 {worst_block}
@@ -273,10 +307,14 @@ def _call_block(calls: list[dict]) -> str:
             r = cn.execute("SELECT thesis FROM research_reports WHERE run_id=? AND symbol=?",
                            (c["run_id"], c["symbol"])).fetchone()
         thesis = (r["thesis"] if r and r["thesis"] else "(screen-only, no thesis)")[:280]
+        # Name the actual benchmark and clock: with per-idea horizons `grade_window`
+        # can read "swing", and "vs SPY (swing)" would be two lies in four words.
+        over = (f"its stated {c['grade_window']} horizon"
+                if c.get("grade_clock") == "horizon" else c["grade_window"])
         lines.append(f"- {c['symbol']} on {str(c.get('surfaced_at',''))[:10]}: "
                      f"{c.get('rating') or 'screen-only'} conv {c.get('conviction')} -> "
-                     f"{c['grade_excess']:+.1f}% vs SPY ({c['grade_window']}). "
-                     f"Thesis then: {thesis}")
+                     f"{c['grade_excess']:+.1f}% vs {c.get('grade_basis','universe')} "
+                     f"({over}). Thesis then: {thesis}")
     return "\n".join(lines) or "(none)"
 
 
@@ -326,14 +364,22 @@ def reflect(n_worst: int = 4, n_best: int = 2) -> dict[str, Any]:
 _PILLARS = ("technical", "fundamental", "sentiment", "catalyst")
 
 
-def pillar_ic() -> dict[str, Any]:
+def pillar_ic(horizon_days: int = 21) -> dict[str, Any]:
     """Information coefficient per pillar, computed Fama-MacBeth style:
     cross-sectional Spearman per run DATE (full universe, one deep run per day),
     on NON-OVERLAPPING dates >=21 trading days apart, then averaged across dates
     with a t-stat. Only rows from the CURRENT score version count (a pillar whose
     definition changed is a different signal). Suggested re-weights are printed
     only when at least one pillar's |t| >= 2 — otherwise the honest answer is
-    'not enough independent data yet'."""
+    'not enough independent data yet'.
+
+    `horizon_days` is the forward-return horizon the pillars are measured against
+    (default 21 = the pre-Phase-6 behaviour). Run it at 10/42/126 to answer "does the
+    technical pillar work on a swing clock and the fundamental on a long one?" — the
+    empirical basis for per-horizon pillar weights. Note the date spacing is NOT
+    widened with the horizon, so at 126 days the dates overlap and the t-stat is
+    optimistic; the backtest harness (--horizon-days) is the non-overlapping version
+    of the same question."""
     from .scoring import effective_score_version, pillar_set
     sv = effective_score_version()
     ps = pillar_set()
@@ -394,7 +440,7 @@ def pillar_ic() -> dict[str, Any]:
     dates_used = 0
     for d, g in df.groupby("started_at"):
         t0 = pd.Timestamp(d)
-        fwd = {row.symbol: performance._fwd_return(px, row.symbol, t0, 21)
+        fwd = {row.symbol: performance._fwd_return(px, row.symbol, t0, horizon_days)
                for row in g.itertuples()}
         gg = g.assign(fwd=[fwd.get(s) for s in g["symbol"]]).dropna(subset=["fwd"])
         if len(gg) < 20:
@@ -424,7 +470,8 @@ def pillar_ic() -> dict[str, Any]:
 
     cur = config.get("scoring.pillars",
                      {"technical": 0.35, "fundamental": 0.30, "sentiment": 0.35})
-    out: dict[str, Any] = {"n_dates": dates_used, "ic": ics, "t_stat": tstats,
+    out: dict[str, Any] = {"n_dates": dates_used, "horizon_days": horizon_days,
+                           "ic": ics, "t_stat": tstats,
                            "current_weights": cur, "score_version": sv,
                            "pillar_set": ps, "pillars_measured": present}
     if skipped:

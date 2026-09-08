@@ -23,7 +23,32 @@ from . import config, theme
 #                   being hardcoded AI-infra, and `deal_likelihood` is no longer asked
 #                   for. Ratings from v4 and v5 are different "analysts" — which is
 #                   exactly what calibration_by_prompt_version exists to separate.
-PROMPT_VERSION = 5
+#   v6  2026-09-08  horizon-conditional: the analyst picks swing|position|long FIRST
+#                   and rates ON that clock, and states expected move + invalidation
+#                   level. The coupling is the point — a horizon that does not
+#                   constrain the rating is a label, not a claim.
+PROMPT_VERSION = 6
+
+# The three clocks an idea can claim. Day counts live in config (evaluation.horizons)
+# because performance.py grades on them; the NAMES are code because the prompt, the
+# storage enum and the calibration cuts must all agree on the same three tokens.
+HORIZONS = ("swing", "position", "long")
+
+
+def horizon_menu_text() -> str:
+    """The horizon menu as prompt prose, rendered from config so the spans Claude is
+    offered can never drift from the day counts performance.py actually grades on."""
+    hz = config.get("evaluation.horizons", {}) or {}
+    spans = {"swing": "a catalyst or setup that resolves fast",
+             "position": "the default when neither extreme applies",
+             "long": "a re-rating or compounding thesis, not a catalyst"}
+    out = []
+    for name in HORIZONS:
+        days = int(hz.get(name, 42))
+        wks = days / 5.0
+        span = (f"~{wks:.0f} weeks" if wks < 9 else f"~{days / 21:.0f} months")
+        out.append(f'  - "{name}": {span} ({days} trading days) — {spans[name]}')
+    return "\n".join(out)
 
 
 def _stamp(report: dict) -> dict:
@@ -41,7 +66,21 @@ TODAY'S DATE IS {today}. Research {name} ({symbol}), sub-sector: {subsector}.
 
 Use web search to find information that is CURRENT AS OF TODAY ({today}) — latest price, news
 and filings from the last few days/weeks. Do NOT rely on memory; verify with current sources and
-note the date of the data you use. Assess, for a medium-term (weeks-to-months) swing horizon:
+note the date of the data you use.
+
+FIRST CHOOSE THE HORIZON THIS IDEA IS ACTUALLY ABOUT, then rate it ON THAT CLOCK:
+{horizon_menu}
+The horizon is a FALSIFIABLE CLAIM, not a label — the call will be graded on the clock you
+pick, so the evidence and the clock must match:
+  - a "swing" buy must rest on a specific catalyst or technical setup that RESOLVES inside
+    the swing window (a dated event, an earnings print, a breakout already in motion). "It
+    is a good company" is not a swing thesis.
+  - a "long" buy must NOT be justified by a near-term catalyst. If the whole argument is a
+    print or an announcement in the next few weeks, that is a swing call, whatever the
+    quality of the business.
+  - "position" is the correct default: the thesis needs a quarter or two of evidence to
+    play out, and no single dated event decides it.
+Then assess, on the horizon you chose:
 1. Concrete corporate CATALYSTS and their materiality: a large named customer/partner
    win or capex-driven demand (e.g. {actors}), M&A or activist involvement, guidance
    revisions, product launches/approvals/ramps, favourable regulation, buybacks or
@@ -57,13 +96,20 @@ note the date of the data you use. Assess, for a medium-term (weeks-to-months) s
 Context from local screening (may be partial):
 {context}
 
-Give an overall "rating" for the medium-term swing horizon:
+Give an overall "rating" FOR THE HORIZON YOU CHOSE (a name can be a "sell" on a swing clock
+and a "buy" on a long one — rate the clock you named, and say so in the rationale):
 - "strong_buy": high-conviction, attractive entry now
 - "buy": positive, worth initiating/adding
 - "hold": fairly valued / wait — neither add nor trim
 - "sell": deteriorating thesis or overvalued — trim/exit
 - "strong_sell": clear exit
 Be willing to say hold/sell; do not default to buy. Weigh valuation against the catalysts.
+Also state, on that same horizon:
+- "expected_move_pct": your CENTRAL expected price move over the horizon, signed (a bear
+  call is negative). Not the bull case, not a target you hope for — the middle of your
+  distribution. Be honest about magnitude: most stocks do not move 40% in two weeks.
+- "invalidation_level": the price below which the thesis is simply WRONG and you would
+  stop defending it (null only if you genuinely cannot name one).
 
 Also read the CHART SETUP from recent price action (use web data): describe the current technical
 pattern/structure (e.g. uptrend/breakout, base/consolidation, cup-and-handle, head-and-shoulders,
@@ -80,6 +126,10 @@ Output ONLY a single JSON object, no prose before or after, with exactly these k
   "ticker": "{symbol}",
   "rating": "strong_buy" | "buy" | "hold" | "sell" | "strong_sell",
   "conviction": <number 0-10>,
+  "horizon": "swing" | "position" | "long",
+  "horizon_rationale": "<what has to happen, and by when, for this to work on that clock>",
+  "expected_move_pct": <signed central expected move over THAT horizon, number>,
+  "invalidation_level": <price below which the thesis is wrong, number or null>,
   "thesis": "<2-4 sentence summary>",
   "chart_pattern": "<current chart setup/pattern + what it implies + caveat>",
   "metrics_read": "<plain-language, stock-specific: how to read THIS name's valuation/growth/quality and technical numbers, and what they imply>",
@@ -176,6 +226,32 @@ def _run_claude(prompt: str, allowed_tools: str | None = None,
 _RATINGS = ("strong_buy", "buy", "hold", "sell", "strong_sell")
 
 
+def _coerce_horizon(parsed: dict) -> dict:
+    """Validate the horizon triple on ANY report that carries one (board research and
+    portfolio deep dive alike — one implementation, so the two paths cannot drift).
+
+    An unrecognised horizon becomes None rather than a guess: the caller then falls
+    back to the deterministic quant/position default and records the source, so
+    "Claude chose this clock" never silently means "we made one up"."""
+    h = str(parsed.get("horizon") or "").strip().lower()
+    parsed["horizon"] = h if h in HORIZONS else None
+    if parsed.get("horizon_rationale") is not None:
+        parsed["horizon_rationale"] = str(parsed["horizon_rationale"])[:600]
+    # Bounds are wide on purpose — they reject parse garbage (a price pasted into a
+    # percent field), not opinions. -90% is a near-wipeout; +300% is a 4-bagger.
+    try:
+        em = float(parsed.get("expected_move_pct"))
+        parsed["expected_move_pct"] = round(max(-90.0, min(300.0, em)), 2)
+    except (TypeError, ValueError):
+        parsed["expected_move_pct"] = None
+    try:
+        iv = float(parsed.get("invalidation_level"))
+        parsed["invalidation_level"] = iv if iv > 0 else None
+    except (TypeError, ValueError):
+        parsed["invalidation_level"] = None
+    return parsed
+
+
 def _coerce_report(parsed: dict) -> dict:
     """Structured-output validation for a research report: enum-check the rating,
     bound the conviction, list-ify list fields. A malformed field becomes None (which
@@ -194,6 +270,7 @@ def _coerce_report(parsed: dict) -> dict:
     if "deal_likelihood" in parsed:
         dl = str(parsed.get("deal_likelihood") or "").strip().lower()
         parsed["deal_likelihood"] = dl if dl in ("low", "medium", "high") else None
+    _coerce_horizon(parsed)
     for k in ("catalysts", "risks"):
         v = parsed.get(k)
         parsed[k] = [str(x) for x in v][:12] if isinstance(v, list) else ([str(v)] if v else [])
@@ -213,10 +290,15 @@ def research_one(symbol: str, name: str, subsector: str,
             f"\nNOTE: This is a CURRENT HOLDING — {holding.get('shares')} shares at "
             f"avg cost {holding.get('avg_cost')}. Rate it as keep/add/trim/exit "
             f"(hold/buy/strong_buy/sell/strong_sell) given today's price and valuation.\n")
+    # NOTE: the quant default horizon (technical.default_horizon) is deliberately NOT
+    # in this prompt, nor in `context`. Claude's clock has to be an INDEPENDENT choice,
+    # otherwise agreement between the two is an anchoring artefact and measuring it
+    # tells us nothing.
     prompt = _PROMPT_TMPL.format(today=date.today().isoformat(), symbol=symbol, name=name,
                                  subsector=subsector or "n/a",
                                  context=context or "(none)",
                                  holding_note=holding_note,
+                                 horizon_menu=horizon_menu_text(),
                                  analyst_role=theme.fragment("analyst_role"),
                                  actors=theme.actors_text(),
                                  catalyst_emphasis=theme.fragment("catalyst_emphasis"))
@@ -244,9 +326,15 @@ def research_one(symbol: str, name: str, subsector: str,
         parsed.setdefault("chart_pattern", None)
         parsed.setdefault("metrics_read", None)
         parsed.setdefault("data_as_of", None)
+        parsed.setdefault("horizon", None)
+        parsed.setdefault("horizon_rationale", None)
+        parsed.setdefault("expected_move_pct", None)
+        parsed.setdefault("invalidation_level", None)
         return _stamp(_coerce_report(parsed))
     return _stamp({"symbol": symbol, "raw": result_text or last_raw, "rating": None,
-                   "conviction": None, "deal_likelihood": None,
+                   "conviction": None, "deal_likelihood": None, "horizon": None,
+                   "horizon_rationale": None, "expected_move_pct": None,
+                   "invalidation_level": None,
                    "thesis": "(could not parse JSON)", "catalysts": [], "risks": []})
 
 
@@ -294,7 +382,17 @@ PORTFOLIO CONTEXT — this position is {weight_pct}% of the total portfolio:
 {portfolio_block}
 {history_block}
 
-Assess for a medium-term swing horizon, given the cost basis:
+THE POSITION'S CURRENT CLOCK IS "{horizon}" — that is the horizon the last idea on this
+name claimed, and the one its outcome is graded on. The menu, for reference:
+{horizon_menu}
+Judge the position ON THAT CLOCK, and say so: a wobble that resolves inside a swing
+window is not a reason to exit a "long" position, and "it will work out eventually" is
+not a defence of a "swing" one. If the thesis has genuinely changed clocks — the
+catalyst you were waiting for is gone and only the compounding case remains, or vice
+versa — say so explicitly and return the NEW horizon; that is a real decision, not a
+relabelling, and it changes how the call will be graded.
+
+Assess on that horizon, given the cost basis:
 - Is the thesis intact, improving, or deteriorating?
 - DRAWDOWN DIAGNOSIS (mandatory if the price is >20% below its recent high): do NOT just
   react to the lower price — decompose WHY it fell, with dates: how much is (a) estimate
@@ -330,6 +428,10 @@ Assess for a medium-term swing horizon, given the cost basis:
 Output ONLY one JSON object:
 {{"symbol": "{symbol}", "action": "add"|"hold"|"trim"|"exit", "conviction": <0-10>,
   "target_weight_pct": <number>,
+  "horizon": "swing" | "position" | "long",
+  "horizon_rationale": "<what has to happen, and by when, on that clock>",
+  "expected_move_pct": <signed central expected move over THAT horizon, number>,
+  "invalidation_level": <price below which the thesis is wrong, number or null>,
   "thesis_health": "<intact|improving|deteriorating - one sentence>",
   "valuation": "<cheap|fair|rich - one sentence>",
   "add_level": <number or null>, "trim_level": <number or null>,
@@ -436,10 +538,26 @@ def sizing_rules_text(risk_ctx: dict | None = None) -> str:
     return "\n".join(lines)
 
 
+def position_horizon(symbol: str) -> str:
+    """The clock a HELD position is on: the horizon its most recent pick claimed, else
+    the configured default. Same interpretation learning.portfolio_action_outcomes
+    grades on, so the prompt and the grade cannot disagree about the clock."""
+    default = str(config.get("evaluation.default_horizon", "position"))
+    try:
+        from . import storage
+        with storage.get_conn() as cn:
+            row = cn.execute("SELECT horizon FROM picks WHERE symbol=? AND horizon IS NOT NULL "
+                             "ORDER BY run_id DESC LIMIT 1", (symbol.upper(),)).fetchone()
+    except Exception:  # noqa: BLE001 - a missing DB must not block a research call
+        return default
+    return (row["horizon"] if row and row["horizon"] in HORIZONS else default)
+
+
 def deep_dive_holding(symbol: str, name: str, subsector: str, holding: dict,
                       portfolio_block: str = "(not provided)",
                       history_block: str = "",
-                      risk_ctx: dict | None = None) -> dict[str, Any]:
+                      risk_ctx: dict | None = None,
+                      horizon: str | None = None) -> dict[str, Any]:
     prompt = _DEEPDIVE_TMPL.format(
         today=date.today().isoformat(), symbol=symbol, name=name, subsector=subsector or "n/a",
         shares=holding.get("shares"), avg_cost=holding.get("avg_cost"),
@@ -447,17 +565,20 @@ def deep_dive_holding(symbol: str, name: str, subsector: str, holding: dict,
         weight_pct=holding.get("weight_pct", "?"),
         portfolio_block=portfolio_block,
         history_block=history_block,
+        horizon=horizon or position_horizon(symbol),
+        horizon_menu=horizon_menu_text(),
         sizing_rules=sizing_rules_text(risk_ctx))
     parsed, raw = _run_json(prompt)
     if not parsed:
         return _stamp({"symbol": symbol, "action": None, "conviction": None,
                        "thesis_health": "(could not parse)", "risks": [], "catalysts": [],
-                       "sources": [], "raw": raw})
+                       "sources": [], "raw": raw, "horizon": None,
+                       "expected_move_pct": None, "invalidation_level": None})
     parsed["symbol"] = symbol
     parsed["raw"] = raw
     for k in ("risks", "catalysts", "sources"):
         parsed.setdefault(k, [])
-    return _stamp(parsed)
+    return _stamp(_coerce_horizon(parsed))
 
 
 def validate_recency(symbol: str, report: dict) -> dict[str, Any]:

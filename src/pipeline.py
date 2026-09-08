@@ -363,6 +363,7 @@ def run(mode: str = "deep") -> int:
             n_unrated = 0
             budget_hit = False
             per_call_timeout = float(config.get("claude.timeout_seconds", 600))
+            claude_horizon: dict[str, str] = {}   # symbol -> the clock Claude named
             for i, row in enumerate(finalists, 1):
                 remaining = budget - (time.monotonic() - t0) if budget else None
                 # Stop while a full call (+ possible red team) still fits — otherwise
@@ -385,6 +386,16 @@ def run(mode: str = "deep") -> int:
                            if h else None)
                 report = deep_research.research_one(
                     sym, row.get("name", sym), row.get("subsector", ""), ctx, holding=holding)
+                # The deterministic clock, recorded ALONGSIDE Claude's own choice (it is
+                # never shown to Claude — see deep_research.research_one, so agreement
+                # between the two stays a real measurement). It is also the fallback when
+                # the report named no valid horizon, so every pick has a clock to be
+                # graded on and horizon_source always says who chose it.
+                report["quant_horizon"] = technical.default_horizon(
+                    {**(row.get("metrics") or {}), "tags": row.get("tags")})
+                report["horizon_source"] = "claude" if report.get("horizon") else "quant"
+                if report.get("horizon"):
+                    claude_horizon[sym] = report["horizon"]
                 # Devil's-advocate pass on buy-rated names: the funnel pre-selects
                 # momentum winners and the context primes Claude bullishly, so someone
                 # must be paid to disagree. Downgrades/haircuts are applied + recorded.
@@ -415,8 +426,18 @@ def run(mode: str = "deep") -> int:
                 hz.ok("research", f"{done}/{len(finalists)} researched")
             # Snapshot ranked opportunity prices for forward tracking, PLUS the benchmark
             # price at the same instant so future excess-return vs SPY is computable.
-            picks = [{"symbol": r["symbol"], "price": (r.get("metrics") or {}).get("price")}
-                     for r in top_finalists]
+            # The clock each pick will be graded on: Claude's when it named one, the
+            # quant default otherwise (names the budget skipped, reports that returned no
+            # valid horizon). Never invented for rows already in the table.
+            picks = []
+            for r in top_finalists:
+                own = claude_horizon.get(r["symbol"])
+                picks.append({
+                    "symbol": r["symbol"],
+                    "price": (r.get("metrics") or {}).get("price"),
+                    "horizon": own or technical.default_horizon(
+                        {**(r.get("metrics") or {}), "tags": r.get("tags")}),
+                    "horizon_source": "claude" if own else "quant"})
             bench = config.get("technical.benchmark", "SPY")
             bench_price = technical.benchmark_last_price(bench)
             if bench_price is not None:

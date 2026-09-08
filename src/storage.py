@@ -211,7 +211,8 @@ CREATE TABLE IF NOT EXISTS portfolio_summary (
 # Bumped whenever _migrate gains a step. Recorded in the schema_version table so a
 # future non-additive change (a rename needs a copy-table in SQLite) has a real anchor
 # to branch on instead of re-deriving state from PRAGMA every time.
-SCHEMA_VERSION = 2   # 2: tickers.sector / tickers.industry_group
+SCHEMA_VERSION = 3   # 3: per-idea horizon + horizon_source on picks,
+                     #    research_reports and portfolio_positions
 
 
 def _add_col(conn: sqlite3.Connection, table: str, name: str, decl: str) -> None:
@@ -298,6 +299,24 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _add_col(conn, "picks", "horizon", "TEXT")
     _add_col(conn, "research_reports", "horizon", "TEXT")
     _add_col(conn, "research_reports", "horizon_rationale", "TEXT")
+    # Phase 6. horizon_source says WHO chose the clock: 'claude' (the analyst named it),
+    # 'quant' (technical.default_horizon filled in), 'legacy' (nobody did — the column is
+    # NULL and stays NULL; see the comment above, backfilling would invent a decision).
+    # quant_horizon records the deterministic label ALONGSIDE Claude's, so
+    # agreement(claude, quant) is a query, not an archaeology project.
+    _add_col(conn, "picks", "horizon_source", "TEXT")
+    _add_col(conn, "research_reports", "horizon_source", "TEXT")
+    _add_col(conn, "research_reports", "quant_horizon", "TEXT")
+    # The analyst's own numbers on that clock: the central expected move and the price
+    # that falsifies the thesis (Phase 8's trigger extractor wants levels, not prose).
+    _add_col(conn, "research_reports", "expected_move_pct", "REAL")
+    _add_col(conn, "research_reports", "invalidation_level", "REAL")
+    # Same three on a HELD position's deep dive, so a holding is judged (and graded) on
+    # the clock it is actually on. `invalidation_level` is the numeric companion to the
+    # existing prose `invalidation` column, not a replacement for it.
+    _add_col(conn, "portfolio_positions", "horizon", "TEXT")
+    _add_col(conn, "portfolio_positions", "expected_move_pct", "REAL")
+    _add_col(conn, "portfolio_positions", "invalidation_level", "REAL")
     # Which pillars composed the score. An integer score_version cannot express two
     # independently dark pillars; this can.
     _add_col(conn, "screen_scores", "pillar_set", "TEXT")
@@ -519,6 +538,12 @@ def upsert_research(run_id: int, r: dict[str, Any]) -> None:
         "chart_pattern": r.get("chart_pattern"),
         "metrics_read": r.get("metrics_read"),
         "data_as_of": r.get("data_as_of"),
+        "horizon": r.get("horizon"),
+        "horizon_rationale": r.get("horizon_rationale"),
+        "horizon_source": r.get("horizon_source"),
+        "quant_horizon": r.get("quant_horizon"),
+        "expected_move_pct": r.get("expected_move_pct"),
+        "invalidation_level": r.get("invalidation_level"),
         "catalysts_json": json.dumps(r.get("catalysts", [])),
         "risks_json": json.dumps(r.get("risks", [])),
         "red_team_json": json.dumps(r.get("red_team", {})),
@@ -532,13 +557,18 @@ def upsert_research(run_id: int, r: dict[str, Any]) -> None:
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO research_reports
-               (run_id,symbol,rating,conviction,deal_likelihood,thesis,chart_pattern,metrics_read,data_as_of,catalysts_json,risks_json,red_team_json,bull,bear,raw,prompt_version,model,created_at)
-               VALUES(:run_id,:symbol,:rating,:conviction,:deal_likelihood,:thesis,:chart_pattern,:metrics_read,:data_as_of,:catalysts_json,:risks_json,:red_team_json,:bull,:bear,:raw,:prompt_version,:model,:created_at)
+               (run_id,symbol,rating,conviction,deal_likelihood,thesis,chart_pattern,metrics_read,data_as_of,horizon,horizon_rationale,horizon_source,quant_horizon,expected_move_pct,invalidation_level,catalysts_json,risks_json,red_team_json,bull,bear,raw,prompt_version,model,created_at)
+               VALUES(:run_id,:symbol,:rating,:conviction,:deal_likelihood,:thesis,:chart_pattern,:metrics_read,:data_as_of,:horizon,:horizon_rationale,:horizon_source,:quant_horizon,:expected_move_pct,:invalidation_level,:catalysts_json,:risks_json,:red_team_json,:bull,:bear,:raw,:prompt_version,:model,:created_at)
                ON CONFLICT(run_id,symbol) DO UPDATE SET
                  rating=excluded.rating, conviction=excluded.conviction,
                  deal_likelihood=excluded.deal_likelihood,
                  thesis=excluded.thesis, chart_pattern=excluded.chart_pattern,
                  metrics_read=excluded.metrics_read, data_as_of=excluded.data_as_of,
+                 horizon=excluded.horizon, horizon_rationale=excluded.horizon_rationale,
+                 horizon_source=excluded.horizon_source,
+                 quant_horizon=excluded.quant_horizon,
+                 expected_move_pct=excluded.expected_move_pct,
+                 invalidation_level=excluded.invalidation_level,
                  catalysts_json=excluded.catalysts_json,
                  risks_json=excluded.risks_json, red_team_json=excluded.red_team_json,
                  bull=excluded.bull, bear=excluded.bear,
@@ -560,6 +590,8 @@ def get_board(run_id: int) -> list[dict[str, Any]]:
                    g.catalysts_json AS sig_catalysts, g.summary,
                    r.rating, r.conviction, r.deal_likelihood, r.thesis, r.chart_pattern,
                    r.metrics_read, r.data_as_of, r.created_at AS research_at,
+                   r.horizon, r.horizon_rationale, r.horizon_source, r.quant_horizon,
+                   r.expected_move_pct, r.invalidation_level,
                    r.catalysts_json AS res_catalysts, r.risks_json, r.red_team_json,
                    r.bull, r.bear, r.raw,
                    h.position AS held_position, h.avg_cost AS held_avg_cost,
@@ -637,14 +669,23 @@ def upsert_quotes(rows: Iterable[dict[str, Any]]) -> None:
 
 
 def record_picks(run_id: int, rows: Iterable[dict[str, Any]]) -> None:
+    """Snapshot the surfaced names for forward grading.
+
+    `horizon`/`horizon_source` travel WITH the pick because that is what fixes the
+    clock it will be graded on. Rows without one (the benchmark snapshot, and every
+    pick recorded before Phase 6) stay NULL — performance.pick_outcomes reports those
+    as horizon_source 'legacy' and grades them on the fixed windows only."""
     payload = [{
         "run_id": run_id, "symbol": r["symbol"],
         "surfaced_at": now_iso(), "price_at_surface": r.get("price"),
+        "horizon": r.get("horizon"), "horizon_source": r.get("horizon_source"),
     } for r in rows]
     with get_conn() as conn:
         conn.executemany(
-            """INSERT INTO picks(run_id,symbol,surfaced_at,price_at_surface)
-               VALUES(:run_id,:symbol,:surfaced_at,:price_at_surface)
+            """INSERT INTO picks(run_id,symbol,surfaced_at,price_at_surface,
+                                 horizon,horizon_source)
+               VALUES(:run_id,:symbol,:surfaced_at,:price_at_surface,
+                      :horizon,:horizon_source)
                ON CONFLICT(run_id,symbol) DO NOTHING""",
             payload,
         )
@@ -788,6 +829,9 @@ def upsert_portfolio_position(run_id: int, p: dict[str, Any]) -> None:
         "thesis_health": p.get("thesis_health"), "valuation": p.get("valuation"),
         "add_level": p.get("add_level"), "trim_level": p.get("trim_level"),
         "invalidation": p.get("invalidation"),
+        "horizon": p.get("horizon"),
+        "expected_move_pct": p.get("expected_move_pct"),
+        "invalidation_level": p.get("invalidation_level"),
         "risks_json": json.dumps(p.get("risks", [])),
         "catalysts_json": json.dumps(p.get("catalysts", [])),
         "data_as_of": p.get("data_as_of"),
