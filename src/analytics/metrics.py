@@ -28,14 +28,23 @@ RAW_FIELDS = (
     "revenueGrowth", "earningsGrowth", "grossMargins", "operatingMargins",
     "returnOnEquity", "returnOnAssets", "debtToEquity",
     "trailingPE", "forwardPE", "pegRatio", "enterpriseToEbitda", "enterpriseToRevenue",
-    "priceToSalesTrailing12Months", "fiftyDayAverage", "twoHundredDayAverage",
+    "priceToSalesTrailing12Months", "priceToBook", "fiftyDayAverage",
+    "twoHundredDayAverage", "cfo", "operatingCashflow", "dna",
     "financialCurrency", "earningsTimestamp", "earningsTimestampStart",
 )
 
 # Ratios that mix a USD market figure with a local-currency statement figure are
 # meaningless for non-USD reporters (ADRs); per-share USD ratios and margins survive.
 _CCY_SENSITIVE = ("net_cash", "fcf_yield", "p_fcf", "ev_sales", "enterpriseToEbitda",
-                  "priceToSalesTrailing12Months")
+                  "priceToSalesTrailing12Months", "priceToBook", "p_ffo", "ffo_yield",
+                  "trailingPE")
+# ...but only when WE built them out of a market cap and a statement figure. A ratio the
+# source handed us whole (yfinance's `trailingPE`, `priceToBook`) is already internally
+# consistent — Yahoo prices the ADR in USD against USD-converted per-share figures — so
+# masking it would throw away the only correct multiple a foreign filer has. TSM is the
+# case that forced this: SEC facts give USD cap / TWD income = P/E 206, which read as a
+# risk flag, while `.info` says 31.8 and is right.
+_CCY_FALLBACK_ONLY = ("trailingPE", "priceToBook")
 
 
 def _pos(x) -> float | None:
@@ -86,12 +95,45 @@ def derive(raw: dict[str, Any], as_of: date | None = None) -> dict[str, Any]:
     m["priceToSalesTrailing12Months"] = _pos(raw.get("priceToSalesTrailing12Months"))
     if m["priceToSalesTrailing12Months"] is None:
         m["priceToSalesTrailing12Months"] = _ratio(mcap, rev)
+    # `from_source` records which of the currency-fragile multiples the caller supplied
+    # whole versus which we rebuilt from a market cap; only the rebuilt ones are masked
+    # for a non-USD reporter (see _CCY_FALLBACK_ONLY).
+    from_source: set[str] = set()
     m["trailingPE"] = _pos(raw.get("trailingPE"))
-    if m["trailingPE"] is None and ni is not None and ni > 0:
+    if m["trailingPE"] is not None:
+        from_source.add("trailingPE")
+    elif ni is not None and ni > 0:
         m["trailingPE"] = _ratio(mcap, ni)
     m["forwardPE"] = _pos(raw.get("forwardPE"))          # live-only (analyst estimates)
     m["pegRatio"] = _pos(raw.get("pegRatio"))            # live-only
     m["net_cash"] = (cash - debt) if (cash is not None and debt is not None) else None
+    # Book value: the valuation multiple for banks and insurers, whose EV/EBITDA does
+    # not exist (interest IS the revenue) and whose P/S is meaningless. Without it a
+    # whole sector could only ever be ranked on P/E.
+    equity = _pos(raw.get("totalStockholderEquity"))
+    m["priceToBook"] = _pos(raw.get("priceToBook"))
+    if m["priceToBook"] is not None:
+        from_source.add("priceToBook")
+    elif (equity or 0) > 0:
+        m["priceToBook"] = _ratio(mcap, equity)
+    # FFO: the REIT earnings measure. Depreciation on buildings is the single largest
+    # charge in a REIT's P&L and is largely fictional, so P/E and every margin built on
+    # net income mis-rank the sector; P/FFO is what the sector is actually priced on.
+    # For the same reason FFO — not free cash flow — is a REIT's cash-flow measure:
+    # development capex makes fcf_yield negative for a healthy REIT by construction.
+    dna = _pos(raw.get("dna"))
+    m["ffo"] = (ni + dna) if (ni is not None and dna is not None) else None
+    m["p_ffo"] = _ratio(mcap, m["ffo"]) if (m["ffo"] or 0) > 0 else None
+    m["ffo_yield"] = _ratio(m["ffo"], mcap)
+    m["ffo_margin"] = _ratio(m["ffo"], rev)
+    # Quarters of operating cash burn the balance sheet covers. None for a cash
+    # GENERATOR (cfo >= 0): "infinite runway" is not a number and must not rank.
+    cfo = _pos(raw.get("cfo"))
+    if cfo is None:
+        cfo = _pos(raw.get("operatingCashflow"))
+    m["cash_runway_quarters"] = (_ratio(cash, max(-cfo, 1e-9) / 4.0)
+                                 if (cash is not None and cfo is not None and cfo < 0)
+                                 else None)
 
     # Growth
     m["revenueGrowth"] = _pos(raw.get("revenueGrowth"))
@@ -131,6 +173,8 @@ def derive(raw: dict[str, Any], as_of: date | None = None) -> dict[str, Any]:
     m["financial_currency"] = fin_ccy
     if fin_ccy and fin_ccy != "USD":
         for k in _CCY_SENSITIVE:
+            if k in _CCY_FALLBACK_ONLY and k in from_source:
+                continue
             m[k] = None
 
     # Next earnings date (live-only; historical snapshots have none)

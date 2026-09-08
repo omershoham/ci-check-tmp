@@ -115,7 +115,64 @@ def subsector_map() -> dict[str, str]:
     return {r["symbol"]: r["subsector"] for r in build_universe()}
 
 
+def sector_map(rows: list[dict[str, Any]] | None = None, store=None,
+               symbols: list[str] | None = None) -> dict[str, str]:
+    """symbol -> GICS-like sector, the peer set VALUATION is ranked inside.
+
+    The broad path already carries it on each row; the curated path does not, but
+    every curated name is an SEC registrant too, so the same SIC-derived table serves
+    both. A name the table does not know keeps "Unknown" — its own group, never
+    silently folded into a real sector's peer comparison."""
+    from .data import registrants
+    from .data.history_store import HistoryStore
+    out: dict[str, str] = {}
+    if rows:
+        out = {r["symbol"]: r["sector"] for r in rows if r.get("sector")}
+        symbols = symbols or [r["symbol"] for r in rows]
+    symbols = symbols or [r["symbol"] for r in build_universe()]
+    missing = [s for s in symbols if not out.get(s)]
+    if missing:
+        try:
+            reg = registrants.load_registrants(store or HistoryStore())
+        except Exception:  # noqa: BLE001 - no registrant table is not a run-stopper
+            reg = pd.DataFrame()
+        if not reg.empty:
+            m = dict(zip(reg["symbol"], reg["sector"]))
+            for s in missing:
+                if m.get(s):
+                    out[s] = m[s]
+    return {s: out.get(s) or "Unknown" for s in symbols}
+
+
 # --------------------------------------------------------------- the PIT floor
+def price_liquidity(store, symbols: list[str], as_of: date) -> pd.DataFrame:
+    """Per symbol: closes in the screen window, last close date, last close, and mean
+    dollar volume over the trailing `adv_window` sessions. Indexed by symbol.
+
+    ONE definition of the price half of the floor. `investable()` uses it for the
+    broad path; the curated path needs the same numbers now that stage 1 reads
+    fundamentals from the store and no longer receives `.info`'s averageVolume."""
+    ts = pd.Timestamp(as_of).normalize()
+    window = int(broad_cfg("screen_price_days"))
+    adv_win = int(broad_cfg("adv_window"))
+    px = store.prices(symbols, start=(ts - pd.Timedelta(days=window)).date(),
+                      end=ts.date(), columns=["close", "volume"])
+    if px.empty:
+        return pd.DataFrame(columns=["n_obs", "last_date", "price", "adv"])
+    # store.prices() already returns (symbol, date)-sorted rows, so `last`/`tail` mean
+    # "most recent" without a second sort of a multi-million-row frame.
+    g = px.groupby("symbol", sort=False)
+    tail = g.tail(adv_win)
+    out = pd.DataFrame({
+        "n_obs": g["date"].size(),
+        "last_date": g["date"].max(),
+        "price": g["close"].last(),
+        "adv": tail.assign(_dv=tail["close"] * tail["volume"]).groupby("symbol")["_dv"].mean(),
+    })
+    out.attrs["sessions"] = pd.Index(px["date"].unique()).sort_values()
+    return out
+
+
 def investable(as_of: date, store=None, candidates: list[str] | None = None,
                max_symbols: int | None = None,
                log: Callable[[str], None] = _log_noop) -> list[dict[str, Any]]:
@@ -150,29 +207,15 @@ def investable(as_of: date, store=None, candidates: list[str] | None = None,
         return []
 
     ts = pd.Timestamp(as_of).normalize()
-    window = int(broad_cfg("screen_price_days"))
     min_hist = int(broad_cfg("min_history_days"))
-    adv_win = int(broad_cfg("adv_window"))
     recency = int(broad_cfg("recency_trading_days"))
     syms = reg["symbol"].tolist()
 
-    px = store.prices(syms, start=(ts - pd.Timedelta(days=window)).date(),
-                      end=ts.date(), columns=["close", "volume"])
-    if px.empty:
+    stat = price_liquidity(store, syms, as_of)
+    if stat.empty:
         log(f"  investable({ts.date()}): no prices for {len(syms)} candidates")
         return []
-    # store.prices() already returns (symbol, date)-sorted rows, so `last`/`tail` mean
-    # "most recent" without a second sort of a multi-million-row frame.
-    g = px.groupby("symbol", sort=False)
-    tail = g.tail(adv_win)
-    stat = pd.DataFrame({
-        "n_obs": g["date"].size(),
-        "last_date": g["date"].max(),
-        "price": g["close"].last(),
-        "adv": tail.assign(_dv=tail["close"] * tail["volume"]).groupby("symbol")["_dv"].mean(),
-    })
-
-    sessions = pd.Index(px["date"].unique()).sort_values()
+    sessions = stat.attrs["sessions"]
     cutoff = sessions[-min(recency, len(sessions))]
 
     meta = reg.set_index("symbol")

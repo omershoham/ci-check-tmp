@@ -103,6 +103,98 @@ def fetch_many(symbols: list[str], throttle: float = 0.4,
     return out
 
 
+def from_store(store, symbols: list[str], as_of: date | None = None,
+               extra: dict[str, dict] | None = None) -> dict[str, dict]:
+    """The screen's metrics for `symbols`, read from the point-in-time SEC store.
+
+    THIS REPLACES `fetch_many` AS THE SCREEN'S INPUT. The old stage 1 made one
+    throttled `.info` request per name (5,000 sequential requests to score a broad
+    universe); the snapshots here are a parquet read, and they are the SAME rows the
+    backtest scores, so the live screen and the composite backtest finally consume
+    identical inputs instead of two sources that merely resemble each other.
+
+    Price and dollar volume come from the local price store, market cap from the
+    snapshot (price x as-filed shares), the next earnings date from filing cadence
+    (`sec_facts.next_earnings_estimate`). `extra` overrides per symbol - that is how
+    `enrich()`'s forward P/E and exact earnings timestamp get in for the shortlist.
+
+    Always returns one dict per symbol; a name the store cannot serve comes back with
+    `error` set, so the floor drops it instead of it vanishing without a trace."""
+    from . import universe
+    from .data import sec_facts
+    d = as_of or date.today()
+    snap = store.fundamentals_asof(symbols, d)
+    liq = universe.price_liquidity(store, symbols, d)
+    try:
+        earn = sec_facts.next_earnings_estimate(store, symbols, d)
+    except Exception:  # noqa: BLE001 - an estimate is a nicety, never a reason to fail
+        earn = pd.Series(dtype="datetime64[ns]")
+    snap_rows = snap.to_dict("index") if not snap.empty else {}
+    liq_rows = liq.to_dict("index") if not liq.empty else {}
+    out: dict[str, dict] = {}
+    for sym in symbols:
+        m: dict[str, Any] = {"symbol": sym, "name": sym}
+        row = snap_rows.get(sym)
+        if row:
+            m.update({k: (None if v != v else v) for k, v in row.items()
+                      if k not in ("as_of", "symbol")})
+        else:
+            m["error"] = "no SEC snapshot within the freshness window"
+        lq = liq_rows.get(sym) or {}
+        if lq.get("price") == lq.get("price") and lq.get("price"):
+            m["price"] = float(lq["price"])
+        m["avg_dollar_volume"] = (float(lq["adv"]) if lq.get("adv") == lq.get("adv")
+                                  and lq.get("adv") is not None else None)
+        # Market cap must be priced off the SAME close the floor is: shares are as
+        # filed, the price moved since the snapshot was written.
+        if m.get("sharesOutstanding") and m.get("price"):
+            m["marketCap"] = float(m["price"]) * float(m["sharesOutstanding"])
+        nxt = earn.get(sym) if len(earn) else None
+        if nxt is not None and nxt == nxt:
+            m["earnings_date"] = pd.Timestamp(nxt).date().isoformat()
+            m["days_to_earnings"] = (pd.Timestamp(nxt).date() - d).days
+        if extra and sym in extra:
+            m.update({k: v for k, v in extra[sym].items() if k != "error"})
+        out[sym] = m
+    return out
+
+
+# The only fields `.info` still exists for. Everything else the screen ranks on now
+# comes from the local SEC store (`HistoryStore.fundamentals_asof` -> `derive`), which
+# is a parquet read rather than one throttled Yahoo request per name.
+# `trailingPE`/`priceToBook` are here for FOREIGN filers only, but are carried for
+# everyone because it costs nothing: SEC facts give a 20-F filer a USD market cap over
+# a local-currency statement, so `derive()` masks the rebuilt multiple to None. Yahoo
+# quotes the ADR against USD-converted per-share figures, so its number is the one
+# correct multiple such a name has. For a domestic filer the two agree to ~4%.
+_ENRICH_FIELDS = ("forwardPE", "pegRatio", "trailingPE", "priceToBook",
+                  "earningsTimestamp", "earningsTimestampStart",
+                  "earnings_date", "days_to_earnings", "name")
+
+
+def enrich(symbols: list[str], throttle: float = 0.4,
+           progress: bool = True) -> dict[str, dict]:
+    """`.info` for a BOUNDED set of names — the shortlist plus what you hold (~40-60).
+
+    This is the entire remaining surface of the per-symbol Yahoo path. It exists for
+    the two things SEC filings genuinely do not contain — forward P/E and the analyst
+    PEG, both estimates — plus the exact next-earnings timestamp and the company's
+    display name. Everything else is served from the store, which is why the universe
+    can grow 15x without the fundamentals stage growing at all.
+
+    Returns symbol -> only the enrichable keys (plus `error` when the call failed), so
+    a caller can merge it over store-derived metrics without a `.info` field silently
+    overwriting a point-in-time one."""
+    out: dict[str, dict] = {}
+    fetched = fetch_many(symbols, throttle=throttle, use_cache=True, progress=progress)
+    for sym, m in fetched.items():
+        keep = {k: m[k] for k in _ENRICH_FIELDS if m.get(k) is not None}
+        if m.get("error"):
+            keep["error"] = m["error"]
+        out[sym] = keep
+    return out
+
+
 def floor_thresholds() -> dict[str, float]:
     """The three config numbers the floor is made of, in one place."""
     floor = config.get("universe.liquidity_floor", {}) or {}

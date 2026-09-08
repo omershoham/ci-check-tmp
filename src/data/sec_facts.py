@@ -79,6 +79,9 @@ SHARES_TAGS = ["EntityCommonStockSharesOutstanding",
                "CommonStockSharesIssued",
                "WeightedAverageNumberOfDilutedSharesOutstanding"]
 
+# Forms that ARE a periodic report (the things a "next earnings date" counts).
+_PERIODIC_FORMS = ("10-K", "10-Q", "20-F", "40-F", "6-K", "8-K")
+
 _Q_DAYS = (75, 105)      # a fiscal quarter
 _A_DAYS = (340, 380)     # a fiscal year
 
@@ -429,6 +432,10 @@ def raw_asof_prepared(pf: PreparedFacts, as_of: date, price: float | None,
         "totalStockholderEquity": inst("totalStockholderEquity"),
         "totalCash": inst("totalCash"),
         "totalDebt": debt,
+        # cfo and dna are carried through (not just consumed into fcf/ebitda) because
+        # derive() builds cash_runway_quarters and REIT FFO from them.
+        "cfo": cfo,
+        "dna": dna,
         "revenueGrowth": (rev / rev_prev - 1) if (rev and rev_prev and rev_prev > 0) else None,
         "earningsGrowth": (ni / ni_prev - 1) if (ni is not None and ni_prev and ni_prev > 0) else None,
         "fiftyDayAverage": ma50,
@@ -607,6 +614,10 @@ def raw_asof(sym_facts: pd.DataFrame, as_of: date, price: float | None,
         "totalStockholderEquity": inst("totalStockholderEquity"),
         "totalCash": inst("totalCash"),
         "totalDebt": debt,
+        # cfo and dna are carried through (not just consumed into fcf/ebitda) because
+        # derive() builds cash_runway_quarters and REIT FFO from them.
+        "cfo": cfo,
+        "dna": dna,
         "revenueGrowth": (rev / rev_prev - 1) if (rev and rev_prev and rev_prev > 0) else None,
         "earningsGrowth": (ni / ni_prev - 1) if (ni is not None and ni_prev and ni_prev > 0) else None,
         "fiftyDayAverage": ma50,
@@ -645,13 +656,20 @@ def _snapshot_symbol(payload: tuple) -> list[dict[str, Any]]:
 
 
 def build_snapshots(store, symbols: list[str], dates: list[pd.Timestamp],
-                    log=print, workers: int | None = None) -> pd.DataFrame:
+                    log=print, workers: int | None = None,
+                    facts_start: date | None = None) -> pd.DataFrame:
     """Derived metrics per (as_of, symbol) using only facts filed by as_of and the
     raw close on/before as_of. Writes to the store and returns the frame.
 
     Symbols are independent, so the O(symbols x dates) double loop is farmed out to a
-    process pool; `workers=1` is the old serial loop, byte for byte."""
-    facts = store.facts(symbols)
+    process pool; `workers=1` is the old serial loop, byte for byte.
+
+    `facts_start` bounds the FILING date read from the store. The full-history grid
+    leaves it None; `build_daily_snapshot` sets it, because a one-date run does not
+    need to page in ten years of filings to compute a TTM and its year-earlier
+    comparison. A filer silent for longer than that window yields no row - which is
+    the honest answer for a name whose last statement is that old."""
+    facts = store.facts(symbols, start=facts_start)
     # Bound the pivot to the window the snapshot grid can actually read: the 200-day
     # moving average needs ~a year of lead-in, nothing needs the years before that.
     lo = (min(dates) - pd.Timedelta(days=600)).date() if dates else None
@@ -673,3 +691,72 @@ def build_snapshots(store, symbols: list[str], dates: list[pd.Timestamp],
     if not df.empty:
         store.write_snapshots(df)
     return df
+
+
+def build_daily_snapshot(store, symbols: list[str], as_of: date | None = None,
+                         log=print, workers: int | None = None) -> pd.DataFrame:
+    """One `as_of=today` snapshot row per symbol, priced off today's raw close.
+
+    The monthly grid is a research artefact; the LIVE screen reads
+    `fundamentals_asof(today)` and would otherwise be served a month-end snapshot
+    carrying a month-old price - so every price-bearing multiple (P/E, P/S, P/B,
+    EV/EBITDA) would be stale by up to a month while the technical pillar used
+    today's tape. Cheap because the facts have not changed: only the price moves.
+
+    Must run BEFORE the pipeline reads fundamentals; `scripts/run_daily` calls it."""
+    d = pd.Timestamp(as_of or date.today()).normalize()
+    # ~3.3y of filings: enough for a TTM and its year-earlier comparison plus the
+    # slowest filing lag, and a fraction of the full-history read.
+    return build_snapshots(store, symbols, [d], log=log, workers=workers,
+                           facts_start=(d - pd.Timedelta(days=1200)).date())
+
+
+def next_earnings_estimate(store, symbols: list[str], as_of: date) -> pd.Series:
+    """Estimated NEXT earnings-report date per symbol, from filing history alone.
+
+    `earningsTimestamp` is a per-name `.info` field: it cannot exist for a
+    universe-wide screen without one network call per ticker, and it does not exist
+    at all for a past date, so nothing point-in-time could ever use it. Filers keep a
+    stable annual cadence, so the filing that covered the same fiscal period ONE YEAR
+    earlier, plus 365 days, dates the next one within a few days - knowable from the
+    local store for every name at once, and equally computable on a historical date.
+
+    Clipped to `as_of`: an overdue filer reads "due now", never "was due last week".
+    Returns a Timestamp Series indexed by symbol; names with fewer than four knowable
+    reporting periods are absent rather than guessed."""
+    ts = pd.Timestamp(as_of).normalize()
+    df = store.facts(symbols, start=(ts - pd.Timedelta(days=900)).date(), end=ts.date())
+    if df.empty:
+        return pd.Series(dtype="datetime64[ns]")
+    # Income-statement FLOWS only. Balance-sheet instants and the dei cover-page share
+    # count carry `end` dates that are not reporting-period ends (a cover page is dated
+    # the day the filing was signed), and letting those into the period list shifts the
+    # count backwards - the estimate then lands a quarter or two late, silently.
+    df = df[df["concept"].isin(("totalRevenue", "netIncome"))
+            & df["start"].notna() & df["end"].notna() & (df["end"] <= ts)]
+    # PERIODIC reports only. A proxy statement (DEF 14A) repeats last year's revenue and
+    # would land in the sequence as an extra "report", pushing the count a quarter back.
+    form = df["form"].fillna("10-Q").astype(str)
+    df = df[form.str.startswith(_PERIODIC_FORMS)]
+    if df.empty:
+        return pd.Series(dtype="datetime64[ns]")
+    # First filing that disclosed each period, then the distinct FILING DATES. Counting
+    # period ENDS would over-count: a 52/53-week filer tags the same quarter under two
+    # ends a few days apart (NVDA: 2025-07-26 and 2025-07-31), which would walk the
+    # count two quarters too far back. One filing date is one report, always.
+    per = df.groupby(["symbol", "end"], sort=True)["filed"].min().reset_index()
+    reports = (per.drop_duplicates(["symbol", "filed"])
+                  .sort_values(["symbol", "filed"], kind="stable"))
+    # 4 reports back from the latest = the same fiscal period one year before the one
+    # that reports NEXT.
+    same_period = reports.groupby("symbol", sort=False)["filed"].nth(-4)
+    if same_period.empty:
+        return pd.Series(dtype="datetime64[ns]")
+    est = (reports.loc[same_period.index].set_index("symbol")["filed"]
+           + pd.Timedelta(days=365))
+    # Never in the past. The bulk FSDS source lags a quarter, so for a filer whose most
+    # recent report is not in the store yet the anniversary has already gone by; step
+    # forward in whole quarters rather than clamping to today, which would tag a name
+    # "earnings-soon" purely because our facts are behind.
+    behind = ((ts - est).dt.days / 91.0).apply(np.ceil).clip(lower=0)
+    return (est + pd.to_timedelta(behind * 91, unit="D")).rename("next_earnings")

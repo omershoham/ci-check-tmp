@@ -27,17 +27,21 @@ def _log(msg: str) -> None:
 
 
 def build_signal(name: str, store: HistoryStore, syms: list[str], subs: dict[str, str],
-                 dates: list[pd.Timestamp], closes_adj: pd.DataFrame) -> pd.DataFrame:
+                 dates: list[pd.Timestamp], closes_adj: pd.DataFrame,
+                 secs: dict[str, str] | None = None) -> pd.DataFrame:
     if name == "momentum":
         return signals.momentum_12_1(closes_adj[syms], dates)
     if name == "technical":
         return signals.technical_pillar(store.prices(syms), dates, log=_log)
     if name == "fundamental":
-        return signals.fundamental_pillar(store, syms, subs, dates)
+        return signals.fundamental_pillar(store, syms, subs, dates, secs)
     if name == "composite":
         tech = signals.technical_pillar(store.prices(syms), dates, log=_log)
-        fund = signals.fundamental_pillar(store, syms, subs, dates)
-        return signals.composite_3pillar(tech, fund)
+        # `scored` is what keeps the replay's cross-section identical to the live
+        # screen's: thin-data names stay in and are re-weighted, names the liquidity
+        # floor would have dropped stay out.
+        fund, scored = signals.fundamental_frames(store, syms, subs, dates, secs)
+        return signals.composite_3pillar(tech, fund, scored)
     raise SystemExit(f"unknown signal {name}")
 
 
@@ -89,6 +93,10 @@ def run_one(name: str, store: HistoryStore, start: date, top_frac: float, top_n:
     # Membership is a set question; it used to be answered by pivoting the whole store
     # into a date x symbol matrix and reading `.columns`.
     syms = [s for s in syms if s in have]
+    # The VALUATION peer set. Sourced from the registrant table for BOTH universe
+    # sources — the curated names are SEC registrants too — so a replay ranks multiples
+    # inside the same sectors the live screen does.
+    secs = universe.sector_map(store=store, symbols=syms)
     spec = BacktestSpec(name=name, top_frac=top_frac, top_n=top_n, cost_bps_side=cost_bps,
                         params={"start": str(start), "rebalance": "BME"})
     # Read ONLY the scored names plus the report benchmarks. `close_matrix(None)` looked
@@ -98,7 +106,7 @@ def run_one(name: str, store: HistoryStore, start: date, top_frac: float, top_n:
     # claims to test, not of what else happens to have been downloaded.
     closes = store.close_matrix(sorted(set(syms) | set(spec.benchmarks)), adjusted=True)
     _log(f"{name}: {len(syms)} symbols, {len(dates)} month-ends from {start}")
-    scores = build_signal(name, store, syms, subs, dates, closes)
+    scores = build_signal(name, store, syms, subs, dates, closes, secs)
     if scores.empty:
         raise SystemExit(f"{name}: signal produced no scores (missing data?)")
     # PIT universe where recorded; otherwise the current curated list (disclosed).

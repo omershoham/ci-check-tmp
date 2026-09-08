@@ -671,8 +671,16 @@ def build_context(score_row: dict, signal_row: dict | None,
         "Quant pillar scores (0-1, higher=better):",
         f"  - Technical: {score_row.get('technical')} (setup: {m.get('setup_label')}, "
         f"RSI {m.get('rsi')}, 3mo RS vs {m.get('benchmark')}: {m.get('rs_3m')}pp)",
+        # Valuation is ranked inside the SECTOR, so the sector is part of what the
+        # number means; coverage says how much of it was actually measured.
         f"  - Fundamental: {score_row.get('fundamental')} "
-        f"(PE={m.get('trailingPE')}, fwdPE={m.get('forwardPE')}, P/FCF={m.get('p_fcf')}, revGrowth={m.get('revenueGrowth')})",
+        f"(sector {m.get('sector') or score_row.get('sector') or 'Unknown'}"
+        + (f", only {float(m['fund_coverage']):.0%} of its sector's metric set had data"
+           if m.get("fund_coverage") is not None and float(m["fund_coverage"]) < 0.6 else "")
+        + (" — TOO THIN TO SCORE, this pillar was dropped from the composite"
+           if score_row.get("fundamental") is None else "")
+        + f"; PE={m.get('trailingPE')} vs sector median {m.get('sector_pe_gics')}, "
+        f"fwdPE={m.get('forwardPE')}, P/FCF={m.get('p_fcf')}, revGrowth={m.get('revenueGrowth')})",
         f"  - Sentiment: {score_row.get('sentiment')} (news tone: {m.get('sentiment_label')})",
         f"  - Composite: {score_row.get('blended')}; tags: {', '.join(score_row.get('tags', []))}",
         "Weigh all three pillars (technical setup, fundamentals/valuation, news sentiment) "

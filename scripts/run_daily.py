@@ -8,7 +8,33 @@ from __future__ import annotations
 
 import argparse
 
-from src import config, market_calendar, pipeline
+from datetime import date
+
+from src import config, market_calendar, pipeline, universe
+
+
+def _refresh_today_snapshot() -> None:
+    """Write today's fundamentals snapshot BEFORE the pipeline reads it.
+
+    Order matters. Stage 1 now serves the fundamental pillar from
+    `fundamentals_asof(today)`, which falls back to the last month-end snapshot — so
+    without this the screen would rank today's technicals against multiples priced off
+    a close up to a month old. The facts have not changed since the month-end; only
+    the price has, which is why this is seconds rather than a rebuild."""
+    from src.data import sec_facts
+    from src.data.history_store import HistoryStore
+    store = HistoryStore()
+    syms = [r["symbol"] for r in universe.current_universe(store=store)]
+    if not syms:
+        print("[run_daily] no universe members; skipping today's snapshot")
+        return
+    try:
+        df = sec_facts.build_daily_snapshot(store, syms, date.today(),
+                                            log=lambda m: print(f"[run_daily] {m}"))
+        print(f"[run_daily] today's fundamentals snapshot: {len(df)}/{len(syms)} names")
+    except Exception as exc:  # noqa: BLE001 - a stale snapshot still scores; a crash does not
+        print(f"[run_daily] today's snapshot failed ({exc}); the pipeline will fall "
+              f"back to the last month-end")
 
 
 def main() -> None:
@@ -22,6 +48,7 @@ def main() -> None:
         print(f"[run_daily] US market closed today ({market_calendar.reason_closed()}); "
               f"skipping {args.mode} run. Use --force to override.")
         return
+    _refresh_today_snapshot()
     pipeline.run(args.mode)
 
 

@@ -93,10 +93,18 @@ scoring:
   learned:
     enabled: true      # compute + persist the pillar when a trained model exists (even at weight 0)
     force: false       # weight the pillar even if the kill criteria did not pass (don't)
+  # Peer-group shrinkage. A within-group percentile is blended with the wider rank at
+  # weight n/(n+k), n = names in the group with that metric. k=10 reproduces the old
+  # flat 50/50 exactly at n=10; a 3-name group now carries 23% instead of 50%.
+  group_shrinkage_k: 10
+  # Minimum inputs a fundamental subscore needs before it means anything. Below it the
+  # subscore is NaN (not a fabricated 0.5), the name is tagged `thin-data` and the
+  # fundamental pillar drops out of ITS composite, re-weighted over the rest.
+  min_fundamental_components: 2
   quality:
     require_positive_fcf_for_tag: true
     subweights:        # each subscore normalized 0..1 across the universe
-      valuation: 0.30  # PE, fwd PE, P/FCF, PEG, EV/EBITDA (cheaper = higher)
+      valuation: 0.30  # PE, fwd PE, P/FCF, PEG, EV/EBITDA — ranked WITHIN sector only
       cashflow: 0.30   # FCF yield, FCF growth
       growth: 0.20     # revenue & EPS growth
       quality: 0.20    # margins, ROE/ROIC, low debt
@@ -110,7 +118,12 @@ scoring:
     quality_threshold: 0.60
     higher_risk:
       flag_if_unprofitable: true
-      pe_risk_ceiling: 60        # PE above this (or N/A) is flagged higher-risk
+      valuation_pct_floor: 0.15  # in the most expensive 15% of its OWN sector
+      sector_pe_multiple: 2.5    # or PE > this x the sector's median PE
+      # DEPRECATED, honoured for one release: a flat ceiling is a sector bet dressed as
+      # a risk rule (60x is ordinary for software, absurd for a utility). Set to 0 to
+      # switch it off now. "PE is N/A" no longer means risky — it gets `no-earnings`.
+      pe_risk_ceiling: 60
 
 news:
   # SEC EDGAR fair-access wants a contact address in the request User-Agent.

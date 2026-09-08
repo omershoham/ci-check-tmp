@@ -94,6 +94,11 @@ def run(mode: str = "deep") -> int:
                if broad else candidates)
         by_symbol = {r["symbol"]: r for r in uni}
         subs = {r["symbol"]: r["subsector"] for r in uni}
+        # The GICS-like sector is the VALUATION peer set (scoring ranks multiples
+        # inside it, never across it). Curated names are SEC registrants too, so the
+        # same table serves both sources; anything unmapped stays "Unknown", which
+        # scoring treats as a sector of its own rather than spreading it around.
+        secs = universe.sector_map(uni, store=store)
         syms = [r["symbol"] for r in uni]
         _log(f"universe ({src}): {len(syms)} tickers"
              + (f" of {len(candidates)} candidates" if broad else ""))
@@ -111,36 +116,32 @@ def run(mode: str = "deep") -> int:
         except Exception as exc:  # noqa: BLE001
             _log(f"universe snapshot not recorded: {exc}")
 
-        # Stage 1: fundamentals + floor
+        # Stage 1: fundamentals + floor, served from the point-in-time SEC store.
+        # There is no per-name `.info` call here any more: that was 5,000 sequential
+        # throttled requests to score a broad universe, and it made the live screen and
+        # the backtest consume two different data sources. `enrich()` below adds the
+        # two things SEC filings genuinely lack, for ~50 names instead of all of them.
         storage.set_progress(run_id, f"stage 1/4: fundamentals for {len(syms)} names")
-        metrics_all = fundamentals.fetch_many(syms, use_cache=True)
+        metrics_all = fundamentals.from_store(store, syms, date.today())
         metrics = {s: m for s, m in metrics_all.items() if fundamentals.passes_floor(m)}
         _log(f"passed liquidity floor: {len(metrics)}")
-        n_fund_err = sum(1 for m in metrics_all.values() if m.get("error"))
+        n_snap = sum(1 for m in metrics_all.values() if not m.get("error"))
+        cov = n_snap / len(syms) if syms else 0.0
         if not metrics:
             hz.failed("fundamentals", f"0/{len(syms)} names passed the floor "
-                                      f"({n_fund_err} fetch errors)")
-        elif n_fund_err > 0.2 * len(syms):
-            hz.degraded("fundamentals", f"{n_fund_err}/{len(syms)} fetch errors "
-                                        f"(Yahoo throttling?); {len(metrics)} passed floor")
+                                      f"(SEC snapshot coverage {cov:.0%})")
+        elif cov < 0.7:
+            # Yahoo's mood is no longer the failure mode; a thin SEC store is. Coverage
+            # of the floored universe is what says whether the pillar is real.
+            hz.degraded("fundamentals", f"SEC snapshots cover {cov:.0%} of the "
+                                        f"{len(syms)} names (<70%) — run "
+                                        f"`scripts.data_refresh --facts-bulk --snapshots`")
         else:
-            hz.ok("fundamentals", f"{len(metrics)}/{len(syms)} passed floor")
-        if broad and syms:
-            # `.info` errors are the curated path's failure mode. The broad path's is a
-            # thin SEC store: the fundamental pillar is served from snapshots, so
-            # coverage of the floored universe — not Yahoo's mood — is what says
-            # whether the pillar is real.
-            try:
-                cov = len(store.fundamentals_asof(syms, date.today())) / len(syms)
-            except Exception:  # noqa: BLE001
-                cov = 0.0
-            if cov < 0.7:
-                hz.degraded("fundamentals", f"SEC snapshots cover {cov:.0%} of the "
-                                            f"{len(syms)} floored names (<70%) — run "
-                                            f"`scripts.data_refresh --facts-bulk --snapshots`")
+            hz.ok("fundamentals", f"{len(metrics)}/{len(syms)} passed floor; "
+                                  f"SEC snapshot coverage {cov:.0%}")
         storage.upsert_tickers([
             {"symbol": s, "name": m.get("name", s), "subsector": subs.get(s, ""),
-             "sector": by_symbol.get(s, {}).get("sector"),
+             "sector": by_symbol.get(s, {}).get("sector") or secs.get(s),
              "industry_group": by_symbol.get(s, {}).get("industry_group")}
             for s, m in metrics.items()
         ])
@@ -196,7 +197,8 @@ def run(mode: str = "deep") -> int:
                     hz.degraded("learned", f"inference failed ({str(exc)[:80]}) — pillar neutral")
 
         # Initial scoring (technical + fundamental; neutral sentiment) -> shortlist
-        scored0 = scoring.score_universe(metrics, subs, technicals=techs, ml_scores=ml_scores)
+        scored0 = scoring.score_universe(metrics, subs, technicals=techs,
+                                         ml_scores=ml_scores, sectors=secs)
         scored0_by_sym = {r["symbol"]: r for r in scored0}
         shortlist_n = int(config.get("screen.shortlist_size", 35))
         shortlist = scored0[:shortlist_n]
@@ -211,6 +213,25 @@ def run(mode: str = "deep") -> int:
                                          if s in scored0_by_sym]
         _log(f"IBKR holdings (early): connected={hold_early['connected']}, "
              f"held in-universe off-shortlist: {held_in_uni}")
+
+        # The ONLY remaining `.info` calls: forward P/E, the analyst PEG, the exact
+        # next-earnings timestamp and the display name — none of which exist in SEC
+        # filings — for the shortlist plus what you hold. Bounded by shortlist_size,
+        # so this stage costs the same whether the universe is 105 names or 1,500.
+        enrich_syms = [r["symbol"] for r in sentiment_targets]
+        storage.set_progress(run_id, f"stage 1/4: .info enrichment for {len(enrich_syms)} names")
+        enriched = fundamentals.enrich(enrich_syms)
+        n_enr_err = sum(1 for e in enriched.values() if e.get("error"))
+        n_fpe = sum(1 for e in enriched.values() if e.get("forwardPE") is not None)
+        _log(f"enriched {len(enriched) - n_enr_err}/{len(enriched)} names "
+             f"({n_fpe} with a forward P/E)")
+        for sym, extra in enriched.items():
+            if sym in metrics:
+                metrics[sym].update({k: v for k, v in extra.items() if k != "error"})
+        if enrich_syms and n_enr_err > 0.2 * len(enrich_syms):
+            hz.degraded("fundamentals", f"{n_enr_err}/{len(enrich_syms)} `.info` "
+                                        f"enrichment calls failed (Yahoo throttling?) — "
+                                        f"forward P/E missing for those names")
 
         # Stage 2: local-LLM news sentiment + signals for shortlist + held names
         storage.set_progress(run_id, f"stage 2/4: news + local-LLM signals for {len(sentiment_targets)} names")
@@ -229,7 +250,7 @@ def run(mode: str = "deep") -> int:
 
         # Re-score with all pillars -> final board
         board = scoring.score_universe(metrics, subs, signals=signals, technicals=techs,
-                                       ml_scores=ml_scores)
+                                       ml_scores=ml_scores, sectors=secs)
 
         # Close the funnel leak: a name that was NOT in the shortlist can still rank into
         # the finalist slots on technical+fundamental alone (it got a neutral sentiment).
@@ -246,7 +267,7 @@ def run(mode: str = "deep") -> int:
                 signals.update(extra_sigs)
                 news_map.update(extra_news)
                 board = scoring.score_universe(metrics, subs, signals=signals, technicals=techs,
-                                               ml_scores=ml_scores)
+                                               ml_scores=ml_scores, sectors=secs)
 
         storage.upsert_screen_scores(run_id, board)
         storage.upsert_signals(run_id, [

@@ -19,16 +19,22 @@ SYMS = ["NVDA", "AMD", "AVGO", "TSM", "VRT", "ANET", "GOOGL", "AMZN", "MSFT", "C
         "IREN", "META"]
 
 
-def _fake_metrics(symbols, **_):
+def _fake_metrics(store, symbols, as_of=None, extra=None):
+    """Stands in for the SEC-store read that stage 1 now does. Names outside the test
+    set come back with `error`, i.e. "no snapshot" — which is what drives the
+    fundamentals stage to DEGRADED on coverage."""
     out = {}
     for i, s in enumerate(symbols):
         if s not in SYMS:
-            out[s] = {"symbol": s, "error": "faked: not in test set"}
+            out[s] = {"symbol": s, "error": "faked: no SEC snapshot"}
             continue
         out[s] = {"symbol": s, "name": s, "marketCap": 1e11, "price": 100.0 + i,
                   "avg_dollar_volume": 5e8, "freeCashflow": 1e9, "profitable": True,
-                  "trailingPE": 20 + i, "forwardPE": 18 + i, "revenueGrowth": 0.1 + i / 100,
-                  "grossMargins": 0.5, "returnOnEquity": 0.2, "fcf_yield": 0.02,
+                  "trailingPE": 20 + i, "revenueGrowth": 0.1 + i / 100,
+                  "grossMargins": 0.5, "returnOnEquity": 0.2, "returnOnAssets": 0.1,
+                  "operatingMargins": 0.3, "debtToEquity": 40.0,
+                  "priceToSalesTrailing12Months": 5 + i, "enterpriseToEbitda": 15 + i,
+                  "earningsGrowth": 0.1, "fcf_yield": 0.02,
                   "fcf_margin": 0.2, "mom_50": 1.0 + i / 100, "mom_200": 1.05}
     return out
 
@@ -58,7 +64,10 @@ def offline(monkeypatch, workspace):
     # Pin the universe source: the fake metrics below are the curated names, and the
     # broad path would otherwise pull in whatever registrant table this machine has.
     monkeypatch.setattr(universe, "configured_source", lambda: "curated")
-    monkeypatch.setattr(fundamentals, "fetch_many", _fake_metrics)
+    monkeypatch.setattr(fundamentals, "from_store", _fake_metrics)
+    # `.info` survives only as enrich() on the shortlist; the offline run must make no
+    # network call at all, so it returns nothing and forwardPE simply stays absent.
+    monkeypatch.setattr(fundamentals, "enrich", lambda syms, **k: {s: {} for s in syms})
     monkeypatch.setattr(technical, "compute_many", _fake_techs)
     monkeypatch.setattr(technical, "yf_last_prices", lambda syms: {})
     monkeypatch.setattr(technical, "benchmark_last_price", lambda *a, **k: None)
@@ -90,7 +99,7 @@ def test_deep_run_offline_records_degraded_health(offline, storage):
     assert stages.get("sentiment") == health.DEGRADED
     assert stages.get("broker") == health.DEGRADED
     assert hz.stage("research").status == health.OK
-    assert hz.stage("fundamentals").status == health.DEGRADED   # 95 of 107 faked as errors
+    assert hz.stage("fundamentals").status == health.DEGRADED   # SEC coverage 12/105
 
     board = storage.get_board(rid)
     assert len(board) == len(SYMS)

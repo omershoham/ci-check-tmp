@@ -77,33 +77,77 @@ def technical_pillar(ohlcv: pd.DataFrame, dates: list[pd.Timestamp],
     return pd.DataFrame(out).T.sort_index()
 
 
-def fundamental_pillar(store, symbols: list[str], subsectors: dict[str, str],
-                       dates: list[pd.Timestamp]) -> pd.DataFrame:
-    out = {}
+def fundamental_frames(store, symbols: list[str], subsectors: dict[str, str],
+                       dates: list[pd.Timestamp],
+                       sectors: dict[str, str] | None = None
+                       ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """-> (pillar frame, "was scorable at all" boolean frame).
+
+    The second frame is not redundant with `pillar.notna()`. A NaN pillar means one of
+    two different things and the composite must treat them differently:
+
+      no PIT snapshot   the live screen never sees this name — no snapshot means no
+                        share count, no market cap, and the liquidity floor drops it
+                        before scoring. It must be OUT of the replay's cross-section.
+      snapshot too thin the live screen DOES score it, on its other pillars, with the
+                        weights re-normalized per row. It must be IN.
+
+    Collapsing the two (the first version of this did) makes the replay strictly
+    stricter than the screen, which changes the cross-section and therefore the IC —
+    an artefact of the harness, not of the signal."""
+    pillar, scored = {}, {}
     for d in dates:
         snap = store.fundamentals_asof(symbols, d.date())
         if snap.empty or len(snap) < 10:
             continue
-        out[d] = scoring.fundamental_pillar(snap, subsectors)
-    return pd.DataFrame(out).T.sort_index()
+        pillar[d] = scoring.fundamental_pillar(snap, subsectors, sectors)
+        scored[d] = pd.Series(True, index=snap.index)
+    return (pd.DataFrame(pillar).T.sort_index(),
+            pd.DataFrame(scored).T.sort_index().fillna(False).astype(bool))
+
+
+def fundamental_pillar(store, symbols: list[str], subsectors: dict[str, str],
+                       dates: list[pd.Timestamp],
+                       sectors: dict[str, str] | None = None) -> pd.DataFrame:
+    """`scoring.fundamental_pillar` replayed on the PIT snapshot for each date.
+
+    `sectors` is the valuation peer set and must be passed: without it every name
+    falls into "Unknown" and the sector-neutral valuation degenerates into one big
+    group — i.e. the replay would measure a different signal from the live screen."""
+    return fundamental_frames(store, symbols, subsectors, dates, sectors)[0]
 
 
 def composite_3pillar(tech: pd.DataFrame, fund: pd.DataFrame,
+                      scored: pd.DataFrame | None = None,
                       weights: dict[str, float] | None = None) -> pd.DataFrame:
-    """Percentile-rank each pillar per date and blend with config weights; the missing
-    sentiment pillar is a constant 0.5 so its weight simply shrinks the others' scale
-    (ranks are unaffected)."""
+    """The live composite, replayed. Percentile-rank each pillar per date and blend with
+    config weights; the missing sentiment pillar is a constant 0.5, so its weight simply
+    shrinks the others' scale (ranks are unaffected).
+
+    The weight sum is PER ROW, exactly as `scoring.score_universe` computes it: a name
+    whose fundamental pillar is NaN is ranked on the pillars it has, re-scaled to 1,
+    rather than being dropped or scored on an invented 0.5. `scored` says which names
+    the live floor would have kept (i.e. had a PIT snapshot); without it the old,
+    stricter behaviour is used and thin-data names leave the cross-section."""
     w = weights or config.get("scoring.pillars",
                               {"technical": 0.35, "fundamental": 0.30, "sentiment": 0.35})
+    wT = w.get("technical", 0.35)
+    wF = w.get("fundamental", 0.30)
+    wS = w.get("sentiment", 0.35)
     dates = sorted(set(tech.index) & set(fund.index))
     out = {}
     for d in dates:
         t = tech.loc[d].dropna()
-        f = fund.loc[d].dropna()
-        names = t.index.intersection(f.index)
+        if scored is not None and d in scored.index:
+            keep = scored.loc[d].reindex(t.index).fillna(False).astype(bool)
+        else:
+            keep = fund.loc[d].reindex(t.index).notna()
+        names = t.index[keep]
         if len(names) < 10:
             continue
-        out[d] = (_rank01(t.loc[names]) * w.get("technical", 0.35)
-                  + _rank01(f.loc[names]) * w.get("fundamental", 0.30)
-                  + 0.5 * w.get("sentiment", 0.35))
+        f = fund.loc[d].reindex(names)
+        w_f = pd.Series(wF, index=names).where(f.notna(), 0.0)
+        wsum = (wT + wS) + w_f
+        out[d] = (_rank01(t.loc[names]) * wT + _rank01(f).fillna(0.0) * w_f
+                  + 0.5 * wS) / wsum
     return pd.DataFrame(out).T.sort_index()

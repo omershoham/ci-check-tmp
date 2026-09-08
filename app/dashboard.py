@@ -89,7 +89,11 @@ def pill(label_key: str, text: str, screen: bool = False) -> str:
 # palette stays reserved for genuinely good→bad axes (recommendation/action/regime).
 # "🟢 Buy … 🔴 higher-risk" on one row used to read as a contradiction.
 TAG_BADGE = {"both": "◆ deal+quality", "deal": "◆ deal", "quality": "◇ quality",
-             "higher-risk": "⚠ higher-risk", "earnings-soon": "🗓 earnings-soon"}
+             "higher-risk": "⚠ higher-risk", "earnings-soon": "🗓 earnings-soon",
+             # Both are statements about DATA, not about the company: "no trailing P/E"
+             # and "too few fundamentals to rank". They used to be silently folded into
+             # higher-risk, which flagged every pre-revenue name as risky.
+             "no-earnings": "◌ no-earnings", "thin-data": "◌ thin-data"}
 ACTION_BADGE = {"add": "🟢 Add", "hold": "🟡 Hold", "trim": "🟠 Trim", "exit": "🔴 Exit",
                 "add_dip": "🟢↘ Add on dip", "trim_wait": "🟡 Hold→trim"}
 SETUP_EMOJI = {"bullish": "📈", "bearish": "📉", "neutral": "➖"}
@@ -613,8 +617,9 @@ watch = storage.get_watch()
 rec_filter = st.sidebar.multiselect(
     "Filter by recommendation", ["strong_buy", "buy", "hold", "sell", "strong_sell", "avoid"],
     format_func=lambda k: recommend.BADGE.get(k, k))
-tag_filter = st.sidebar.multiselect("Filter by tag",
-                                    ["both", "deal", "quality", "higher-risk", "earnings-soon"])
+tag_filter = st.sidebar.multiselect(
+    "Filter by tag",
+    ["both", "deal", "quality", "higher-risk", "earnings-soon", "no-earnings", "thin-data"])
 # Options come from the tickers table, not the four curated labels: in broad mode
 # `subsector` carries the SIC industry group and a hardcoded list offers nothing.
 _sub_options = storage.distinct_subsectors() or list(SUBSECTOR_LABELS.keys())

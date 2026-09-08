@@ -105,9 +105,11 @@ def test_scoring_learned_pillar_is_dark_by_default_but_persisted(monkeypatch):
     with_ml = {r["symbol"]: r for r in scoring.score_universe(m, subs, ml_scores=ml)}
     assert all(abs(base[s] - with_ml[s]["blended"]) < 1e-12 for s in m)       # weight 0: no effect
     assert with_ml["J"]["metrics"]["pillar_learned_rank"] == 1.0                # but persisted
-    assert scoring.effective_score_version() == 3
+    assert scoring.effective_score_version() == scoring.SCORE_VERSION
     monkeypatch.setattr(scoring, "learned_weight", lambda: 0.2)
-    assert scoring.effective_score_version() == 4
+    # Lighting the pillar bumps the version by itself, so rows scored with and without
+    # it never pool inside pillar_ic. v4 stays reserved for "v3 + learned".
+    assert scoring.effective_score_version() == 6
     lit_rows = scoring.score_universe(m, subs, ml_scores=ml)
     lit = {r["symbol"]: r["blended"] for r in lit_rows}
     assert lit["J"] > base["J"] and lit["A"] < base["A"]                       # now it moves scores

@@ -331,17 +331,25 @@ def pillar_ic() -> dict[str, Any]:
     definition changed is a different signal). Suggested re-weights are printed
     only when at least one pillar's |t| >= 2 — otherwise the honest answer is
     'not enough independent data yet'."""
-    from .scoring import effective_score_version
+    from .scoring import effective_score_version, pillar_set
     sv = effective_score_version()
+    ps = pillar_set()
     with storage.get_conn() as cn:
+        # (score_version, pillar_set) is the partition key. The version catches a
+        # changed pillar DEFINITION; pillar_set catches a changed pillar COUNT, which
+        # moves the composite's dispersion without changing any pillar. Rows written
+        # before the column existed have pillar_set NULL and are matched only when the
+        # current set is the historical three-pillar one.
         rows = [dict(r) for r in cn.execute(
             """SELECT s.run_id, s.symbol, s.metrics_json, r.started_at
                FROM screen_scores s JOIN runs r ON r.id=s.run_id
                WHERE r.status='ok' AND r.mode='deep' AND s.score_version=?
-               ORDER BY s.run_id""", (sv,))]
+                 AND (s.pillar_set=? OR (s.pillar_set IS NULL AND ?=?))
+               ORDER BY s.run_id""",
+            (sv, ps, ps, "technical,fundamental,sentiment"))]
     if not rows:
-        return {"note": "no rows at the current score version yet "
-                        "(accumulates from the next deep runs)"}
+        return {"note": f"no rows at score_version={sv} / pillars '{ps}' yet "
+                        f"(accumulates from the next deep runs)"}
     recs = []
     for r in rows:
         try:
@@ -415,7 +423,7 @@ def pillar_ic() -> dict[str, Any]:
                      {"technical": 0.35, "fundamental": 0.30, "sentiment": 0.35})
     out: dict[str, Any] = {"n_dates": dates_used, "ic": ics, "t_stat": tstats,
                            "current_weights": cur, "score_version": sv,
-                           "pillars_measured": present}
+                           "pillar_set": ps, "pillars_measured": present}
     if skipped:
         out["pillars_no_history"] = skipped
     if any(t is not None and abs(t) >= 2 for t in tstats.values()):

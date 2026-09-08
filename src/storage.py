@@ -442,8 +442,9 @@ def upsert_tickers(rows: Iterable[dict[str, Any]]) -> None:
 
 # ---------------------------------------------------------------- scores
 def upsert_screen_scores(run_id: int, rows: Iterable[dict[str, Any]]) -> None:
-    from .scoring import effective_score_version
+    from .scoring import effective_score_version, pillar_set
     version = effective_score_version()
+    pset = pillar_set()
     payload = []
     for r in rows:
         payload.append({
@@ -456,15 +457,19 @@ def upsert_screen_scores(run_id: int, rows: Iterable[dict[str, Any]]) -> None:
             "tags": json.dumps(r.get("tags", [])),
             "metrics_json": json.dumps(r.get("metrics", {})),
             "score_version": version,
+            # WHICH pillars carried weight. Adding a pillar changes what `blended`
+            # means even when no existing pillar's definition moved, so pillar_ic
+            # partitions on this alongside score_version instead of pooling them.
+            "pillar_set": r.get("pillar_set") or pset,
         })
     with get_conn() as conn:
         conn.executemany(
-            """INSERT INTO screen_scores(run_id,symbol,quality,deal,blended,rank,tags,metrics_json,score_version)
-               VALUES(:run_id,:symbol,:quality,:deal,:blended,:rank,:tags,:metrics_json,:score_version)
+            """INSERT INTO screen_scores(run_id,symbol,quality,deal,blended,rank,tags,metrics_json,score_version,pillar_set)
+               VALUES(:run_id,:symbol,:quality,:deal,:blended,:rank,:tags,:metrics_json,:score_version,:pillar_set)
                ON CONFLICT(run_id,symbol) DO UPDATE SET
                  quality=excluded.quality, deal=excluded.deal, blended=excluded.blended,
                  rank=excluded.rank, tags=excluded.tags, metrics_json=excluded.metrics_json,
-                 score_version=excluded.score_version""",
+                 score_version=excluded.score_version, pillar_set=excluded.pillar_set""",
             payload,
         )
 

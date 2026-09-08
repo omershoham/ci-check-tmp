@@ -107,6 +107,12 @@ def main() -> None:
         _log(f"registrants: {res['rows']} rows -> {res['path']}")
         _log(f"registrants funnel: {res['funnel']}")
 
+    # `--symbols` present but EMPTY is a shell expansion that matched nothing, never a
+    # request to refresh the entire universe. Falling through to "everything" turned a
+    # 3-symbol repair into a full re-ingest twice during Phase 3.
+    if args.symbols is not None and not args.symbols:
+        ap.error("--symbols was given with no tickers (an empty expansion?). "
+                 "Omit --symbols entirely to mean the whole universe.")
     syms = [s.upper() for s in args.symbols] if args.symbols else universe.symbols()
     _log(f"universe: {len(syms)} symbols")
 
