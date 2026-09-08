@@ -17,11 +17,6 @@ from datetime import datetime, timezone
 
 from src import config, health, storage
 
-# Health badges contain emoji; a Windows console defaults to cp1252 and would raise
-# UnicodeEncodeError mid-report, hiding the remaining checks and the summary line.
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
 OK, WARN, FAIL = "OK  ", "WARN", "FAIL"
 _rows: list[tuple[str, str, str]] = []
 
