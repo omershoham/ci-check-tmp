@@ -69,6 +69,15 @@ INSTANT_TAGS: dict[str, list[str]] = {
                 "CurrentPortionOfNoncurrentBorrowings", "ShorttermBorrowings"],
 }
 SHARES_TAG = ("dei", "EntityCommonStockSharesOutstanding")
+# Ordered fallbacks for the share count. The dei cover-page tag is the cleanest and is
+# what companyfacts serves, but the Financial Statement Data Sets carry it only as a
+# segmented row, so the bulk path has to fall back to the balance sheet. Market cap
+# depends on this, so an empty result here silently removes a name from any valuation
+# screen. Order matters: cover page, then outstanding, then issued, then diluted avg.
+SHARES_TAGS = ["EntityCommonStockSharesOutstanding",
+               "CommonStockSharesOutstanding",
+               "CommonStockSharesIssued",
+               "WeightedAverageNumberOfDilutedSharesOutstanding"]
 
 _Q_DAYS = (75, 105)      # a fiscal quarter
 _A_DAYS = (340, 380)     # a fiscal year
@@ -339,7 +348,7 @@ def prepare_symbol(sym_facts: pd.DataFrame) -> PreparedFacts:
                  "val": pd.Series(dtype=float), "filed": pd.Series(dtype="datetime64[ns]")}))))
         if lst:
             flows[concept] = lst
-    for concept, tags in list(INSTANT_TAGS.items()) + [("sharesOutstanding", [SHARES_TAG[1]])]:
+    for concept, tags in list(INSTANT_TAGS.items()) + [("sharesOutstanding", SHARES_TAGS)]:
         g = sym_facts[(sym_facts["concept"] == concept) & (sym_facts["start"].isna())]
         lst = []
         for tag in tags:
@@ -564,7 +573,7 @@ def raw_asof(sym_facts: pd.DataFrame, as_of: date, price: float | None,
         g = by.get(concept)
         if g is None:
             return None
-        for tag in INSTANT_TAGS.get(concept, []) + [SHARES_TAG[1]]:
+        for tag in INSTANT_TAGS.get(concept, []) + SHARES_TAGS:
             gt = g[g["tag"] == tag]
             if not gt.empty:
                 v = _instant(gt, ts)
