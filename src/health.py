@@ -29,7 +29,7 @@ FAILED = "failed"
 _RANK = {OK: 0, DEGRADED: 1, FAILED: 2}
 
 # Stage names are fixed so the dashboard/doctor can render them in a stable order.
-STAGES = ("fundamentals", "technicals", "regime", "sentiment", "broker",
+STAGES = ("universe", "fundamentals", "technicals", "regime", "sentiment", "broker",
           "research", "triggers", "risk", "synthesis")
 
 GLYPH = {OK: "🟢", DEGRADED: "🟠", FAILED: "🔴"}

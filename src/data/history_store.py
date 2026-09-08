@@ -387,7 +387,12 @@ class HistoryStore:
 
     def close_matrix(self, symbols: list[str] | None = None, adjusted: bool = True,
                      start: date | None = None, end: date | None = None) -> pd.DataFrame:
-        """Wide date x symbol frame of (adjusted) closes — the harness's workhorse."""
+        """Wide date x symbol frame of (adjusted) closes — the harness's workhorse.
+
+        PASS `symbols`. `symbols=None` means "every symbol in the store", which makes
+        the frame's DATE INDEX a function of unrelated downloads — and the backtest
+        engine takes its rebalance calendar from that index. Analytic callers name what
+        they score plus the benchmark columns they read; None is for exploration."""
         col = "adj_close" if adjusted else "close"
         df = self.prices(symbols, start, end, columns=[col])
         if df.empty:

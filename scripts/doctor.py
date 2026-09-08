@@ -62,8 +62,14 @@ def check_config() -> None:
     _rec(OK if abs(tot - 1.0) < 0.02 else WARN, "scoring.pillars",
          f"weights sum to {tot:.2f} ({', '.join(f'{k}={v}' for k, v in pillars.items())})")
     from src import universe
+    src = universe.configured_source()
     n = len(universe.symbols())
-    _rec(OK if n >= 20 else WARN, "universe", f"{n} tickers")
+    if src == "broad":
+        _rec(OK if n >= 500 else WARN, "universe",
+             f"source=broad · {n} SEC-registrant candidates before the floor "
+             f"(cap {universe.broad_cfg('max_symbols')})")
+    else:
+        _rec(OK if n >= 20 else WARN, "universe", f"source=curated · {n} tickers")
     _rec(OK if config.cache_dir().exists() and os.access(config.cache_dir(), os.W_OK) else FAIL,
          "cache dir", str(config.cache_dir()))
 
@@ -163,6 +169,17 @@ def check_history_store() -> None:
     sn = man.get("snapshots") or {}
     _rec(OK if sn else WARN, "PIT snapshots",
          f"{sn.get('rows')} rows, {sn.get('dates')} month-ends to {sn.get('last')}" if sn else "none built")
+    from src import universe
+    reg = man.get("registrants") or {}
+    if reg:
+        f = reg.get("funnel") or {}
+        _rec(OK, "registrants", f"{reg.get('rows')} candidates "
+                                f"(from {f.get('sec_listed', '?')} listed registrants) "
+                                f"refreshed {reg.get('refreshed_at')}")
+    else:
+        _rec(WARN if universe.configured_source() == "broad" else OK, "registrants",
+             "not built — `python -m scripts.data_refresh --registrants` "
+             "(only needed for universe.source: broad)")
     try:
         from src.ml import infer as ml_infer
         meta = ml_infer.latest_meta()

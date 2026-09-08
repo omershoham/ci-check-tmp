@@ -181,7 +181,12 @@ def build_feature_frame(store, symbols: list[str], subsectors: dict[str, str],
     _lo = (min(dates) - pd.Timedelta(days=800)).date() if dates else None
     _hi = (max(dates) + pd.Timedelta(days=120)).date() if dates else None
     ohlcv = store.prices(symbols, start=_lo, end=_hi)
-    closes = store.close_matrix(None, adjusted=True, start=_lo, end=_hi)
+    # The feature symbols plus the two benchmark columns this function reads — never
+    # the whole store: labels, regime replay and relative strength all index into this
+    # frame, so a symbol nobody asked for is dead weight at best and a changed date
+    # index at worst.
+    closes = store.close_matrix(sorted(set(symbols) | {bench, regime_bench}),
+                                adjusted=True, start=_lo, end=_hi)
     if ohlcv.empty or closes.empty:
         return pd.DataFrame()
     bench_close = closes[bench] if bench in closes else None

@@ -43,14 +43,18 @@ def main() -> None:
     store = HistoryStore()
     root = models_root()
     root.mkdir(parents=True, exist_ok=True)
-    uni = universe.build_universe()
+    uni = universe.current_universe(store=store)
     syms = [u["symbol"] for u in uni]
     subs = {u["symbol"]: u["subsector"] for u in uni}
     have = set(store.symbols_with_prices())
     if not have:
         raise SystemExit("no prices in the history store — run scripts.data_refresh first")
     syms = [s for s in syms if s in have]   # a set question, not a full pivot
-    closes = store.close_matrix(None, adjusted=True)
+    # Scored names + report benchmarks only: the engine's rebalance calendar comes from
+    # this frame's index, so an unrelated symbol in the store must not reach it.
+    _bt_spec = BacktestSpec(name=f"learned_{args.model}", top_frac=args.top_frac,
+                            cost_bps_side=args.cost_bps)
+    closes = store.close_matrix(sorted(set(syms) | set(_bt_spec.benchmarks)), adjusted=True)
     dates = month_ends(date.fromisoformat(args.start), date.today())
 
     fpath = root / "features.parquet"
@@ -75,12 +79,11 @@ def main() -> None:
         raise SystemExit("no folds produced")
 
     # Out-of-sample scores through the harness (same fill/cost conventions as baselines).
-    eligible = {d: set(store.universe_asof(d.date())) for d in scores.index}
+    eligible = {d: set(store.universe_asof(d.date(), source=universe.configured_source()))
+                for d in scores.index}
     trials_root = store.root
     n_prior = n_trials(trials_root)
-    bt = run_rank_backtest(scores, closes, BacktestSpec(name=f"learned_{spec.model}",
-                                                        top_frac=args.top_frac, cost_bps_side=args.cost_bps),
-                           eligible=eligible, n_trials=n_prior + 1,
+    bt = run_rank_backtest(scores, closes, _bt_spec, eligible=eligible, n_trials=n_prior + 1,
                            universe_note="curated (see backtest reports for the survivorship caveat)")
     log_trial(trials_root, f"learned_{spec.model}", asdict_safe(spec), bt.summary)
 

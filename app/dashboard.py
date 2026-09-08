@@ -615,10 +615,13 @@ rec_filter = st.sidebar.multiselect(
     format_func=lambda k: recommend.BADGE.get(k, k))
 tag_filter = st.sidebar.multiselect("Filter by tag",
                                     ["both", "deal", "quality", "higher-risk", "earnings-soon"])
-sub_filter = st.sidebar.multiselect("Sub-sector", list(SUBSECTOR_LABELS.keys()),
+# Options come from the tickers table, not the four curated labels: in broad mode
+# `subsector` carries the SIC industry group and a hardcoded list offers nothing.
+_sub_options = storage.distinct_subsectors() or list(SUBSECTOR_LABELS.keys())
+sub_filter = st.sidebar.multiselect("Sub-sector", _sub_options,
                                     format_func=lambda k: SUBSECTOR_LABELS.get(k, k))
 hide_excluded = st.sidebar.checkbox("Hide excluded watchlist names", value=True)
-top_n = st.sidebar.slider("Show top N", 5, 110, 25)
+top_n = st.sidebar.slider("Show top N", 5, 300, 25)   # 300: a broad board is 250
 if st.sidebar.button("🔄 Refresh data"):
     st.cache_data.clear(); st.rerun()
 st.sidebar.divider()

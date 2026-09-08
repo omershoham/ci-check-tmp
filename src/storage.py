@@ -209,7 +209,7 @@ CREATE TABLE IF NOT EXISTS portfolio_summary (
 # Bumped whenever _migrate gains a step. Recorded in the schema_version table so a
 # future non-additive change (a rename needs a copy-table in SQLite) has a real anchor
 # to branch on instead of re-deriving state from PRAGMA every time.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2   # 2: tickers.sector / tickers.industry_group
 
 
 def _add_col(conn: sqlite3.Connection, table: str, name: str, decl: str) -> None:
@@ -299,6 +299,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # Which pillars composed the score. An integer score_version cannot express two
     # independently dark pillars; this can.
     _add_col(conn, "screen_scores", "pillar_set", "TEXT")
+    # Two-level taxonomy for the broad universe. `subsector` keeps meaning "the peer
+    # group this name is ranked inside" (it carries industry_group in broad mode), so
+    # nothing that already reads it has to change; these two record WHICH taxonomy the
+    # group came from, and give valuation a coarser peer set than ranking.
+    _add_col(conn, "tickers", "sector", "TEXT")
+    _add_col(conn, "tickers", "industry_group", "TEXT")
 
     conn.execute("CREATE TABLE IF NOT EXISTS schema_version ("
                  "version INTEGER PRIMARY KEY, applied_at TEXT)")
@@ -408,12 +414,29 @@ def runs_with_research() -> set[int]:
 
 
 # ---------------------------------------------------------------- tickers
+def distinct_subsectors() -> list[str]:
+    """Peer-group labels actually present in the tickers table. The dashboard filter
+    used to hardcode the four curated sub-sectors, which offers nothing selectable once
+    the universe is broad (where `subsector` carries the SIC industry group)."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT DISTINCT subsector FROM tickers "
+                            "WHERE subsector IS NOT NULL AND subsector <> '' "
+                            "ORDER BY subsector").fetchall()
+    return [r["subsector"] for r in rows]
+
+
 def upsert_tickers(rows: Iterable[dict[str, Any]]) -> None:
+    payload = [{"symbol": r["symbol"], "name": r.get("name"),
+                "subsector": r.get("subsector", ""), "sector": r.get("sector"),
+                "industry_group": r.get("industry_group")} for r in rows]
     with get_conn() as conn:
         conn.executemany(
-            """INSERT INTO tickers(symbol,name,subsector) VALUES(:symbol,:name,:subsector)
-               ON CONFLICT(symbol) DO UPDATE SET name=excluded.name, subsector=excluded.subsector""",
-            list(rows),
+            """INSERT INTO tickers(symbol,name,subsector,sector,industry_group)
+               VALUES(:symbol,:name,:subsector,:sector,:industry_group)
+               ON CONFLICT(symbol) DO UPDATE SET name=excluded.name,
+                   subsector=excluded.subsector, sector=excluded.sector,
+                   industry_group=excluded.industry_group""",
+            payload,
         )
 
 

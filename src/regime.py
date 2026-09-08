@@ -167,8 +167,11 @@ def context_line(r: dict[str, Any]) -> str:
 
 if __name__ == "__main__":
     from . import technical, universe
-    subs = universe.subsector_map()
-    techs = technical.compute_many(universe.symbols(), use_cache=True)
+    # `universe.symbols()` is the CANDIDATE list, which in broad mode is thousands of
+    # names; breadth only ever meant "the universe the pipeline actually scores".
+    uni = universe.current_universe()
+    subs = {r["symbol"]: r["subsector"] for r in uni}
+    techs = technical.compute_many([r["symbol"] for r in uni], use_cache=True)
     r = detect(techs, subs, use_cache=False)
     print(json.dumps(r, indent=2))
     print()

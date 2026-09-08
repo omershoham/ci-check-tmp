@@ -165,12 +165,16 @@ def _numbers(z: zipfile.ZipFile, keep_tags: set[str],
 
 
 def parse_quarter(zip_path: Path, keep_ciks: set[str] | None = None,
-                  cik_to_symbol: dict[str, str] | None = None) -> pd.DataFrame:
-    """One quarter's ZIP -> the same long frame shape as sec_facts.facts_frame."""
+                  cik_to_symbol: dict[str, str] | None = None,
+                  keep_tags: set[str] | None = None) -> pd.DataFrame:
+    """One quarter's ZIP -> the same long frame shape as sec_facts.facts_frame.
+
+    `keep_tags` narrows the parse to a subset of the mapped tags (the broad-universe
+    share-count ingest wants only the four SHARES_TAGS across every filer)."""
     t2c = tag_to_concept()
     with zipfile.ZipFile(zip_path) as z:
         sub = _submissions(z)
-        num = _numbers(z, set(t2c), keep_ciks, sub)
+        num = _numbers(z, set(keep_tags or t2c), keep_ciks, sub)
     if num.empty:
         return pd.DataFrame()
 
@@ -194,8 +198,17 @@ def parse_quarter(zip_path: Path, keep_ciks: set[str] | None = None,
         m = flow & (df["qtrs"] == n)
         df.loc[m, "start"] = df.loc[m, "end"] - pd.DateOffset(months=3 * int(n))
 
-    # sharesOutstanding is a dei instant; drop any flow-shaped rows for it.
-    df = df[~((df["concept"] == "sharesOutstanding") & flow)]
+    # sharesOutstanding must reach the store as an INSTANT — `prepare_symbol` reads it
+    # from the instant table only. The preferred tags already are instants; the
+    # last-resort fallback, WeightedAverageNumberOf*, is tagged as a duration and was
+    # therefore being dropped here. That is not cosmetic: Walmart, Meta and Berkshire
+    # publish NO instant share count in num.txt, so the whole class of filers that tags
+    # only the weighted average came out of the broad universe with a null market cap
+    # and silently failed the liquidity floor. Re-stamp those as instants at their
+    # period end (`SHARES_TAGS` already ranks them last, so a real instant still wins).
+    wavg = df["tag"].str.startswith("WeightedAverageNumber", na=False)
+    df.loc[(df["concept"] == "sharesOutstanding") & flow & wavg, "start"] = pd.NaT
+    df = df[~((df["concept"] == "sharesOutstanding") & flow & ~wavg)]
     # Monetary tags must carry a currency; the share count must carry "shares".
     is_shares = df["concept"] == "sharesOutstanding"
     df = df[(is_shares & df["uom"].eq("shares"))
@@ -216,7 +229,7 @@ def parse_quarter(zip_path: Path, keep_ciks: set[str] | None = None,
 
 def refresh_facts_bulk(store, symbols: list[str] | None = None,
                        start_quarter: str = "2015q1", end_quarter: str | None = None,
-                       force: bool = False,
+                       force: bool = False, source: str = "fsds",
                        log: Callable[[str], None] = print) -> dict[str, Any]:
     """Ingest quarterly ZIPs into the store's `facts` table, one quarter at a time.
 
@@ -234,6 +247,11 @@ def refresh_facts_bulk(store, symbols: list[str] | None = None,
     `force=True` re-ingests them, and REPLACES each quarter's directory — use it when
     the PARSE changed (a new tag in FLOW_TAGS, a namespace fix), and re-run
     `--facts` afterwards if this store also carries companyfacts rows.
+   
+    `source` names the marker. It is what lets a SECOND symbol set be ingested into
+    quarters an earlier run already covered: the marker records which pass has run, not
+    which symbols it happened to want, so re-running with a wider `symbols` list under
+    the default marker would skip every quarter and silently do nothing.
     """
     cikmap = news._ticker_cik_map()
     cik_to_symbol: dict[str, str] = {}
@@ -244,7 +262,7 @@ def refresh_facts_bulk(store, symbols: list[str] | None = None,
     keep_ciks = set(cik_to_symbol) if symbols is not None else None
 
     quarters = quarters_between(start_quarter, end_quarter)
-    have = set(store.facts_quarters(source="fsds"))
+    have = set(store.facts_quarters(source=source))
     rows, syms, got, missing, skipped = 0, set(), [], [], []
     for i, q in enumerate(quarters, 1):
         if q in have and not force:
@@ -263,7 +281,7 @@ def refresh_facts_bulk(store, symbols: list[str] | None = None,
         if not df.empty:
             # Same (symbol, tag, period, filing) key the companyfacts path produces.
             df = df.drop_duplicates(["symbol", "tag", "end", "start", "filed"], keep="last")
-            store.append_facts_quarter(q, df, replace=force, source="fsds",
+            store.append_facts_quarter(q, df, replace=force, source=source,
                                        touch_manifest=False)
             rows += len(df)
             syms |= set(df["symbol"].dropna())
@@ -271,6 +289,57 @@ def refresh_facts_bulk(store, symbols: list[str] | None = None,
         log(f"  {q}: {len(df):7d} rows  ({i}/{len(quarters)})")
 
     # One distinct-symbol scan for the whole backfill, not one per quarter.
+    store.refresh_facts_manifest()
+    return {"rows": int(rows), "quarters": got, "missing": missing,
+            "skipped": skipped, "symbols": len(syms)}
+
+
+def refresh_shares_bulk(store, cik_to_symbol: dict[str, str],
+                        start_quarter: str = "2015q1", end_quarter: str | None = None,
+                        force: bool = False, source: str = "fsds-shares",
+                        log: Callable[[str], None] = print) -> dict[str, Any]:
+    """Ingest ONLY the share-count tags, for every CIK in `cik_to_symbol`.
+
+    The broad liquidity floor is `price x shares outstanding`, point in time, for
+    thousands of names on every rebalance date - so `shares_asof` has to cover the
+    whole candidate list, not the 105 the full FSDS ingest was run for. A full ingest
+    of every filer would parse ~30 tags out of 27 GB of `num.txt`; this parses the same
+    files for four tags and takes ~5 seconds a quarter, because the cost is the CSV
+    parse and the tag filter is what bounds memory, not time.
+
+    Tracked under its own source marker (default `fsds-shares`) so it is idempotent per
+    quarter independently of the full ingest; pass a new `source` to re-run it after a
+    PARSE change without replacing — and so destroying — what other passes wrote. Symbols the full ingest already covered get a
+    duplicate share row per period; the values are identical and every reader
+    (`shares_asof`, `_Tab.dedupe_by_end`) keeps the last one, so it is wasted bytes
+    rather than a wrong number.
+    """
+    quarters = quarters_between(start_quarter, end_quarter)
+    have = set(store.facts_quarters(source=source))
+    keep_ciks = set(cik_to_symbol)
+    rows, syms, got, missing, skipped = 0, set(), [], [], []
+    for i, q in enumerate(quarters, 1):
+        if q in have and not force:
+            skipped.append(q)
+            continue
+        path = download_quarter(q)
+        if path is None:
+            missing.append(q)
+            continue
+        try:
+            df = parse_quarter(path, keep_ciks, cik_to_symbol, keep_tags=set(SF.SHARES_TAGS))
+        except (zipfile.BadZipFile, ValueError) as exc:
+            log(f"  {q}: unreadable ({exc}) - skipped")
+            missing.append(q)
+            continue
+        if not df.empty:
+            df = df.drop_duplicates(["symbol", "tag", "end", "start", "filed"], keep="last")
+            store.append_facts_quarter(q, df, replace=False, source=source,
+                                       touch_manifest=False)
+            rows += len(df)
+            syms |= set(df["symbol"].dropna())
+        got.append(q)
+        log(f"  {q}: {len(df):7d} share rows  ({i}/{len(quarters)})")
     store.refresh_facts_manifest()
     return {"rows": int(rows), "quarters": got, "missing": missing,
             "skipped": skipped, "symbols": len(syms)}

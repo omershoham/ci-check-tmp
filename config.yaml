@@ -6,6 +6,21 @@ paths:
   cache: data/cache
 
 universe:
+  # curated = the hand-picked AI-infra lists below (the shipped default).
+  # broad   = every US-listed SEC registrant that files financial statements, floored
+  #           point-in-time by src/universe.py::investable(). Needs the registrant
+  #           table and candidate prices first:
+  #             python -m scripts.data_refresh --registrants --shares-bulk --screen-prices
+  source: curated
+  broad:
+    max_symbols: 250             # the phasing knob: 250 -> 750 -> 1500
+    rank_by: adv                 # which measure the cap keeps the top of
+    exchanges: [Nasdaq, NYSE, NYSE American, Cboe]
+    exclude_sic: [6726, 6770]    # funds/CEFs/BDCs, blank checks. REITs (6798) stay in
+    min_history_days: 200        # closes required inside the screen window
+    adv_window: 20               # sessions averaged for dollar volume
+    screen_price_days: 400       # calendar-day price window the floor is computed on
+
   # Hard liquidity/size floor applied BEFORE scoring (Q&A: "standard floor")
   liquidity_floor:
     min_market_cap: 300000000      # $300M

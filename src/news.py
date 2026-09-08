@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -60,8 +61,12 @@ def google_news(query: str, limit: int = 8) -> list[dict[str, Any]]:
     return out
 
 
+@lru_cache(maxsize=1)
 def _ticker_cik_map() -> dict[str, str]:
-    """Ticker -> zero-padded CIK, cached for the day."""
+    """Ticker -> zero-padded CIK, cached for the day (and memoised per process).
+
+    `recent_8k` calls this once per symbol; without the memo a shortlist re-parsed a
+    230 KB JSON 35 times, and a broad-universe candidate map would do it thousands."""
     cf = config.cache_dir() / f"sec_tickers_{date.today().isoformat()}.json"
     if cf.exists():
         try:

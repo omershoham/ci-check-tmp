@@ -13,7 +13,7 @@ import json
 import pytest
 
 from src import (deep_research, fundamentals, health, ibkr, learning, local_llm, news,
-                 pipeline, regime, technical)
+                 pipeline, regime, technical, universe)
 
 SYMS = ["NVDA", "AMD", "AVGO", "TSM", "VRT", "ANET", "GOOGL", "AMZN", "MSFT", "CEG",
         "IREN", "META"]
@@ -55,6 +55,9 @@ def _fake_claude(prompt, allowed_tools=None, timeout=None, extra_args=None):
 
 @pytest.fixture
 def offline(monkeypatch, workspace):
+    # Pin the universe source: the fake metrics below are the curated names, and the
+    # broad path would otherwise pull in whatever registrant table this machine has.
+    monkeypatch.setattr(universe, "configured_source", lambda: "curated")
     monkeypatch.setattr(fundamentals, "fetch_many", _fake_metrics)
     monkeypatch.setattr(technical, "compute_many", _fake_techs)
     monkeypatch.setattr(technical, "yf_last_prices", lambda syms: {})

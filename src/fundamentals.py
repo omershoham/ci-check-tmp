@@ -10,6 +10,7 @@ import time
 from datetime import date
 from typing import Any
 
+import pandas as pd
 import yfinance as yf
 
 from . import config
@@ -102,21 +103,35 @@ def fetch_many(symbols: list[str], throttle: float = 0.4,
     return out
 
 
-def passes_floor(m: dict) -> bool:
-    """Hard liquidity/size floor from config (Q&A: standard floor)."""
+def floor_thresholds() -> dict[str, float]:
+    """The three config numbers the floor is made of, in one place."""
     floor = config.get("universe.liquidity_floor", {}) or {}
-    mcap = m.get("marketCap")
-    price = m.get("price")
-    adv = m.get("avg_dollar_volume")
-    if mcap is None or price is None:
-        return False  # can't verify → exclude (defensive)
-    if mcap < floor.get("min_market_cap", 0):
+    return {"min_market_cap": float(floor.get("min_market_cap", 0) or 0),
+            "min_price": float(floor.get("min_price", 0) or 0),
+            "min_avg_dollar_volume": float(floor.get("min_avg_dollar_volume", 0) or 0)}
+
+
+def passes_floor_pit(price, mcap, adv) -> bool:
+    """THE hard liquidity/size floor (Q&A: standard floor), on bare numbers.
+
+    Taking numbers rather than a `.info` dict is what lets the broad universe apply the
+    SAME floor from bulk data - last raw close, mean close*volume, SEC share count -
+    with zero per-name network calls, instead of a second copy of the rule that has to
+    be kept in step with this one.
+
+    Missing price or market cap FAILS (the floor could not be verified); a missing ADV
+    passes, because absence of a volume series is not evidence of illiquidity."""
+    f = floor_thresholds()
+    if pd.isna(mcap) or pd.isna(price):
         return False
-    if price < floor.get("min_price", 0):
+    if float(mcap) < f["min_market_cap"] or float(price) < f["min_price"]:
         return False
-    if adv is not None and adv < floor.get("min_avg_dollar_volume", 0):
-        return False
-    return True
+    return bool(pd.isna(adv) or float(adv) >= f["min_avg_dollar_volume"])
+
+
+def passes_floor(m: dict) -> bool:
+    """Floor for a `.info` metrics dict — a field-name shim over `passes_floor_pit`."""
+    return passes_floor_pit(m.get("price"), m.get("marketCap"), m.get("avg_dollar_volume"))
 
 
 if __name__ == "__main__":

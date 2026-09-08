@@ -79,15 +79,35 @@ def run(mode: str = "deep") -> int:
     hz = health.RunHealth()
     _log(f"run #{run_id} mode={mode} starting")
     try:
-        uni = universe.build_universe()
+        from .data.history_store import HistoryStore
+        store = HistoryStore()
+        # Stage 0: universe. In broad mode the SEC registrant table is thousands of
+        # CANDIDATES and the point-in-time floor (price x SEC shares, dollar volume,
+        # all from the local store) is what cuts it to the scorable set — BEFORE any
+        # per-name network call. Doing it the other way round costs 5,000 sequential
+        # `.info` requests to discard 95% of them.
+        src = universe.configured_source()
+        candidates = universe.build_universe()
+        broad = src == "broad"
+        storage.set_progress(run_id, f"stage 0/4: universe ({src})")
+        uni = (universe.investable(date.today(), store=store, log=_log)
+               if broad else candidates)
+        by_symbol = {r["symbol"]: r for r in uni}
         subs = {r["symbol"]: r["subsector"] for r in uni}
         syms = [r["symbol"] for r in uni]
-        _log(f"universe: {len(syms)} tickers")
+        _log(f"universe ({src}): {len(syms)} tickers"
+             + (f" of {len(candidates)} candidates" if broad else ""))
+        if not syms:
+            hz.failed("universe", f"0/{len(candidates)} candidates passed the "
+                                  f"point-in-time floor")
+        elif broad:
+            hz.ok("universe", f"{len(syms)}/{len(candidates)} passed floor")
+        else:
+            hz.ok("universe", f"{len(syms)} curated tickers")
         # Record today's membership so future backtests know what was in the universe
         # on this date instead of reconstructing it with hindsight (survivorship guard).
         try:
-            from .data.history_store import HistoryStore
-            HistoryStore().record_universe(date.today(), uni)
+            store.record_universe(date.today(), uni, source=src)
         except Exception as exc:  # noqa: BLE001
             _log(f"universe snapshot not recorded: {exc}")
 
@@ -105,8 +125,23 @@ def run(mode: str = "deep") -> int:
                                         f"(Yahoo throttling?); {len(metrics)} passed floor")
         else:
             hz.ok("fundamentals", f"{len(metrics)}/{len(syms)} passed floor")
+        if broad and syms:
+            # `.info` errors are the curated path's failure mode. The broad path's is a
+            # thin SEC store: the fundamental pillar is served from snapshots, so
+            # coverage of the floored universe — not Yahoo's mood — is what says
+            # whether the pillar is real.
+            try:
+                cov = len(store.fundamentals_asof(syms, date.today())) / len(syms)
+            except Exception:  # noqa: BLE001
+                cov = 0.0
+            if cov < 0.7:
+                hz.degraded("fundamentals", f"SEC snapshots cover {cov:.0%} of the "
+                                            f"{len(syms)} floored names (<70%) — run "
+                                            f"`scripts.data_refresh --facts-bulk --snapshots`")
         storage.upsert_tickers([
-            {"symbol": s, "name": m.get("name", s), "subsector": subs.get(s, "")}
+            {"symbol": s, "name": m.get("name", s), "subsector": subs.get(s, ""),
+             "sector": by_symbol.get(s, {}).get("sector"),
+             "industry_group": by_symbol.get(s, {}).get("industry_group")}
             for s, m in metrics.items()
         ])
 
