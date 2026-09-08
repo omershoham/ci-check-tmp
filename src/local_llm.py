@@ -1,8 +1,8 @@
-"""Local LLM (Ollama) signal stage: classify recent news into a hyperscaler
-signal score + extracted catalysts. Free and local — conserves Claude usage.
+"""Local LLM (Ollama) signal stage: classify recent news into a CATALYST VECTOR
+(9 fixed keys, 0-10 each) + extracted catalysts. Free and local — conserves Claude usage.
 
 Degrades gracefully: if Ollama is unreachable, returns a neutral signal so the
-pipeline continues (scoring treats a missing signal as neutral 5/10).
+pipeline continues (scoring treats a missing key as unknown, not as a zero).
 """
 from __future__ import annotations
 
@@ -11,28 +11,83 @@ from typing import Any
 
 import requests
 
-from . import config
+from . import config, theme
 
-_HYPERSCALERS = ("AWS", "Amazon", "Azure", "Microsoft", "Google Cloud", "GCP",
-                 "Oracle", "OCI", "Meta", "NVIDIA", "hyperscaler", "data center",
-                 "cloud capex", "AI infrastructure")
+# THE KEY SET IS FIXED IN PYTHON, NEVER IN A THEME PACK. A theme varies the prose
+# (which actors matter, what to emphasise); if it could vary the KEYS, two themes'
+# signals would be different measurements wearing the same column, no information
+# coefficient could ever be pooled across them, and the single `hyperscaler_signal`
+# column — un-poolable and un-measurable by construction — would simply come back
+# under another name.
+CATALYST_KEYS: tuple[str, ...] = (
+    "customer_deal", "ma_event", "guidance_revision", "analyst_action",
+    "product_cycle", "regulatory_policy", "capital_return_insider",
+    "management_ownership", "adverse_event",
+)
+# The one axis that scores BADNESS. Kept separate so `scoring._catalyst_pillar`
+# subtracts it instead of rewarding a lawsuit as "a catalyst".
+NEGATIVE_KEYS: frozenset[str] = frozenset({"adverse_event"})
 
+# 1 = the single hyperscaler_signal; 2 = this vector. Persisted per row so any
+# statistic can partition instead of silently pooling two different signals.
+SIGNAL_VERSION = 2
+
+# One line per key, straight into the prompt. Wording is the contract: the model can
+# only discriminate keys it can tell apart, and "guidance vs analyst action" is a
+# SOURCE distinction (company vs sell-side), not a subject-matter one.
+_KEY_DEFS = {
+    "customer_deal": "large named customer/partner win, supply agreement, or capex-driven demand ({actors})",
+    "ma_event": "the company is an acquisition target or acquirer, an activist takes a stake, or a strategic review starts",
+    "guidance_revision": "COMPANY-sourced outlook change: raised/cut guidance, pre-announcement, beat/miss commentary",
+    "analyst_action": "SELL-SIDE-sourced: upgrades, downgrades, price-target or estimate revisions",
+    "product_cycle": "launch, regulatory/product approval, design win, capacity or node ramp",
+    "regulatory_policy": "FAVOURABLE government/regulatory action ONLY — approvals, subsidies, tariff relief, won litigation. Adverse regulatory action (probes, fines, adverse rulings) belongs in adverse_event; score regulatory_policy 0 for those",
+    "capital_return_insider": "buyback authorization, dividend initiation/raise, insider buying",
+    "management_ownership": "CEO/CFO transition, board change, major ownership shift",
+    "adverse_event": "NEGATIVE events: probe, lawsuit, guidance cut, dilution, downgrade, customer loss, accident, recall",
+}
+
+
+def _key_lines() -> str:
+    actors = theme.actors_text()
+    return "\n".join(f"  - {k}: {_KEY_DEFS[k].format(actors=actors)}"
+                     for k in CATALYST_KEYS)
+
+
+# THE CLASSIFIER IS THEME-NEUTRAL; THE RESEARCH PROMPT IS NOT.
+# The division of labour: this stage produces MEASURED FEATURES, so it must score the
+# same evidence the same way under every theme — otherwise `customer_deal 8` means
+# something different in each pack and the two can never be pooled or IC'd, which is
+# the exact defect the single hyperscaler_signal had. The pack's `actors` DO appear,
+# in the key definitions only: naming AWS is RECOGNITION ("this counterparty is a
+# large customer"), not weighting. What is deliberately absent is the pack's
+# `catalyst_emphasis` ("weigh hyperscaler capex heavily") — that is a judgement, and
+# judgement belongs in deep_research's prompt, where the output is an opinion rather
+# than a feature.
 _SYSTEM = (
-    "You are a financial news classifier for AI-infrastructure stocks. "
-    "Given recent headlines about one company, judge how likely the company is "
-    "to benefit from large hyperscaler deals/capex (AWS, Azure, Google Cloud, "
-    "Oracle, Meta, NVIDIA ecosystem) in the coming weeks-to-months. "
-    "Return ONLY JSON."
+    "You are a financial news classifier for US stocks. Given recent headlines "
+    "about one company, score how strongly the news evidences each of nine "
+    "catalyst types over the coming weeks-to-months. Score each key on the evidence "
+    "alone; do not privilege any one sector's storyline. Return ONLY JSON."
 )
 
-_PROMPT_TMPL = """Company: {name} ({symbol})
+
+def _system() -> str:
+    return _SYSTEM
+
+
+def _prompt_tmpl() -> str:
+    return """Company: {name} ({symbol})
 
 Recent headlines (newest first, with dates):
 {headlines}
 
 Return JSON with exactly these keys:
-{{"hyperscaler_signal": <integer 0-10>, "sentiment": "bullish"|"neutral"|"bearish", "sentiment_score": <integer 0-10>, "catalysts": [<short strings>], "summary": "<one sentence>"}}
-- hyperscaler_signal: 0 = no relevance, 10 = strong imminent hyperscaler-deal signal.
+{{"catalyst": {{""" + ", ".join(f'"{k}": <integer 0-10>' for k in CATALYST_KEYS) + """}}, "sentiment": "bullish"|"neutral"|"bearish", "sentiment_score": <integer 0-10>, "catalysts": [<short strings>], "summary": "<one sentence>"}}
+- catalyst: score EACH key 0-10 on the evidence in THESE headlines. 0 = no evidence
+  of that event type (the common, correct answer — most keys are 0 for most names);
+  10 = strong, imminent, well-evidenced. Do NOT spread a single story across keys.
+""" + _key_lines() + """
 - sentiment: overall tone of the recent news for the stock.
 - sentiment_score: 0 = very bearish, 5 = neutral, 10 = very bullish.
 - catalysts: up to 4 concrete near-term catalysts from the headlines (empty if none).
@@ -41,18 +96,33 @@ Return JSON with exactly these keys:
   two-week-old price-target raise.
 """
 
+
 # JSON schema Ollama enforces via constrained decoding (stricter than format:"json").
+# Every catalyst key is REQUIRED: the model literally cannot omit one, so a 0 always
+# means "the model looked and found nothing", never "the model forgot".
 _CLASSIFY_SCHEMA = {
     "type": "object",
     "properties": {
-        "hyperscaler_signal": {"type": "integer", "minimum": 0, "maximum": 10},
+        "catalyst": {
+            "type": "object",
+            "properties": {k: {"type": "integer", "minimum": 0, "maximum": 10}
+                           for k in CATALYST_KEYS},
+            "required": list(CATALYST_KEYS),
+        },
         "sentiment": {"type": "string", "enum": ["bullish", "neutral", "bearish"]},
         "sentiment_score": {"type": "integer", "minimum": 0, "maximum": 10},
         "catalysts": {"type": "array", "items": {"type": "string"}},
         "summary": {"type": "string"},
     },
-    "required": ["hyperscaler_signal", "sentiment", "sentiment_score", "catalysts", "summary"],
+    "required": ["catalyst", "sentiment", "sentiment_score", "catalysts", "summary"],
 }
+
+
+def _unknown_vector() -> dict[str, None]:
+    """All nine keys UNKNOWN. Distinct from all-zero: zero is measured evidence of
+    absence, None is the absence of a measurement, and only the latter may be
+    neutralised downstream."""
+    return {k: None for k in CATALYST_KEYS}
 
 
 def _host() -> str:
@@ -70,32 +140,36 @@ def available() -> bool:
 
 
 def _neutral(symbol: str, reason: str) -> dict[str, Any]:
-    return {"symbol": symbol, "hyperscaler_signal": None, "sentiment": None,
+    cat = _unknown_vector()
+    return {"symbol": symbol, "catalyst": cat, "hyperscaler_signal": None,
+            "signal_version": SIGNAL_VERSION, "sentiment": None,
             "sentiment_score": None, "catalysts": [], "summary": "", "error": reason}
 
 
 def classify(symbol: str, name: str, headlines: list[str],
              check_available: bool = True) -> dict[str, Any]:
     if not headlines:
-        # No news → neutral tone, and hyperscaler relevance is UNKNOWN (None), not a
-        # bearish 0. A hard 0 here would wrongly penalize the sentiment pillar and drag
-        # the deal signal below a name we simply never scanned.
-        return {"symbol": symbol, "hyperscaler_signal": None, "sentiment": "neutral",
-                "sentiment_score": 5, "catalysts": [], "summary": "No recent news."}
+        # No news → neutral tone, and every catalyst key is UNKNOWN (None), not a
+        # bearish 0. A hard 0 here would penalize a name we simply never scanned as
+        # if we had scanned it and found nothing.
+        return {"symbol": symbol, "catalyst": _unknown_vector(),
+                "hyperscaler_signal": None, "signal_version": SIGNAL_VERSION,
+                "sentiment": "neutral", "sentiment_score": 5, "catalysts": [],
+                "summary": "No recent news."}
     if check_available and not available():
         return _neutral(symbol, "ollama_unavailable")
 
     model = config.get("local_llm.model", "qwen3.5:9b")
     timeout = config.get("local_llm.timeout_seconds", 120)
     hl = "\n".join(f"- {h}" for h in headlines[:12])
-    prompt = _PROMPT_TMPL.format(name=name, symbol=symbol, headlines=hl)
+    prompt = _prompt_tmpl().format(name=name, symbol=symbol, headlines=hl)
 
     try:
         resp = requests.post(
             f"{_host()}/api/generate",
             json={
                 "model": model,
-                "system": _SYSTEM,
+                "system": _system(),
                 "prompt": prompt,
                 "format": _CLASSIFY_SCHEMA,  # schema-constrained decoding (valid JSON guaranteed)
                 "stream": False,
@@ -116,7 +190,11 @@ def classify(symbol: str, name: str, headlines: list[str],
         except (TypeError, ValueError):
             return None
 
-    sig = _int0_10(data.get("hyperscaler_signal"))
+    raw_cat = data.get("catalyst")
+    raw_cat = raw_cat if isinstance(raw_cat, dict) else {}
+    # A key the model omitted (impossible under the schema, but the schema is the
+    # server's promise, not ours) stays None = unmeasured, never a fabricated 0.
+    cat = {k: _int0_10(raw_cat.get(k)) for k in CATALYST_KEYS}
     sent_score = _int0_10(data.get("sentiment_score"))
     sentiment = str(data.get("sentiment", "")).strip().lower() or None
     if sentiment not in ("bullish", "neutral", "bearish"):
@@ -126,7 +204,12 @@ def classify(symbol: str, name: str, headlines: list[str],
         cats = [str(cats)]
     return {
         "symbol": symbol,
-        "hyperscaler_signal": sig,
+        "catalyst": cat,
+        # DUAL-WRITE, display continuity only: `customer_deal` is the direct heir of
+        # hyperscaler_signal, so the legacy column and everything reading it keep
+        # rendering while signal_version tells statistics which signal they hold.
+        "hyperscaler_signal": cat["customer_deal"],
+        "signal_version": SIGNAL_VERSION,
         "sentiment": sentiment,
         "sentiment_score": sent_score,
         "catalysts": [str(c) for c in cats][:4],
@@ -209,8 +292,8 @@ def score_headlines(headlines: list[str], timeout: float | None = None) -> list[
 if __name__ == "__main__":
     print("Ollama available:", available())
     demo = [
-        "Vertiv lands major data center cooling order tied to AI buildout",
-        "Analysts raise Vertiv targets on hyperscaler capex surge",
-        "Vertiv expands liquid cooling capacity for NVIDIA GPU racks",
+        "[1d ago] Vertiv lands major data center cooling order tied to AI buildout",
+        "[2d ago] Analysts raise Vertiv targets on hyperscaler capex surge",
+        "[5d ago] Vertiv expands liquid cooling capacity for NVIDIA GPU racks",
     ]
     print(json.dumps(classify("VRT", "Vertiv", demo), indent=2))

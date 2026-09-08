@@ -1,4 +1,4 @@
-"""Dual scoring: Quality score + Deal score -> blended conviction + tags.
+"""Cross-sectional pillar scoring -> blended conviction + tags.
 
 Scores are cross-sectional percentile ranks within the day's universe (0..1).
 Growth, quality and cash flow rank across the universe blended with the name's own
@@ -26,7 +26,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from . import config
+from . import config, local_llm
 
 # Bump whenever a pillar's DEFINITION changes (components, ranking method, signs).
 # pillar_ic filters to the current version so pre-change scores can't contaminate
@@ -59,24 +59,19 @@ def effective_score_version() -> int:
 # Which pillars a row was actually scored with. Persisted to screen_scores.pillar_set
 # so pillar_ic can group on it: adding a pillar changes the composite's meaning even
 # when no existing pillar's definition moved, and pooling the two is a silent error.
-_PILLAR_ORDER = ("technical", "fundamental", "sentiment", "learned")
+_PILLAR_ORDER = ("technical", "fundamental", "sentiment", "learned", "catalyst")
 
 
 _DEFAULT_PILLARS = {"technical": 0.35, "fundamental": 0.30, "sentiment": 0.35}
 
 
 def pillar_set() -> str:
+    """The WEIGHTED pillars, comma-joined. A pillar shipped dark is computed and
+    persisted but contributes nothing to `blended`, so listing it would split the IC
+    study's partition key for no change in the composite."""
     pillars = config.get("scoring.pillars", _DEFAULT_PILLARS) or _DEFAULT_PILLARS
     on = [p for p in _PILLAR_ORDER if float(pillars.get(p, 0) or 0) > 0]
     return ",".join(on)
-
-# Static base relevance of each sub-sector to hyperscaler capex (feeds Deal score).
-SUBSECTOR_RELEVANCE = {
-    "semis_equipment": 0.95,
-    "networking_optical": 0.85,
-    "datacenter_power": 0.80,
-    "cloud_ai_software": 0.70,
-}
 
 # Component metrics per subscore. (column, higher_is_better)
 # Deduped per CR#2: p_fcf removed (reciprocal of fcf_yield — one number was ~20% of
@@ -378,14 +373,50 @@ def _r3(v) -> float | None:
 
 
 def _sentiment_pillar(sig: dict | None) -> float:
-    """0..1 news-sentiment pillar: TONE ONLY. hyperscaler_signal is thesis-RELEVANCE,
-    not tone, and already carries 45% of the deal score — blending it here would
-    double-count relevance across the composite and make the pillar's information
-    coefficient uninterpretable (which signal is being measured?)."""
+    """0..1 news-sentiment pillar: TONE ONLY. The catalyst vector measures EVENTS and
+    has its own pillar; folding it in here would put the same evidence into the
+    composite twice and make either pillar's information coefficient uninterpretable
+    (which signal would be measured?)."""
     if not sig:
         return 0.5
     ss = sig.get("sentiment_score")
     return 0.5 if ss is None else float(ss) / 10.0
+
+
+def catalyst_subweights() -> dict[str, float]:
+    """Per-key weights for the catalyst pillar. EQUAL by default, deliberately.
+
+    The deleted deal score put 35% on `subsector_relevance`, a hand-set prior that
+    could never be wrong and never be measured. Hand-tuning these nine would repeat
+    exactly that, so they stay equal until pillar_ic has the forward data to earn a
+    change."""
+    cfg = config.get("scoring.catalyst.subweights", {}) or {}
+    return {k: float(cfg.get(k, 1.0) or 0.0) for k in local_llm.CATALYST_KEYS}
+
+
+def _catalyst_pillar(sig: dict | None,
+                     subweights: dict[str, float] | None = None) -> float | None:
+    """Weighted mean of the eight positive catalyst keys minus `adverse_event`, each
+    on 0..1, over the keys that were actually MEASURED.
+
+    Returns None when no key was measured — a failed call, or a name never scanned.
+    That is the genuine-0-vs-unknown discipline the old `_hs` carried: a measured 0
+    means "the model read the headlines and found no such event" and must keep
+    ranking below a measured 8, while an unmeasured key must not push a name down
+    for evidence nobody ever gathered."""
+    cat = (sig or {}).get("catalyst") or {}
+    w = subweights if subweights is not None else catalyst_subweights()
+    num = den = 0.0
+    for k in local_llm.CATALYST_KEYS:
+        v = cat.get(k)
+        if v is None:
+            continue
+        wk = float(w.get(k, 1.0) or 0.0)
+        if wk <= 0:
+            continue
+        den += wk
+        num += wk * (float(v) / 10.0) * (-1.0 if k in local_llm.NEGATIVE_KEYS else 1.0)
+    return None if den <= 0 else num / den
 
 
 def score_universe(metrics: dict[str, dict],
@@ -397,7 +428,7 @@ def score_universe(metrics: dict[str, dict],
     """Three-pillar scoring (+ an optional fourth, learned pillar).
 
     metrics: symbol -> fundamentals dict.
-    signals: symbol -> local_llm dict (hyperscaler_signal, sentiment_score, ...).
+    signals: symbol -> local_llm dict (catalyst vector, sentiment_score, ...).
     technicals: symbol -> technical_score (0..1).
     ml_scores: symbol -> raw score from the learned ranker (src/ml). Weighted only by
         config scoring.pillars.learned (default 0 = shipped dark); still persisted so the
@@ -425,27 +456,12 @@ def score_universe(metrics: dict[str, dict],
     fund_cov = fd["coverage"]
     val_in_sector = fd["valuation_in_sector"]
 
-    # --- Deal-relevance (feeds the "deal" tag): sub-sector + hyperscaler signal + momentum.
-    # Weights come from config (scoring.deal.subweights) so tuning the YAML is live.
-    relevance = pd.Series({s: SUBSECTOR_RELEVANCE.get(subsectors.get(s, ""), 0.6) for s in df.index})
-    mom_raw = pd.concat([
-        pd.to_numeric(df.get("mom_50", pd.Series(index=df.index)), errors="coerce"),
-        pd.to_numeric(df.get("mom_200", pd.Series(index=df.index)), errors="coerce"),
-    ], axis=1).mean(axis=1)
-    momentum = _pct(mom_raw, higher_is_better=True)
-
-    def _hs(sym: str) -> float:
-        # A genuine 0 ("no hyperscaler relevance") must NOT be coerced to neutral 5;
-        # only a truly missing/unknown signal defaults to 5.
-        v = (signals.get(sym) or {}).get("hyperscaler_signal")
-        return (5.0 if v is None else float(v)) / 10.0
-
-    hsignal = pd.Series({s: _hs(s) for s in df.index})
-    dw = config.get("scoring.deal.subweights", {}) or {}
-    w_rel = dw.get("subsector_relevance", 0.35)
-    w_hs = dw.get("hyperscaler_signal", 0.45)
-    w_mom = dw.get("momentum", 0.20)
-    deal = relevance * w_rel + hsignal * w_hs + momentum * w_mom
+    # --- Catalyst pillar (SHIPPED DARK at scoring.pillars.catalyst = 0). Computed and
+    # persisted from day one so the forward history accumulates while the pillar is
+    # un-backtestable: no news archive exists, so it can only ever be earned forward.
+    cw = catalyst_subweights()
+    catalyst = pd.Series({s: _catalyst_pillar(signals.get(s), cw) for s in df.index},
+                         dtype=float)
 
     # --- Technical & Sentiment pillars
     # technicals: symbol -> dict from technical.compute_many (has technical_score, state, rsi).
@@ -462,6 +478,7 @@ def score_universe(metrics: dict[str, dict],
     wF = pillars.get("fundamental", 0.30)
     wS = pillars.get("sentiment", 0.35)
     wL = learned_weight()
+    wC = float(pillars.get("catalyst", 0.0) or 0.0)
     technical_r = _pct(technical, higher_is_better=True)
     # NOT _pct: its fillna(0.5) is exactly what the coverage floor exists to prevent.
     # A thin-data name keeps a NaN rank here and the weight loop below drops the
@@ -471,16 +488,20 @@ def score_universe(metrics: dict[str, dict],
     learned = pd.Series({s: ml_scores.get(s) for s in df.index}, dtype=float)
     learned_r = _pct(learned, higher_is_better=True) if learned.notna().any() \
         else pd.Series(0.5, index=df.index)
+    # _pct's fillna(0.5) is the right rule here: a name with NO measured catalyst key
+    # sits in the middle of the cross-section, not at the bottom of it.
+    catalyst_r = _pct(catalyst, higher_is_better=True) if catalyst.notna().any() \
+        else pd.Series(0.5, index=df.index)
     # Normalize by the weight sum so the composite stays on the 0..1 scale when a user
     # turns the learned pillar on without re-balancing the other three (identical to
     # the old formula whenever the weights already sum to 1). The sum is PER ROW: a
     # name whose fundamental pillar is NaN is ranked on its other pillars re-scaled to
     # 1, not penalised for data we never had.
     wF_row = pd.Series(float(wF), index=df.index).where(fundamental.notna(), 0.0)
-    wsum = (wT + wS + wL) + wF_row
+    wsum = (wT + wS + wL + wC) + wF_row
     wsum = wsum.where(wsum > 0, 1.0)
     composite = (technical_r * wT + fundamental_r.fillna(0.0) * wF_row
-                 + sentiment_r * wS + learned_r * wL) / wsum
+                 + sentiment_r * wS + learned_r * wL + catalyst_r * wC) / wsum
 
     # Sector-relative valuation: median PE / fwd PE / EV-EBITDA per sub-sector.
     df["_sub"] = [subsectors.get(s, "") for s in df.index]
@@ -500,7 +521,6 @@ def score_universe(metrics: dict[str, dict],
 
     rows: list[dict[str, Any]] = []
     q_thresh = tagcfg.get("quality_threshold", 0.6)
-    d_thresh = tagcfg.get("deal_threshold", 0.6)
     require_fcf = config.get("scoring.quality.require_positive_fcf_for_tag", True)
     hr = tagcfg.get("higher_risk", {})
     # DEPRECATED (one release): a flat PE ceiling is a sector bet dressed as a risk
@@ -530,13 +550,8 @@ def score_universe(metrics: dict[str, dict],
         tags: list[str] = []
         is_quality = (f_val is not None and f_val >= q_thresh
                       and (positive_fcf or not require_fcf))
-        is_deal = deal[s] >= d_thresh
         if is_quality:
             tags.append("quality")
-        if is_deal:
-            tags.append("deal")
-        if is_quality and is_deal:
-            tags.append("both")
         # "higher-risk" means unprofitable, or EXPENSIVE RELATIVE TO ITS OWN SECTOR.
         # The old rule also fired on `pe is None`, which flagged every pre-revenue
         # biotech and every loss-making growth name as risky for the same reason — a
@@ -579,7 +594,6 @@ def score_universe(metrics: dict[str, dict],
             "blended": round(float(composite[s]), 4),   # composite = ranking score
             # kept for back-compat / tags
             "quality": round(f_val, 4) if f_val is not None else None,
-            "deal": round(float(deal[s]), 4),
             "tags": tags,
             "metrics": {
                 "price": m.get("price"),
@@ -599,6 +613,14 @@ def score_universe(metrics: dict[str, dict],
                 "pillar_learned": (round(float(learned[s]), 4)
                                    if s in learned.index and learned[s] == learned[s] else None),
                 "pillar_learned_rank": round(float(learned_r[s]), 4) if learned.notna().any() else None,
+                # catalyst pillar (dark until scoring.pillars.catalyst > 0). Persisted
+                # with its RAW nine keys, so a later redefinition can be recomputed
+                # over the accumulated history instead of only from the day it lands.
+                "pillar_catalyst": _r3(catalyst[s]),
+                "pillar_catalyst_rank": (round(float(catalyst_r[s]), 4)
+                                         if catalyst.notna().any() else None),
+                "catalyst": (signals.get(s) or {}).get("catalyst"),
+                "signal_version": (signals.get(s) or {}).get("signal_version"),
                 "tech_state": tech_info.get("state"),
                 "rsi": tech_info.get("rsi"),
                 "macd_hist": tech_info.get("macd_hist"),

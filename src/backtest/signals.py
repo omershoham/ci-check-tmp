@@ -4,7 +4,7 @@
   technical_pillar     src/technical._compute_one replayed on each date's trailing window
   fundamental_pillar   src/scoring.fundamental_pillar on the PIT snapshot for each date
   composite_3pillar    the live screen replayed: percentile-ranked pillars × config weights,
-                       sentiment fixed at 0.5 (no news history exists)
+                       sentiment fixed at 0.5 and catalyst omitted (no news history exists)
 
 Each returns a date × symbol score frame on the requested rebalance dates.
 """
@@ -117,6 +117,42 @@ def fundamental_pillar(store, symbols: list[str], subsectors: dict[str, str],
     return fundamental_frames(store, symbols, subsectors, dates, sectors)[0]
 
 
+# Pillars the replay CANNOT reproduce, and why. Checked before every replay: at
+# weight 0 they are simply absent from the composite and nothing is lost, but the
+# moment one carries weight the replayed composite silently stops being the live one
+# and every backtest number becomes a measurement of a different signal. That is the
+# Phase 4 replay/live parity bug in a form nobody would notice, so it raises.
+_UNREPLAYABLE = {
+    "catalyst": "it is derived from a news scan and no news archive exists "
+                "(src/backtest/signals.py has no historical headlines to replay)",
+    "learned": "it requires the trained ranker's point-in-time model, which the "
+               "replay does not load",
+}
+
+
+def assert_replayable(weights: dict[str, float] | None = None) -> dict[str, float]:
+    """The pillar weights the replay will use, or a hard failure naming the pillar
+    that cannot be replayed. Callers get the weights back so there is one place the
+    replay's weights are resolved AND checked — a check the caller can forget to run
+    is a check that will be forgotten."""
+    w = weights if weights is not None else config.get(
+        "scoring.pillars", {"technical": 0.35, "fundamental": 0.30, "sentiment": 0.35})
+    w = w or {}
+    for pillar, why in _UNREPLAYABLE.items():
+        try:
+            wt = float(w.get(pillar, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            wt = 0.0
+        if wt > 0:
+            raise ValueError(
+                f"scoring.pillars.{pillar} = {wt} but the backtest cannot replay the "
+                f"{pillar} pillar: {why}. The replayed composite would silently stop "
+                f"being the live composite. Set it to 0 to backtest, or validate that "
+                f"pillar forward with `pillar_ic` instead."
+            )
+    return w
+
+
 def composite_3pillar(tech: pd.DataFrame, fund: pd.DataFrame,
                       scored: pd.DataFrame | None = None,
                       weights: dict[str, float] | None = None) -> pd.DataFrame:
@@ -128,9 +164,12 @@ def composite_3pillar(tech: pd.DataFrame, fund: pd.DataFrame,
     whose fundamental pillar is NaN is ranked on the pillars it has, re-scaled to 1,
     rather than being dropped or scored on an invented 0.5. `scored` says which names
     the live floor would have kept (i.e. had a PIT snapshot); without it the old,
-    stricter behaviour is used and thin-data names leave the cross-section."""
-    w = weights or config.get("scoring.pillars",
-                              {"technical": 0.35, "fundamental": 0.30, "sentiment": 0.35})
+    stricter behaviour is used and thin-data names leave the cross-section.
+
+    The CATALYST pillar is absent here on purpose and cannot be added: it is derived
+    from a news scan, and no news archive exists to replay (same reason sentiment is
+    a constant 0.5). It is earned forward through `pillar_ic`, never backtested."""
+    w = assert_replayable(weights)
     wT = w.get("technical", 0.35)
     wF = w.get("fundamental", 0.30)
     wS = w.get("sentiment", 0.35)

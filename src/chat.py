@@ -14,7 +14,7 @@ from typing import Any
 
 from . import config, deep_research, learning, recommend, regime, storage
 
-_SYSTEM_TMPL = """You are the analyst behind "Claude Trader", a personal AI-infra stock
+_SYSTEM_TMPL = """You are the analyst behind "Claude Trader", a personal US-equity
 research system. Today is {today}. The owner is asking you questions INSIDE the dashboard.
 Below is the system's complete current state — its rankings, research, portfolio actions,
 risk numbers and track record. Answer from THIS data first; be specific (cite tickers,

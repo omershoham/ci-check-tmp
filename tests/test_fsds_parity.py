@@ -200,6 +200,7 @@ def _parity_sample() -> list:
     return _cached_quarters()[-_PARITY_QUARTERS:]
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(len(_cached_quarters()) < 4,
                     reason="needs cached FSDS ZIPs (scripts.data_refresh --facts-bulk)")
 def test_fsds_matches_companyfacts_on_cached_quarters():

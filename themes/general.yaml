@@ -1,0 +1,26 @@
+# Default theme pack: no theme at all.
+#
+# Ships no curated universe on purpose — the broad path (universe.source: broad)
+# derives its names from SEC registrants, and a general board that also carried a
+# hand-picked list would be two universes pretending to be one.
+
+name: Opportunity Board
+description: US equities, no sector or thematic prior.
+
+# Deliberately generic: the catalyst prompt needs SOMETHING concrete to point at,
+# but naming one theme's counterparties here would bias every name's score.
+actors:
+  - large customers
+  - hyperscalers
+  - government / defense primes
+  - major pharma partners
+  - telcos
+
+prompt_fragments:
+  analyst_role: >-
+    an equity research analyst covering US equities
+  catalyst_emphasis: >-
+    Judge each catalyst on its own materiality to THIS company's revenue or
+    multiple; do not privilege any one sector's storyline.
+
+subsectors: {}

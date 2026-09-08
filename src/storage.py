@@ -61,7 +61,9 @@ CREATE TABLE IF NOT EXISTS screen_scores (
     run_id       INTEGER NOT NULL,
     symbol       TEXT NOT NULL,
     quality      REAL,
-    deal         REAL,
+    deal         REAL,         -- FROZEN, written NULL since the catalyst vector
+                               -- replaced the deal score. Kept so historical rows
+                               -- stay readable; nothing computes it any more.
     blended      REAL,
     rank         INTEGER,
     tags         TEXT,         -- JSON array of strings
@@ -475,19 +477,32 @@ def upsert_screen_scores(run_id: int, rows: Iterable[dict[str, Any]]) -> None:
 
 
 def upsert_signals(run_id: int, rows: Iterable[dict[str, Any]]) -> None:
+    """Persist the local-LLM signal per symbol.
+
+    `catalyst_json` is the 9-key vector and `signal_version` says which contract it
+    speaks; `hyperscaler_signal` keeps carrying `customer_deal` so every existing
+    reader (dashboard, old queries) renders unchanged. Renaming the column instead of
+    extending would have orphaned every historical row it holds.
+    """
     payload = [{
         "run_id": run_id,
         "symbol": r["symbol"],
         "hyperscaler_signal": r.get("hyperscaler_signal"),
+        "catalyst_json": json.dumps(r["catalyst"]) if r.get("catalyst") else None,
+        "signal_version": r.get("signal_version"),
         "catalysts_json": json.dumps(r.get("catalysts", [])),
         "summary": r.get("summary"),
     } for r in rows]
     with get_conn() as conn:
         conn.executemany(
-            """INSERT INTO signals(run_id,symbol,hyperscaler_signal,catalysts_json,summary)
-               VALUES(:run_id,:symbol,:hyperscaler_signal,:catalysts_json,:summary)
+            """INSERT INTO signals(run_id,symbol,hyperscaler_signal,catalyst_json,
+                                   signal_version,catalysts_json,summary)
+               VALUES(:run_id,:symbol,:hyperscaler_signal,:catalyst_json,
+                      :signal_version,:catalysts_json,:summary)
                ON CONFLICT(run_id,symbol) DO UPDATE SET
                  hyperscaler_signal=excluded.hyperscaler_signal,
+                 catalyst_json=excluded.catalyst_json,
+                 signal_version=excluded.signal_version,
                  catalysts_json=excluded.catalysts_json, summary=excluded.summary""",
             payload,
         )
@@ -541,7 +556,8 @@ def get_board(run_id: int) -> list[dict[str, Any]]:
             """
             SELECT s.symbol, t.name, t.subsector, s.quality, s.deal, s.blended,
                    s.rank, s.tags, s.metrics_json,
-                   g.hyperscaler_signal, g.catalysts_json AS sig_catalysts, g.summary,
+                   g.hyperscaler_signal, g.catalyst_json, g.signal_version,
+                   g.catalysts_json AS sig_catalysts, g.summary,
                    r.rating, r.conviction, r.deal_likelihood, r.thesis, r.chart_pattern,
                    r.metrics_read, r.data_as_of, r.created_at AS research_at,
                    r.catalysts_json AS res_catalysts, r.risks_json, r.red_team_json,
@@ -563,7 +579,7 @@ def get_board(run_id: int) -> list[dict[str, Any]]:
     for row in rows:
         d = dict(row)
         for k in ("tags", "metrics_json", "sig_catalysts", "res_catalysts", "risks_json",
-                  "red_team_json"):
+                  "red_team_json", "catalyst_json"):
             if d.get(k):
                 try:
                     d[k] = json.loads(d[k])
@@ -837,10 +853,11 @@ if __name__ == "__main__":
     rid = create_run("deep")
     upsert_tickers([{"symbol": "NVDA", "name": "NVIDIA", "subsector": "semis_equipment"}])
     upsert_screen_scores(rid, [{
-        "symbol": "NVDA", "quality": 0.8, "deal": 0.9, "blended": 0.86, "rank": 1,
-        "tags": ["deal", "quality", "both"], "metrics": {"pe": 45.0},
+        "symbol": "NVDA", "quality": 0.8, "blended": 0.86, "rank": 1,
+        "tags": ["quality"], "metrics": {"pe": 45.0},
     }])
     upsert_signals(rid, [{"symbol": "NVDA", "hyperscaler_signal": 9.0,
+                          "catalyst": {"customer_deal": 9}, "signal_version": 2,
                           "catalysts": ["new GPU deal"], "summary": "strong demand"}])
     upsert_research(rid, {"symbol": "NVDA", "conviction": 8.5, "deal_likelihood": "high",
                           "thesis": "AI backbone", "catalysts": ["earnings"], "risks": ["valuation"],
@@ -848,7 +865,7 @@ if __name__ == "__main__":
     finish_run(rid, "ok", "smoke test")
     board = get_board(rid)
     assert board and board[0]["symbol"] == "NVDA", "round-trip failed"
-    assert board[0]["tags"] == ["deal", "quality", "both"]
+    assert board[0]["tags"] == ["quality"]
     assert board[0]["conviction"] == 8.5
     print("storage.py round-trip OK. run_id=", rid, "board rows=", len(board))
     print("Sample row:", {k: board[0][k] for k in ("symbol", "blended", "tags", "conviction")})

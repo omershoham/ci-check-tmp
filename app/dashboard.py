@@ -28,7 +28,8 @@ try:
 except Exception:  # noqa: BLE001
     st_autorefresh = None
 
-from src import charts, config, health, news, recommend, regime, storage  # noqa: E402
+from src import charts, config, health, news, recommend, regime, storage, theme  # noqa: E402
+from src.local_llm import CATALYST_KEYS  # noqa: E402
 from src.universe import SUBSECTOR_LABELS  # noqa: E402
 
 st.set_page_config(page_title="Claude Trader", layout="wide", page_icon="📈")
@@ -88,7 +89,7 @@ def pill(label_key: str, text: str, screen: bool = False) -> str:
 # Tags are IDENTITY, not status — they use neutral glyphs so the traffic-light
 # palette stays reserved for genuinely good→bad axes (recommendation/action/regime).
 # "🟢 Buy … 🔴 higher-risk" on one row used to read as a contradiction.
-TAG_BADGE = {"both": "◆ deal+quality", "deal": "◆ deal", "quality": "◇ quality",
+TAG_BADGE = {"quality": "◇ quality",
              "higher-risk": "⚠ higher-risk", "earnings-soon": "🗓 earnings-soon",
              # Both are statements about DATA, not about the company: "no trailing P/E"
              # and "too few fundamentals to rank". They used to be silently folded into
@@ -152,6 +153,28 @@ def tag_str(tags) -> str:
     return " ".join(TAG_BADGE.get(t, t) for t in (tags or []))
 
 
+# Short labels for the catalyst column: nine snake_case keys do not fit a table cell.
+CATALYST_SHORT = {"customer_deal": "deal", "ma_event": "M&A",
+                  "guidance_revision": "guide", "analyst_action": "analyst",
+                  "product_cycle": "product", "regulatory_policy": "policy",
+                  "capital_return_insider": "buyback",
+                  "management_ownership": "mgmt", "adverse_event": "adverse"}
+
+
+def catalyst_str(row, top: int = 2) -> str:
+    """The `top` strongest NON-ZERO catalyst keys, e.g. "deal 8 · product 6".
+
+    Zeros are dropped rather than shown: most keys are legitimately 0 for most names
+    on most days, and rendering seven zeros would hide the one key that fired."""
+    cat = (row or {}).get("catalyst_json") or ((row or {}).get("metrics") or {}).get("catalyst")
+    if not isinstance(cat, dict):
+        return ""
+    hits = [(k, v) for k, v in cat.items()
+            if k in CATALYST_KEYS and isinstance(v, (int, float)) and v]
+    hits.sort(key=lambda kv: -kv[1])
+    return " · ".join(f"{CATALYST_SHORT.get(k, k)} {int(v)}" for k, v in hits[:top])
+
+
 def md(text) -> str:
     """Escape $ so Streamlit markdown doesn't render '$...$' spans as LaTeX math."""
     return str(text).replace("$", "\\$") if text not in (None, "") else ""
@@ -196,10 +219,10 @@ GLOSSARY = {
     "Price": "The latest traded price, delayed about 15 minutes (from IBKR). Every valuation ratio and trade level below is computed against this price, so they move as the price moves.",
     "Mkt cap": "Market capitalization = share price x total shares outstanding — the market's price tag on the company's entire equity. It tells you the size class (small / mid / large / mega-cap) and lets you compare valuation ratios fairly: a low P/E on a tiny company is far riskier than the same P/E on a mega-cap.",
     "PE": "Trailing Price/Earnings: share price divided by the last 12 months of earnings per share — roughly what you pay for $1 of current annual profit. Lower looks cheaper, but 'cheap' is relative: fast-growing tech routinely trades at 30-50x, and a very low P/E can signal either a bargain or a declining business. Compare only within the same sector, and note it's blank/negative for unprofitable companies.",
-    "Fwd PE": "Forward P/E uses analysts' estimate of NEXT year's earnings instead of the past. If it's well below the trailing P/E, the market expects earnings to grow (common in AI-infra); if it's higher, earnings are expected to shrink. Estimates are often wrong, so read it as an expectation gauge, not a fact.",
+    "Fwd PE": "Forward P/E uses analysts' estimate of NEXT year's earnings instead of the past. If it's well below the trailing P/E, the market expects earnings to grow; if it's higher, earnings are expected to shrink. Estimates are often wrong, so read it as an expectation gauge, not a fact.",
     "P/FCF": "Price divided by free cash flow (operating cash flow minus capital spending). Free cash flow is much harder to manipulate than reported earnings, so this is a stricter value measure — approximately how many years of cash generation it would take to pay back the share price. Lower = cheaper. Capital-heavy names building out (data centers, chip fabs) often show a high P/FCF while they invest.",
     "FCF yield": "Free cash flow divided by market cap — the inverse of P/FCF expressed as a yield. It's the cash 'return' the business throws off relative to its price; higher is better. Above ~5% is healthy for a mature company, while growth names reinvesting aggressively can show low or even negative yields.",
-    "Rev growth": "Year-over-year revenue growth — the top-line momentum of the business. For medium-swing AI-infra ideas you generally want strong, ideally accelerating growth; decelerating growth even at a 'cheap' valuation is a warning sign.",
+    "Rev growth": "Year-over-year revenue growth — the top-line momentum of the business. For medium-swing ideas you generally want strong, ideally accelerating growth; decelerating growth even at a 'cheap' valuation is a warning sign.",
     "Gross margin": "Gross profit (revenue minus the direct cost of goods/services) as a percent of revenue. It measures pricing power and product economics — software and chip-IP businesses run 60-80%, hardware and equipment makers lower. Rising gross margin is a strong quality signal; falling margin hints at pricing pressure or rising input costs.",
     "ROE": "Return on Equity = net income divided by shareholder equity — how much profit the company produces per $1 of equity capital, a core efficiency/quality measure. Consistently high ROE (>15-20%) points to a strong franchise, but heavy debt can inflate it, so read it alongside the company's leverage.",
     "RSI(14)": "Relative Strength Index over 14 days, scaled 0-100 — a momentum oscillator. Above 70 is 'overbought' (stretched, prone to a pullback), below 30 is 'oversold' (beaten down, prone to a bounce), and 40-65 is a healthy uptrend zone. It's a timing aid, not a standalone buy/sell signal — strong leaders can stay overbought for weeks.",
@@ -227,10 +250,11 @@ SCORE_GLOSSARY = {
     "Recommendation": "Claude's overall medium-term call after reading the three pillars plus its own web research: 🟩 Strong Buy / 🟢 Buy / 🟡 Hold / 🟠 Sell / 🔴 Strong Sell. A trailing * means it's a provisional screen guess (that name wasn't deep-researched this run), so trust it less.",
     "Composite": "The 0–1 ranking score that orders the board, a weighted blend of the three pillars (Technical 35% / Fundamental 30% / Sentiment 35%). It's relative to the day's peer set, not an absolute grade.",
     "📊 Technical": "A 0–1 score of the chart/price action: trend (price vs the 50/200-day averages and whether they've crossed), RSI, MACD, where price sits in its 52-week range, and volume confirmation. High = healthy uptrend with momentum.",
-    "💰 Fundamental": "A 0–1 score of the business and valuation, percentile-ranked against the AI-infra peer set: valuation (P/E, P/FCF, etc.), cash flow, revenue/earnings growth, and quality (margins, ROE, debt). High = cheaper and higher-quality relative to peers.",
-    "📰 Sentiment": "A 0–1 score of recent news tone (scored bullish/neutral/bearish by the local LLM) blended with the hyperscaler-deal signal. High = recent news is positive and deal-relevant.",
+    "💰 Fundamental": "A 0–1 score of the business and valuation, percentile-ranked against the day's peer set: valuation (P/E, P/FCF, etc.), cash flow, revenue/earnings growth, and quality (margins, ROE, debt). High = cheaper and higher-quality relative to peers.",
+    "📰 Sentiment": "A 0–1 score of recent news TONE only (scored bullish/neutral/bearish by the local LLM). Events — deals, approvals, lawsuits — are scored separately in the catalyst vector, so the same news is never counted twice.",
     "Conviction": "Claude's 0–10 confidence in its call after the deep research (8+ = high conviction). Only names that were deep-researched have one; others are blank.",
-    "Tags": "Quick labels: ◆ deal (likely hyperscaler-deal beneficiary) · ◇ quality (strong cash flow + reasonable valuation) · ⚠ higher-risk (unprofitable or expensively valued) · 🗓 earnings-soon (reports within a week). Tags are neutral identity markers — the colored traffic-light scale is reserved for recommendations/actions.",
+    "Tags": "Quick labels: ◇ quality (strong cash flow + reasonable valuation) · ⚠ higher-risk (unprofitable or expensively valued) · 🗓 earnings-soon (reports within a week). Tags are neutral identity markers — the colored traffic-light scale is reserved for recommendations/actions.",
+    "⚡ Catalyst": "The nine-key catalyst vector the local LLM scores from this week's headlines (customer_deal, ma_event, guidance_revision, analyst_action, product_cycle, regulatory_policy, capital_return_insider, management_ownership, adverse_event), 0–10 each. The column shows the two strongest non-zero keys. SHIPPED DARK: it is recorded every run but carries no weight in the ranking score until forward data earns it one.",
     "Setup": "A rule-based read of the trend: 📈 bullish (price above a rising, stacked 50/200-day MA structure with MACD up), 📉 bearish (the mirror image), ➖ neutral/range. Built from moving-average structure, golden/death crosses, MACD and RSI — robust signals, not fuzzy shape-matching.",
     "Relative strength": "The stock's price return minus the benchmark's (default SPY) over 3 and 6 months, in percentage points. Positive = outperforming the market (leadership); negative = lagging. One of the most predictive momentum signals — leaders tend to keep leading.",
     "Chart read": "Claude's qualitative description of the current chart setup/pattern (breakout, base/consolidation, cup-and-handle, head-and-shoulders, downtrend) from recent price action — with the caveat that chart patterns are probabilistic, not certainties.",
@@ -619,7 +643,7 @@ rec_filter = st.sidebar.multiselect(
     format_func=lambda k: recommend.BADGE.get(k, k))
 tag_filter = st.sidebar.multiselect(
     "Filter by tag",
-    ["both", "deal", "quality", "higher-risk", "earnings-soon", "no-earnings", "thin-data"])
+    ["quality", "higher-risk", "earnings-soon", "no-earnings", "thin-data"])
 # Options come from the tickers table, not the four curated labels: in broad mode
 # `subsector` carries the SIC industry group and a hardcoded list offers nothing.
 _sub_options = storage.distinct_subsectors() or list(SUBSECTOR_LABELS.keys())
@@ -641,7 +665,7 @@ else:
         st_autorefresh(interval=interval_min * 60 * 1000, key="auto_refresh")
 
 # ----------------------------------------------------------------- header
-st.title("AI-Infra Opportunity Board")
+st.title(theme.board_name())
 sel_run = next((r for r in runs if r["id"] == run_id), None)
 latest_any = runs[0] if runs else None
 if sel_run:
@@ -718,7 +742,9 @@ with tab_board:
             "from Claude's research. Trailing **\\*** = provisional screen guess (not deep-researched).\n"
             "- **📊tech / 💰fund / 📰sent** — the three pillar scores (0–1). **Composite** ranks the board.\n"
             "- **Conviction** — Claude's 0–10 confidence. **Quote** — 15-min delayed price (IBKR).\n"
-            "- **Tags** — ◆ deal · ◇ quality · ◆ deal+quality · ⚠ higher-risk · 🗓 earnings-soon.")
+            "- **⚡ catalyst** — the strongest catalyst keys the local LLM found in this "
+            "week's headlines (0–10 each). Dark: not in the ranking score yet.\n"
+            "- **Tags** — ◇ quality · ⚠ higher-risk · 🗓 earnings-soon.")
 
     # Sidebar filters FIRST, so the tile counts describe the list you're actually
     # looking at (they used to count the raw board — "All · 104" over a 25-row table).
@@ -787,6 +813,7 @@ with tab_board:
             "composite": r["blended"],
             "📊": m.get("pillar_technical"), "💰": m.get("pillar_fundamental"), "📰": m.get("pillar_sentiment"),
             "RS 3m": m.get("rs_3m"),
+            "⚡ catalyst": catalyst_str(r),
             "conv": r.get("conviction"), "quote": r.get("quote_last"),
             "tags": tag_str(r.get("tags")),
         })
@@ -810,6 +837,10 @@ with tab_board:
             "quote": st.column_config.NumberColumn("quote", format="$%.2f"),
             "RS 3m": st.column_config.NumberColumn("RS 3m", format="%+.0f", width="small"),
             "name": st.column_config.TextColumn(width="medium"),
+            "⚡ catalyst": st.column_config.TextColumn(
+                "⚡ catalyst", width="small",
+                help="Strongest catalyst keys from this run's headline scan (0–10). "
+                     "Dark: not in the ranking score."),
             "tags": st.column_config.TextColumn(width="small"),
         })
     st.caption(f"RS 3m = 3-month return vs {config.get('technical.rs_benchmark', 'SMH')} "
@@ -853,8 +884,11 @@ with tab_board:
                           help="Fundamental pillar (0–1) from valuation, cash flow, growth and quality, ranked vs peers.")
                 p2.caption(f"PE {fmt_num(m.get('trailingPE'))}")
                 p3.metric("📰 Sentiment", fmt_num(m.get("pillar_sentiment"), 2),
-                          help="Sentiment pillar (0–1) from local-LLM news tone plus the hyperscaler-deal signal.")
+                          help="Sentiment pillar (0–1) from local-LLM news TONE only. Events are scored separately in the ⚡ catalyst vector.")
                 p3.caption(m.get("sentiment_label") or "—")
+                _cat = catalyst_str(r, top=9)
+                if _cat:
+                    st.markdown(f"**⚡ Catalysts (local LLM, 0–10):** {_cat}")
                 if m.get("setup_label"):
                     st.markdown(f"**{SETUP_EMOJI.get(m.get('setup'),'')} Setup:** {m['setup_label']}"
                                 + (f" — {' · '.join(m.get('signals') or [])}" if m.get("signals") else ""))
@@ -920,7 +954,9 @@ with tab_board:
                     st.info(f"⏳ Researching {pick} in the background — refresh in ~1–2 min.")
                     load_board.clear()  # so the finished report shows up on the next tick
                 if r.get("conviction") is not None:
-                    st.markdown(f"**Claude conviction:** {r['conviction']}/10 · **deal likelihood:** {r.get('deal_likelihood','—')}")
+                    _dl = r.get("deal_likelihood")   # legacy: prompts <= v4 only
+                    st.markdown(f"**Claude conviction:** {r['conviction']}/10"
+                                + (f" · **deal likelihood:** {_dl}" if _dl else ""))
                 if r.get("rating") is not None or r.get("conviction") is not None:
                     st.caption(f"🔬 Analyzed {ago(r.get('research_at'))} · {freshness(r.get('data_as_of'))}")
                 if r.get("thesis"):
@@ -1039,12 +1075,12 @@ with tab_port:
         st.info("No holdings loaded. Connect IB Gateway and re-run to populate.")
     else:
         # The Portfolio tab uses the latest portfolio DEEP-DIVE's holding actions as the
-        # single source of truth (the Board tab uses the AI-infra screening rating).
+        # single source of truth (the Board tab uses the screening rating).
         _pf_latest = storage.latest_portfolio_run("ok")
         pf_pos = ({p["symbol"]: p for p in storage.get_portfolio(_pf_latest["id"])["positions"]}
                   if _pf_latest else {})
         st.caption("Recommendations here come from the latest **portfolio deep-dive** "
-                   "(cost-basis aware). The Board tab's rating is the AI-infra screen — they can differ.")
+                   "(cost-basis aware). The Board tab's rating is the screen — they can differ.")
         hrows, total_mv, total_cost = [], 0.0, 0.0
         by_sub: dict[str, float] = {}
         for sym, h in sorted(holdings.items()):

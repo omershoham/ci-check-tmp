@@ -11,14 +11,19 @@ import json
 from datetime import date
 from typing import Any
 
-from . import config
+from . import config, theme
 
 # Bump whenever any research/deep-dive template below changes in a way that could
 # move ratings or convictions. Stored on every report so the Accuracy tab can group
 # calibration by the "analyst" that actually produced it (mirrors scoring.SCORE_VERSION).
 #   v4  2026-09-07  versioning introduced; templates as of the Jul-17 red-team
 #                   recalibration ("stress test, not a veto"). Earlier reports: NULL.
-PROMPT_VERSION = 4
+#   v5  2026-09-08  theme removed from the prompt text: the analyst role, the catalyst
+#                   criterion and the ETF examples come from the theme pack instead of
+#                   being hardcoded AI-infra, and `deal_likelihood` is no longer asked
+#                   for. Ratings from v4 and v5 are different "analysts" — which is
+#                   exactly what calibration_by_prompt_version exists to separate.
+PROMPT_VERSION = 5
 
 
 def _stamp(report: dict) -> dict:
@@ -28,16 +33,22 @@ def _stamp(report: dict) -> dict:
     return report
 
 
-_PROMPT_TMPL = """You are an equity research analyst focused on US AI-infrastructure stocks.
+# Theme-agnostic by construction: the analyst role, the catalyst criterion and the
+# actors it names are injected from the theme pack, so switching themes does not
+# require touching (or re-versioning) this template.
+_PROMPT_TMPL = """You are {analyst_role}.
 TODAY'S DATE IS {today}. Research {name} ({symbol}), sub-sector: {subsector}.
 
 Use web search to find information that is CURRENT AS OF TODAY ({today}) — latest price, news
 and filings from the last few days/weeks. Do NOT rely on memory; verify with current sources and
 note the date of the data you use. Assess, for a medium-term (weeks-to-months) swing horizon:
-1. Likelihood of the company landing or materially benefiting from large hyperscaler
-   deals / capex (AWS, Azure, Google Cloud, Oracle/OCI, Meta, NVIDIA ecosystem).
+1. Concrete corporate CATALYSTS and their materiality: a large named customer/partner
+   win or capex-driven demand (e.g. {actors}), M&A or activist involvement, guidance
+   revisions, product launches/approvals/ramps, favourable regulation, buybacks or
+   insider buying — and, on the other side, probes, litigation, dilution or customer
+   loss. {catalyst_emphasis}
 2. Moat / vision / competitive position.
-3. Concrete near-term catalysts and their rough timing.
+3. Rough timing (dates/windows) of the catalysts above.
 4. Key risks (including valuation).
 5. If the price is >20% below its recent high: diagnose WHY it fell (estimate cuts vs
    multiple compression vs dilution vs theme beta, with dates) and whether the cause
@@ -69,7 +80,6 @@ Output ONLY a single JSON object, no prose before or after, with exactly these k
   "ticker": "{symbol}",
   "rating": "strong_buy" | "buy" | "hold" | "sell" | "strong_sell",
   "conviction": <number 0-10>,
-  "deal_likelihood": "low" | "medium" | "high",
   "thesis": "<2-4 sentence summary>",
   "chart_pattern": "<current chart setup/pattern + what it implies + caveat>",
   "metrics_read": "<plain-language, stock-specific: how to read THIS name's valuation/growth/quality and technical numbers, and what they imply>",
@@ -177,8 +187,13 @@ def _coerce_report(parsed: dict) -> dict:
         parsed["conviction"] = max(0.0, min(10.0, c))
     except (TypeError, ValueError):
         parsed["conviction"] = None
-    dl = str(parsed.get("deal_likelihood") or "").strip().lower()
-    parsed["deal_likelihood"] = dl if dl in ("low", "medium", "high") else None
+    # FROZEN LEGACY FIELD. The prompt stopped asking for it at v5; it is still
+    # accepted (and coerced) when a model volunteers it so historical reports and the
+    # research_reports.deal_likelihood column stay readable, but its ABSENCE is not an
+    # error — demanding it would fail every v5 report.
+    if "deal_likelihood" in parsed:
+        dl = str(parsed.get("deal_likelihood") or "").strip().lower()
+        parsed["deal_likelihood"] = dl if dl in ("low", "medium", "high") else None
     for k in ("catalysts", "risks"):
         v = parsed.get(k)
         parsed[k] = [str(x) for x in v][:12] if isinstance(v, list) else ([str(v)] if v else [])
@@ -201,7 +216,10 @@ def research_one(symbol: str, name: str, subsector: str,
     prompt = _PROMPT_TMPL.format(today=date.today().isoformat(), symbol=symbol, name=name,
                                  subsector=subsector or "n/a",
                                  context=context or "(none)",
-                                 holding_note=holding_note)
+                                 holding_note=holding_note,
+                                 analyst_role=theme.fragment("analyst_role"),
+                                 actors=theme.actors_text(),
+                                 catalyst_emphasis=theme.fragment("catalyst_emphasis"))
     last_raw = ""
     result_text = ""
     for _ in (1, 2, 3):
@@ -303,7 +321,7 @@ Assess for a medium-term swing horizon, given the cost basis:
   you'd hold — conviction reflects how clear-cut AND how risky THIS specific situation is, so a
   high-flyer up >80%, a beaten-down turnaround, a steady compounder, and a broad index fund
   should NOT all get the same score.
-- If this is a broad index ETF (e.g. VOO, QQQ), treat it as a diversifier: action is usually
+- If this is a broad index ETF, treat it as a diversifier: action is usually
   hold, conviction reflects market-level attractiveness (typically modest), skip single-stock mechanics.
 - Concrete add level and trim level (prices).
 - What would INVALIDATE the thesis (specific triggers).
@@ -345,7 +363,7 @@ per-position deep-dive summaries:
 Analyze the PORTFOLIO as a whole (concentration, correlation/single-theme risk, gaps, weakest link).
 Ground your correlation/concentration statements in the COMPUTED RISK METRICS above — cite the
 numbers. If ballast candidates are listed, recommend 1-3 concrete diversifiers with target weights
-(the owner's policy targets ~{min_ballast}% non-theme ballast).
+(the owner's policy targets ~{min_ballast}% in ballast uncorrelated with the book's dominant exposure).
 
 Then RANK every holding best-to-worst on risk-adjusted attractiveness and assign each a
 CONVICTION 0-10. You MUST use the full range and DIFFERENTIATE — they may not all be the same:
@@ -687,6 +705,13 @@ def build_context(score_row: dict, signal_row: dict | None,
         "in your rating; flag when they disagree.",
     ]
     if signal_row:
+        # The 9-key vector, non-zero keys only. Listing the zeros would bury the two
+        # keys that fired under seven that say "nothing happened".
+        cat = signal_row.get("catalyst") or m.get("catalyst") or {}
+        hits = [f"{k} {v}" for k, v in cat.items() if isinstance(v, (int, float)) and v]
+        if hits:
+            lines.append("Catalysts (local LLM, 0-10, non-zero keys only): "
+                         + ", ".join(hits))
         cats = signal_row.get("catalysts") or []
         lines.append(f"Recent catalysts (local news scan): {'; '.join(cats) or 'none'}")
         # Raw dated headlines — give Claude the actual news, not just a summary of it.
@@ -706,5 +731,5 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--live":
         print("\nRunning a live research call for VRT (uses your subscription)...")
         out = research_one("VRT", "Vertiv", "datacenter_power",
-                           "Quant blended 0.7; tags: deal, both; signal 8/10")
+                           "Quant blended 0.7; tags: quality; customer_deal 8/10")
         print(json.dumps(out, indent=2)[:1500])

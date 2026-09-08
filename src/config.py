@@ -137,6 +137,8 @@ if __name__ == "__main__":
     print("User overrides:", USER_CONFIG_PATH if USER_CONFIG_PATH.exists() and USER_CONFIG_PATH != DEFAULT_CONFIG_PATH else "(none)")
     print("DB path:", db_path())
     print("Cache dir:", cache_dir())
-    print("Sectors:", list(get("universe.sectors", {}).keys()))
+    from . import theme
+    print("Theme:", theme.configured_name(), "-", theme.board_name())
+    print("Sectors:", list(theme.curated_sectors().keys()))
     print("OAuth token set:", bool(oauth_token()))
     print("ANTHROPIC_API_KEY set (should be False):", api_key_is_set())

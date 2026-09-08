@@ -12,7 +12,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from src import config, fundamentals, universe
+from src import config, fundamentals, theme, universe
 from src.data import registrants
 from src.data.history_store import HistoryStore
 
@@ -255,12 +255,13 @@ def test_max_symbols_caps_by_dollar_volume(pit_store):
 
 
 # ------------------------------------------------------------- curated is intact
-def test_curated_build_universe_is_the_config_list():
+def test_curated_build_universe_is_the_theme_pack_list():
     """The shipped default must be byte-identical to what it always was: the four
-    config sub-sector lists, deduped, first sub-sector winning on overlap."""
+    sub-sector lists, deduped, first sub-sector winning on overlap. They moved from
+    config.yaml into themes/ai_infra.yaml; the RESULT may not have moved with them."""
     expected = []
     seen = set()
-    for sub, syms in (config.get("universe.sectors", {}) or {}).items():
+    for sub, syms in theme.curated_sectors("ai_infra").items():
         for s in syms or []:
             s = str(s).strip().upper()
             if s and s not in seen:

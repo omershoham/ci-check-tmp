@@ -36,6 +36,10 @@ def build_signal(name: str, store: HistoryStore, syms: list[str], subs: dict[str
     if name == "fundamental":
         return signals.fundamental_pillar(store, syms, subs, dates, secs)
     if name == "composite":
+        # Checked BEFORE the ~10-minute technical replay, not only inside
+        # composite_3pillar: a run that is going to be refused should be refused
+        # while the user is still watching.
+        signals.assert_replayable()
         tech = signals.technical_pillar(store.prices(syms), dates, log=_log)
         # `scored` is what keeps the replay's cross-section identical to the live
         # screen's: thin-data names stay in and are re-weighted, names the liquidity

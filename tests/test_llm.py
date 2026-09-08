@@ -45,6 +45,29 @@ def test_research_one_uses_provider_and_coerces(fake, monkeypatch):
     assert rep["prompt_version"] == deep_research.PROMPT_VERSION and rep["model"] == "m"
 
 
+def test_deal_likelihood_is_optional_legacy(fake):
+    """v5 stopped asking for it. Demanding it would make every current report invalid;
+    coercing it when volunteered keeps the frozen column readable."""
+    r = deep_research._coerce_report({"rating": "buy", "conviction": 5})
+    assert "deal_likelihood" not in r
+    assert deep_research._coerce_report(
+        {"rating": "buy", "conviction": 5, "deal_likelihood": "HIGH"})["deal_likelihood"] == "high"
+    assert deep_research._coerce_report(
+        {"rating": "buy", "conviction": 5, "deal_likelihood": "maybe"})["deal_likelihood"] is None
+    assert "deal_likelihood" not in deep_research._PROMPT_TMPL
+
+
+def test_research_prompt_is_theme_agnostic(fake, monkeypatch):
+    """The template must carry no theme of its own — the role and the actors come from
+    the pack, so switching themes cannot silently keep pointing Claude at hyperscalers."""
+    from src import theme
+    monkeypatch.setattr(theme, "configured_name", lambda: "general")
+    deep_research.research_one("XYZ", "Acme", "n/a", "ctx")
+    prompt = fake.calls[-1]["prompt"]
+    assert "AI-infrastructure" not in prompt
+    assert "government / defense primes" in prompt      # the general pack's actors
+
+
 def test_coerce_rejects_garbage_rating():
     r = deep_research._coerce_report({"rating": "moon", "conviction": "eleven"})
     assert r["rating"] is None and r["conviction"] is None

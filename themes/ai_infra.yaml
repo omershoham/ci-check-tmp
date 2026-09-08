@@ -1,0 +1,54 @@
+# AI-infrastructure theme pack — the original Claude Trader universe and prose.
+#
+# A pack owns PROSE (what to call the board, whose deals matter, how to steer the
+# analyst) and, optionally, a CURATED universe. It never owns the catalyst key set:
+# see src/local_llm.CATALYST_KEYS for why theme-varying keys can never be pooled.
+
+name: AI-Infra Opportunity Board
+description: >-
+  US AI-infrastructure: semis and equipment, data-center power, networking/optical
+  and the cloud software layer that monetizes them.
+
+# Named counterparties whose deals move a name in this theme. Used ONLY in prompt
+# prose (local-LLM catalyst prompt, Claude research prompt) — never in a schema.
+actors:
+  - AWS / Amazon
+  - Microsoft Azure
+  - Google Cloud
+  - Oracle / OCI
+  - Meta
+  - NVIDIA
+  - large data-center and colocation operators
+
+prompt_fragments:
+  analyst_role: >-
+    an equity research analyst focused on US AI-infrastructure stocks
+  catalyst_emphasis: >-
+    Weigh hyperscaler capex and AI build-out exposure heavily: a named cloud or
+    GPU-ecosystem win is the single most price-relevant event in this theme.
+
+# The curated universe. `universe.source: curated` scores exactly these names.
+# A user config.yaml with its own `universe.sectors:` still overrides this pack.
+subsectors:
+  semis_equipment:
+    label: Semiconductors & Equipment
+    symbols:
+      [NVDA, AMD, AVGO, TSM, ASML, AMAT, LRCX, KLAC, MU, INTC, QCOM, MRVL,
+       TXN, ARM, ADI, NXPI, "ON", MCHP, MPWR, SWKS, QRVO, TER, ENTG, ACLS,
+       CRDO, ALAB, SITM, RMBS, AMBA, WOLF, POWI, LSCC, ONTO, FORM, AEHR, INDI]
+  datacenter_power:
+    label: Data Center & Power
+    symbols:
+      [VRT, ETN, PWR, GEV, CEG, VST, NRG, TLN, OKLO, SMR, NNE, EQIX, DLR,
+       CARR, JCI, NVT, HUBB, FLEX, BWXT, SMCI, DELL, HPE, MOD, PEG, SO, DUK, D, IREN]
+  networking_optical:
+    label: Networking & Optical
+    # JNPR removed 2026-09-07: acquired/delisted (no prices, no SEC filings)
+    symbols: [ANET, CSCO, COHR, LITE, CIEN, AAOI, FN, GLW, NTGR, EXTR]
+  cloud_ai_software:
+    label: Cloud / AI Software
+    # CFLT removed 2026-09-07: delisted (Yahoo 404, no SEC filings)
+    symbols:
+      [MSFT, GOOGL, GOOG, AMZN, ORCL, META, CRM, NOW, SNOW, DDOG, NET, MDB, PLTR,
+       CRWD, ZS, PANW, FTNT, ESTC, GTLB, S, DT, ADBE, IBM, AI, PATH,
+       AKAM, FSLY, TWLO, OKTA, WDAY, INTU]

@@ -5,8 +5,14 @@ paths:
   db: data/trader.db
   cache: data/cache
 
+# Which theme pack in themes/ supplies the board's name, the actors named in the
+# catalyst/research prompts, and (for `universe.source: curated`) the ticker lists.
+# `general` is the theme-free default. The catalyst KEY SET is never theme-varying —
+# it lives in src/local_llm.CATALYST_KEYS so signals stay poolable across themes.
+theme: ai_infra
+
 universe:
-  # curated = the hand-picked AI-infra lists below (the shipped default).
+  # curated = the theme pack's hand-picked lists (the shipped default; ai_infra).
   # broad   = every US-listed SEC registrant that files financial statements, floored
   #           point-in-time by src/universe.py::investable(). Needs the registrant
   #           table and candidate prices first:
@@ -27,23 +33,9 @@ universe:
     min_price: 5.0                 # $
     min_avg_dollar_volume: 5000000 # $5M average daily traded value
 
-  # Curated AI-infra universe across the four sub-sectors.
-  # Sub-sector membership also feeds the Deal score (relevance to hyperscaler capex).
-  # You can pin/exclude names from the dashboard later; this is the auto-built base.
-  sectors:
-    semis_equipment:
-      [NVDA, AMD, AVGO, TSM, ASML, AMAT, LRCX, KLAC, MU, INTC, QCOM, MRVL,
-       TXN, ARM, ADI, NXPI, "ON", MCHP, MPWR, SWKS, QRVO, TER, ENTG, ACLS,
-       CRDO, ALAB, SITM, RMBS, AMBA, WOLF, POWI, LSCC, ONTO, FORM, AEHR, INDI]
-    datacenter_power:
-      [VRT, ETN, PWR, GEV, CEG, VST, NRG, TLN, OKLO, SMR, NNE, EQIX, DLR,
-       CARR, JCI, NVT, HUBB, FLEX, BWXT, SMCI, DELL, HPE, MOD, PEG, SO, DUK, D, IREN]
-    networking_optical:
-      [ANET, CSCO, COHR, LITE, CIEN, AAOI, FN, GLW, NTGR, EXTR]   # JNPR removed 2026-09-07: acquired/delisted (no prices, no SEC filings)
-    cloud_ai_software:
-      [MSFT, GOOGL, GOOG, AMZN, ORCL, META, CRM, NOW, SNOW, DDOG, NET, MDB, PLTR,
-       CRWD, ZS, PANW, FTNT, ESTC, GTLB, S, DT, ADBE, IBM, AI, PATH,   # CFLT removed 2026-09-07: delisted (Yahoo 404, no SEC filings)
-       AKAM, FSLY, TWLO, OKTA, WDAY, INTU]
+  # Curated universe: see themes/ai_infra.yaml (`subsectors:`), which owns both the
+  # ticker lists and their display labels. A `universe.sectors:` block here still
+  # overrides the pack wholesale (config._REPLACE_KEYS) if you want your own list.
 
 screen:
   shortlist_size: 35   # passed from quant screen to local-LLM signal stage
@@ -86,10 +78,14 @@ scoring:
   pillars:
     technical: 0.35    # RSI, MACD, SMA trend/crosses, 52w position, volume (src/technical.py)
     fundamental: 0.30  # valuation, cashflow, growth, quality (yfinance)
-    sentiment: 0.35    # local-LLM news sentiment + hyperscaler-deal signal
+    sentiment: 0.35    # local-LLM news TONE only (events live in the catalyst pillar)
     learned: 0.0       # ML ranking pillar (src/ml). SHIPPED DARK: raise only after
                        # `python -m scripts.train_ranker` reports every kill criterion PASSED.
                        # Any value > 0 bumps score_version to 4 automatically.
+    catalyst: 0.0      # 9-key catalyst vector from the local LLM. SHIPPED DARK, and
+                       # un-backtestable by construction (no news archive exists), so
+                       # it can only be earned forward: raise it when `pillar_ic`
+                       # reports |t| >= 2 for the catalyst pillar.
   learned:
     enabled: true      # compute + persist the pillar when a trained model exists (even at weight 0)
     force: false       # weight the pillar even if the kill criteria did not pass (don't)
@@ -108,13 +104,22 @@ scoring:
       cashflow: 0.30   # FCF yield, FCF growth
       growth: 0.20     # revenue & EPS growth
       quality: 0.20    # margins, ROE/ROIC, low debt
-  deal:
+  catalyst:
+    # EQUAL ON PURPOSE. The deal score this replaces gave 35% to a static per-sector
+    # prior that could never be wrong and never be measured; hand-tuning these nine
+    # would repeat that mistake. Change them only on measured evidence.
+    # `adverse_event` is subtracted, not added — it is the negative axis.
     subweights:
-      subsector_relevance: 0.35  # static base by sub-sector
-      hyperscaler_signal: 0.45   # from local LLM (Stage 2)
-      momentum: 0.20             # price vs 50/200 DMA
+      customer_deal: 1.0
+      ma_event: 1.0
+      guidance_revision: 1.0
+      analyst_action: 1.0
+      product_cycle: 1.0
+      regulatory_policy: 1.0
+      capital_return_insider: 1.0
+      management_ownership: 1.0
+      adverse_event: 1.0
   tags:
-    deal_threshold: 0.60
     quality_threshold: 0.60
     higher_risk:
       flag_if_unprofitable: true

@@ -2,9 +2,10 @@
 
 Two sources, chosen by `universe.source` in config:
 
-  curated  The per-sub-sector lists in config.yaml are the single source of truth —
-           transparent and stable. (ETF-holdings augmentation was considered but
-           dropped: issuer CSV scraping is too fragile to rely on.) UNCHANGED, and the
+  curated  The per-sub-sector lists in the active THEME PACK (themes/*.yaml) are the
+           single source of truth — transparent and stable. (ETF-holdings augmentation
+           was considered but dropped: issuer CSV scraping is too fragile to rely on.)
+           A `universe.sectors:` block in config.yaml still overrides the pack. The
            shipped default.
 
   broad    Every US-listed SEC registrant that files financial statements
@@ -34,15 +35,16 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from . import config, fundamentals
+from . import config, fundamentals, theme
 
-# Friendly sub-sector labels for display.
-SUBSECTOR_LABELS = {
-    "semis_equipment": "Semiconductors & Equipment",
-    "datacenter_power": "Data Center & Power",
-    "networking_optical": "Networking & Optical",
-    "cloud_ai_software": "Cloud / AI Software",
-}
+# Friendly sub-sector labels for display, from the active theme pack. Resolved at
+# import so the dashboard can keep importing it as a constant; `subsector_labels()`
+# re-reads the pack for callers that switch themes inside one process (the tests do).
+SUBSECTOR_LABELS = theme.subsector_labels()
+
+
+def subsector_labels() -> dict[str, str]:
+    return theme.subsector_labels()
 
 _BROAD_DEFAULTS = {
     "max_symbols": 250,
@@ -69,8 +71,11 @@ def broad_cfg(key: str) -> Any:
 
 
 def _curated() -> list[dict[str, str]]:
-    """Return [{symbol, subsector}] deduped, first sub-sector wins on overlap."""
-    sectors = config.get("universe.sectors", {}) or {}
+    """Return [{symbol, subsector}] deduped, first sub-sector wins on overlap.
+
+    The lists come from the theme pack (or a `universe.sectors:` override), so the
+    universe and the prose that describes it can never drift apart."""
+    sectors = theme.curated_sectors()
     seen: dict[str, str] = {}
     for subsector, symbols in sectors.items():
         for sym in symbols or []:
@@ -303,6 +308,8 @@ if __name__ == "__main__":
     by_sub: dict[str, int] = {}
     for r in u:
         by_sub[r["subsector"]] = by_sub.get(r["subsector"], 0) + 1
-    print(f"Universe ({configured_source()}): {len(u)} tickers")
+    labels = subsector_labels()
+    print(f"Universe ({configured_source()}, theme {theme.configured_name()}): "
+          f"{len(u)} tickers")
     for ss, n in sorted(by_sub.items(), key=lambda kv: -kv[1]):
-        print(f"  {SUBSECTOR_LABELS.get(ss, ss)}: {n}")
+        print(f"  {labels.get(ss, ss)}: {n}")

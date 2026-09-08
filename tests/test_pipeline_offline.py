@@ -112,6 +112,34 @@ def test_deep_run_offline_records_degraded_health(offline, storage):
     # Red team ran and haircut conviction 7 -> 6 on every buy.
     assert all(r["conviction"] == 6 for r in rated)
 
+    # Ollama is DOWN in this fixture, so every catalyst key must be UNKNOWN (null),
+    # never a fabricated 0 - and the row must still say which contract it speaks.
+    from src import local_llm as _llm
+    with storage.get_conn() as cn:
+        sig = cn.execute("SELECT catalyst_json, signal_version, hyperscaler_signal "
+                         "FROM signals WHERE run_id=?", (rid,)).fetchall()
+    assert sig
+    for row in sig:
+        cat = json.loads(row["catalyst_json"])
+        assert tuple(cat) == _llm.CATALYST_KEYS
+        assert set(cat.values()) == {None}
+        assert row["signal_version"] == 2
+        assert row["hyperscaler_signal"] == cat["customer_deal"]
+    # The catalyst pillar is persisted from day one even with nothing to measure...
+    with storage.get_conn() as cn:
+        m = json.loads(cn.execute("SELECT metrics_json FROM screen_scores WHERE run_id=? "
+                                  "LIMIT 1", (rid,)).fetchone()["metrics_json"])
+    assert "pillar_catalyst" in m
+    # ...and at weight 0 it must not appear in the partition key.
+    with storage.get_conn() as cn:
+        psets = {r["pillar_set"] for r in cn.execute(
+            "SELECT DISTINCT pillar_set FROM screen_scores WHERE run_id=?", (rid,))}
+        deals = {r["deal"] for r in cn.execute(
+            "SELECT DISTINCT deal FROM screen_scores WHERE run_id=?", (rid,))}
+    assert psets == {"technical,fundamental,sentiment"}
+    assert deals == {None}
+    assert not any({"deal", "both"} & set(r.get("tags") or []) for r in board)
+
 
 def test_light_run_skips_research(offline, storage):
     rid = pipeline.run("light")

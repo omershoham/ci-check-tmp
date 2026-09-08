@@ -320,7 +320,10 @@ def reflect(n_worst: int = 4, n_best: int = 2) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------- pillar IC
-_PILLARS = ("technical", "fundamental", "sentiment")
+# Every pillar the screen persists, weighted or dark. `pillar_ic` measures only the
+# ones that actually have data, so a newly added dark pillar reports
+# "no history yet" instead of emptying the study.
+_PILLARS = ("technical", "fundamental", "sentiment", "catalyst")
 
 
 def pillar_ic() -> dict[str, Any]:

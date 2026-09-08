@@ -1,17 +1,27 @@
-# Claude Trader — Daily AI-Infra Opportunity Helper
+# Claude Trader — Daily Stock Opportunity Helper
 
-A locally-hosted assistant that surfaces US tech / AI-infrastructure stock **opportunities**
-each day — both potential hyperscaler-deal beneficiaries (catalyst-driven) and quality
-compounders (cashflow + valuation). **Advisory only**: it ranks ideas and writes research;
+A locally-hosted assistant that surfaces US stock **opportunities** each day — quality at a
+fair price, plus catalysts and events. **Advisory only**: it ranks ideas and writes research;
 you trade manually in IBKR.
+
+The universe is either a **curated list** or a **broad, survivorship-aware SEC-registrant
+universe** (`universe.source` in `config.yaml`). A **theme pack** in `themes/` supplies the
+board's name, the counterparties named in the prompts and, for the curated path, the ticker
+lists; `themes/ai_infra.yaml` is the shipped AI-infrastructure theme and `themes/general.yaml`
+is the theme-free default. What a pack never varies is the catalyst KEY SET — those nine keys
+live in `src/local_llm.py`, so signals stay comparable across themes.
 
 > ⚠️ **Not financial advice.** This tool is a personal research aid. It can be wrong.
 > Do your own due diligence. Nothing here is a recommendation to buy or sell any security.
 
 ## How it works (4-stage funnel, cheap → expensive)
 
-1. **Quant screen** (Python, free) — curated AI-infra universe → dual score (Quality + Deal) + tags.
-2. **Local LLM** (Ollama, free) — news/catalyst extraction + hyperscaler-signal score.
+1. **Quant screen** (Python, free) — technical + sector-aware fundamental pillars → composite
+   ranking score + tags.
+2. **Local LLM** (Ollama, free) — news scan → a fixed **9-key catalyst vector** (customer deal,
+   M&A, guidance, analyst action, product cycle, regulation, capital return/insider,
+   management/ownership, adverse event) + news tone. The catalyst pillar ships **dark**
+   (weight 0) and accumulates history until forward data earns it a weight.
 3. **Claude deep research** (your subscription) — deep web research on ~10 finalists.
 4. **Streamlit dashboard** — blended, tagged board + IBKR holdings/quotes overlay.
 
