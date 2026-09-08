@@ -1188,10 +1188,12 @@ with tab_port:
                                 "real risk share.")
                 rc2.metric("Avg pairwise corr", _rm.get("avg_pairwise_corr"),
                            help="Weighted average 90-day return correlation between holdings.")
-                rc3.metric("Beta vs QQQ", _rm.get("beta_qqq"))
-                rc4.metric("SMH −20% scenario", f"{_rm.get('scenario_drawdown_pct', '—')}%",
-                           help=f"Estimated portfolio move if the semis/AI theme (SMH) drops 20%, "
-                                f"via the portfolio's beta to SMH. Stressed (betas rise in "
+                _bm = _rm.get("benchmark") or "benchmark"
+                _tm = _rm.get("theme_benchmark") or "theme"
+                rc3.metric(f"Beta vs {_bm}", _rm.get("beta_bench"))
+                rc4.metric(f"{_tm} −20% scenario", f"{_rm.get('scenario_drawdown_pct', '—')}%",
+                           help=f"Estimated portfolio move if {_tm} drops 20%, "
+                                f"via the portfolio's beta to {_tm}. Stressed (betas rise in "
                                 f"selloffs): {_rm.get('scenario_stressed_pct', '—')}%. Worst "
                                 f"ACTUAL 20-day stretch in the lookback: "
                                 f"{_rm.get('worst_20d_pct', '—')}%.")

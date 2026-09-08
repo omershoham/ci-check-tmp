@@ -140,7 +140,7 @@ def run() -> int:
             hz.ok("research", f"{len(positions)} holdings dived + validated")
 
         _log(f"risk: eff_bets={rm.get('effective_bets')} avg_corr={rm.get('avg_pairwise_corr')} "
-             f"beta_qqq={rm.get('beta_qqq')} smh_-20%={rm.get('scenario_drawdown_pct')}%")
+             f"beta_bench={rm.get('beta_bench')} theme_-20%={rm.get('scenario_drawdown_pct')}%")
 
         # Ballast candidates (non-AI diversifiers) with simple momentum context, so the
         # synthesis can recommend something concrete instead of "you need ballast".

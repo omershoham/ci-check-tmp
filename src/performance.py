@@ -7,7 +7,8 @@ Grading design (post CR#2):
     exclude the day-0 move the pick most predicts (lookahead-ish).
   * BENCHMARK — primary excess is vs the EQUAL-WEIGHT MEAN of that run's own scored
     universe (`excess_uni_*`): pure cross-sectional selection skill, immune to theme
-    beta. SMH (`excess_smh_*`) and SPY (`excess_*`, legacy name kept for the dashboard)
+    beta. The theme proxy (`excess_theme_*`, config-driven) and SPY (`excess_*`, legacy
+    name kept for the dashboard)
     are computed as secondary references. Grading vs SPY alone on an SMH-beta>1
     universe would teach the learning loop beta timing and call it skill.
   * WINDOW GUARD — if the price history doesn't cover the surface date (searchsorted
@@ -24,10 +25,11 @@ from typing import Any
 import pandas as pd
 import yfinance as yf
 
-from . import config, storage
+from . import config, risk, storage
 
 _WINDOWS = {"1w": 5, "4w": 21, "13w": 65}  # trading days
-_THEME = "SMH"
+# The theme proxy is config-driven; risk._theme() is the single resolver
+# (risk.theme_benchmark -> technical.rs_benchmark -> SMH).
 
 # ------------------------------------------------------------- memoized data
 _MEMO: dict[tuple, Any] = {}
@@ -163,7 +165,8 @@ def pick_outcomes() -> list[dict[str, Any]]:
         return []
     # Universe symbols are needed for the equal-weight benchmark.
     uni_syms = {s for syms in _universe_by_run().values() for s in syms}
-    all_syms = sorted({r["symbol"] for r in picks} | uni_syms | {bench, _THEME})
+    theme = risk._theme()
+    all_syms = sorted({r["symbol"] for r in picks} | uni_syms | {bench, theme})
     t_all = []
     for r in picks:
         try:
@@ -186,12 +189,12 @@ def pick_outcomes() -> list[dict[str, Any]]:
         for label, days in _WINDOWS.items():
             fr = _fwd_return(px, r["symbol"], t0, days, base_override=base)
             spy = _fwd_return(px, bench, t0, days)
-            smh = _fwd_return(px, _THEME, t0, days)
+            thm = _fwd_return(px, theme, t0, days)
             uni = _uni_mean_fwd(px, r["run_id"], t0, days)
             rec[f"ret_{label}"] = round(fr, 2) if fr is not None else None
             rec[f"excess_{label}"] = (round(fr - spy, 2)
                                       if fr is not None and spy is not None else None)
-            rec[f"excess_smh_{label}"] = (round(fr - smh, 2)
+            rec[f"excess_theme_{label}"] = (round(fr - thm, 2)
                                           if fr is not None and smh is not None else None)
             rec[f"excess_uni_{label}"] = (round(fr - uni, 2)
                                           if fr is not None and uni is not None else None)
@@ -219,7 +222,9 @@ def rating_calibration(basis: str = "uni") -> pd.DataFrame:
     rows = pick_outcomes()
     if not rows:
         return pd.DataFrame()
-    prefix = {"uni": "excess_uni_", "smh": "excess_smh_", "spy": "excess_"}[basis]
+    # "smh" accepted as a legacy alias for the now-configurable theme basis.
+    prefix = {"uni": "excess_uni_", "theme": "excess_theme_",
+              "smh": "excess_theme_", "spy": "excess_"}[basis]
     df = pd.DataFrame(rows)
     df["bucket"] = df.apply(_bucket, axis=1)
     agg_rows = []

@@ -166,8 +166,13 @@ def labels(closes_adj: pd.DataFrame, dates: list[pd.Timestamp], horizon: int = 2
 def build_feature_frame(store, symbols: list[str], subsectors: dict[str, str],
                         dates: list[pd.Timestamp], bench: str = "SMH", regime_bench: str = "SPY",
                         with_labels: bool = True, log: Callable[[str], None] | None = None) -> pd.DataFrame:
-    ohlcv = store.prices(symbols)
-    closes = store.close_matrix(None, adjusted=True)
+    # Bound both reads to what the replays actually need: technical_replay looks back
+    # ~520 trading days, regime_replay 200, and labels look forward `horizon`. Reading
+    # the entire store was fine at 105 symbols and is not at 1,500.
+    _lo = (min(dates) - pd.Timedelta(days=800)).date() if dates else None
+    _hi = (max(dates) + pd.Timedelta(days=120)).date() if dates else None
+    ohlcv = store.prices(symbols, start=_lo, end=_hi)
+    closes = store.close_matrix(None, adjusted=True, start=_lo, end=_hi)
     if ohlcv.empty or closes.empty:
         return pd.DataFrame()
     bench_close = closes[bench] if bench in closes else None

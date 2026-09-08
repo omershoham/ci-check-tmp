@@ -206,6 +206,19 @@ CREATE TABLE IF NOT EXISTS portfolio_summary (
 """
 
 
+# Bumped whenever _migrate gains a step. Recorded in the schema_version table so a
+# future non-additive change (a rename needs a copy-table in SQLite) has a real anchor
+# to branch on instead of re-deriving state from PRAGMA every time.
+SCHEMA_VERSION = 1
+
+
+def _add_col(conn: sqlite3.Connection, table: str, name: str, decl: str) -> None:
+    """Add a column if the table lacks it. No-op when the table doesn't exist yet."""
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if cols and name not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Lightweight additive migrations for DBs created before a column existed."""
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(research_reports)")}
@@ -264,6 +277,34 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if "model" not in cc:
             conn.execute(f"ALTER TABLE {tbl} ADD COLUMN model TEXT")
 
+    # Which universe the run scored. excess_uni_* is measured against the run's OWN
+    # universe mean, so widening the universe changes what that number means. Without
+    # this column every calibration function would silently pool two different
+    # populations; with it they can group or filter.
+    _add_col(conn, "runs", "universe_source", "TEXT")
+    # Safe to backfill: the broad universe does not exist before this migration, so
+    # every pre-existing run scored the curated one. (Contrast picks.horizon, which is
+    # deliberately NOT backfilled - inventing a horizon would fake an analyst decision.)
+    conn.execute("UPDATE runs SET universe_source='curated' WHERE universe_source IS NULL")
+    # Catalyst vector (theme-agnostic successor to the single hyperscaler_signal).
+    # signal_version partitions the statistics: 1 = single-theme signal, 2 = vector.
+    _add_col(conn, "signals", "catalyst_json", "TEXT")
+    _add_col(conn, "signals", "signal_version", "INTEGER")
+    # Per-idea horizon, so a pick can be graded on the clock it actually claimed
+    # instead of one shared window. NULL on legacy rows and never backfilled — that
+    # would fabricate a decision the analyst never made.
+    _add_col(conn, "picks", "horizon", "TEXT")
+    _add_col(conn, "research_reports", "horizon", "TEXT")
+    _add_col(conn, "research_reports", "horizon_rationale", "TEXT")
+    # Which pillars composed the score. An integer score_version cannot express two
+    # independently dark pillars; this can.
+    _add_col(conn, "screen_scores", "pillar_set", "TEXT")
+
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version ("
+                 "version INTEGER PRIMARY KEY, applied_at TEXT)")
+    conn.execute("INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES (?, ?)",
+                 (SCHEMA_VERSION, datetime.now(timezone.utc).isoformat(timespec="seconds")))
+
 
 def init_db() -> None:
     with get_conn() as conn:
@@ -272,11 +313,17 @@ def init_db() -> None:
 
 
 # ---------------------------------------------------------------- runs
-def create_run(mode: str) -> int:
+def create_run(mode: str, universe_source: str | None = None) -> int:
+    """Start a run row. `universe_source` records WHICH universe was scored — the
+    grading benchmark (excess_uni_*) is that universe's own mean, so runs from
+    different universes are not comparable on it and must not be pooled."""
+    if universe_source is None:
+        universe_source = str(config.get("universe.source", "curated"))
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO runs(mode, started_at, status) VALUES (?,?,'running')",
-            (mode, now_iso()),
+            "INSERT INTO runs(mode, started_at, status, universe_source) "
+            "VALUES (?,?,'running',?)",
+            (mode, now_iso(), universe_source),
         )
         return int(cur.lastrowid)
 

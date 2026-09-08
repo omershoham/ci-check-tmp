@@ -97,7 +97,7 @@ def build_context(max_board: int = 15) -> str:
         if rm:
             parts.append(f"  RISK: eff_bets={rm.get('effective_bets')} "
                          f"(vol-aware {rm.get('vol_aware_bets')}) avg_corr="
-                         f"{rm.get('avg_pairwise_corr')} beta_qqq={rm.get('beta_qqq')} "
+                         f"{rm.get('avg_pairwise_corr')} beta_bench={rm.get('beta_bench')} "
                          f"SMH-20%->{rm.get('scenario_drawdown_pct')}% "
                          f"(stressed {rm.get('scenario_stressed_pct')}%, worst20d "
                          f"{rm.get('worst_20d_pct')}%)")

@@ -28,31 +28,45 @@ from ..analytics.metrics import derive
 
 _CF_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 
-# concept -> ordered fallback list of us-gaap tags. Flows are period totals; instants
-# are balance-sheet points. Names on the left are what analytics.metrics.derive reads.
+# concept -> ordered fallback list of tags. Flows are period totals; instants are
+# balance-sheet points. Names on the left are what analytics.metrics.derive reads.
+# IFRS (`ifrs-full`) tags are appended AFTER the us-gaap ones for the same concept:
+# `prepare_symbol` walks each list in order and takes the first tag with data, so a
+# domestic filer still resolves to its us-gaap tag and a 20-F filer falls through to
+# IFRS. Without these, every foreign private issuer (TSM, ASML, ARM...) produced only
+# its `dei` share count and was scored on an empty fundamental pillar.
+_NAMESPACES = ("us-gaap", "ifrs-full")
 FLOW_TAGS: dict[str, list[str]] = {
     "totalRevenue": ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
-                     "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueNet"],
+                     "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueNet",
+                     "Revenue", "RevenueFromContractsWithCustomers"],
     "netIncome": ["NetIncomeLoss", "NetIncomeLossAvailableToCommonStockholdersBasic",
-                  "ProfitLoss"],
+                  "ProfitLoss", "ProfitLossAttributableToOwnersOfParent"],
     "grossProfits": ["GrossProfit"],
-    "operatingIncome": ["OperatingIncomeLoss"],
+    "operatingIncome": ["OperatingIncomeLoss", "ProfitLossFromOperatingActivities"],
     "cfo": ["NetCashProvidedByUsedInOperatingActivities",
-            "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"],
+            "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+            "CashFlowsFromUsedInOperatingActivities"],
     "capex": ["PaymentsToAcquirePropertyPlantAndEquipment",
-              "PaymentsToAcquireProductiveAssets"],
+              "PaymentsToAcquireProductiveAssets",
+              "PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities"],
     "dna": ["DepreciationDepletionAndAmortization", "DepreciationAndAmortization",
-            "DepreciationAmortizationAndAccretionNet", "Depreciation"],
+            "DepreciationAmortizationAndAccretionNet", "Depreciation",
+            "DepreciationAndAmortisationExpense"],
 }
 INSTANT_TAGS: dict[str, list[str]] = {
     "totalAssets": ["Assets"],
     "totalStockholderEquity": ["StockholdersEquity",
-                               "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
+                               "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+                               "EquityAttributableToOwnersOfParent", "Equity"],
     "totalCash": ["CashAndCashEquivalentsAtCarryingValue",
-                  "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],
-    "debt_lt": ["LongTermDebtNoncurrent", "LongTermDebt", "LongTermDebtAndCapitalLeaseObligations"],
+                  "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+                  "CashAndCashEquivalents"],
+    "debt_lt": ["LongTermDebtNoncurrent", "LongTermDebt", "LongTermDebtAndCapitalLeaseObligations",
+                "NoncurrentPortionOfNoncurrentBorrowings", "LongtermBorrowings"],
     "debt_st": ["LongTermDebtCurrent", "DebtCurrent", "ShortTermBorrowings",
-                "LongTermDebtAndCapitalLeaseObligationsCurrent"],
+                "LongTermDebtAndCapitalLeaseObligationsCurrent",
+                "CurrentPortionOfNoncurrentBorrowings", "ShorttermBorrowings"],
 }
 SHARES_TAG = ("dei", "EntityCommonStockSharesOutstanding")
 
@@ -73,20 +87,44 @@ def fetch_companyfacts(cik: str, pause: float = 0.15) -> dict[str, Any] | None:
         return None
 
 
+def _currency_unit(units: dict[str, Any]) -> str | None:
+    """Pick the monetary unit a filer reported a tag in.
+
+    companyfacts keys units by measure: "USD", "EUR", "TWD", "shares", "USD/shares".
+    Prefer USD when present (a filer may report both), else the first plain 3-letter
+    currency code. Per-share and share units are not monetary and are skipped.
+    """
+    if "USD" in units:
+        return "USD"
+    for u in units:
+        if len(u) == 3 and u.isalpha() and u.isupper():
+            return u
+    return None
+
+
 def facts_frame(symbol: str, cik: str, cf: dict[str, Any]) -> pd.DataFrame:
-    """Flatten the tags we use into a long frame. Values in USD (flows/instants) or
-    shares (dei). `start` is NaT for instants."""
+    """Flatten the tags we use into a long frame. `unit` carries the filer's own
+    reporting currency (USD/EUR/TWD/...) or "shares" for the dei count; `start` is
+    NaT for instants."""
     rows = []
     facts = cf.get("facts") or {}
-    wanted: list[tuple[str, str, str]] = []           # (namespace, tag, concept)
+    wanted: list[tuple[str, str]] = []                # (tag, concept)
     for concept, tags in FLOW_TAGS.items():
-        wanted += [("us-gaap", t, concept) for t in tags]
+        wanted += [(t, concept) for t in tags]
     for concept, tags in INSTANT_TAGS.items():
-        wanted += [("us-gaap", t, concept) for t in tags]
-    wanted.append((SHARES_TAG[0], SHARES_TAG[1], "sharesOutstanding"))
-    for ns, tag, concept in wanted:
-        units = ((facts.get(ns) or {}).get(tag) or {}).get("units") or {}
-        unit = "shares" if concept == "sharesOutstanding" else "USD"
+        wanted += [(t, concept) for t in tags]
+    for tag, concept in wanted:
+        # First namespace that carries this tag wins, so a us-gaap filer never picks up
+        # an identically-named IFRS tag (Assets, GrossProfit and ProfitLoss exist in both).
+        units: dict[str, Any] = {}
+        for ns in _NAMESPACES:
+            u = ((facts.get(ns) or {}).get(tag) or {}).get("units") or {}
+            if u:
+                units = u
+                break
+        unit = _currency_unit(units)
+        if unit is None:
+            continue
         for it in units.get(unit, []):
             if it.get("val") is None or not it.get("end") or not it.get("filed"):
                 continue
@@ -95,6 +133,15 @@ def facts_frame(symbol: str, cik: str, cf: dict[str, Any]) -> pd.DataFrame:
                          "end": it["end"], "val": float(it["val"]), "filed": it["filed"],
                          "form": it.get("form"), "frame": it.get("frame"),
                          "fy": it.get("fy"), "fp": it.get("fp")})
+    sh_units = ((facts.get(SHARES_TAG[0]) or {}).get(SHARES_TAG[1]) or {}).get("units") or {}
+    for it in sh_units.get("shares", []):
+        if it.get("val") is None or not it.get("end") or not it.get("filed"):
+            continue
+        rows.append({"symbol": symbol, "cik": str(cik).zfill(10), "concept": "sharesOutstanding",
+                     "tag": SHARES_TAG[1], "unit": "shares", "start": it.get("start"),
+                     "end": it["end"], "val": float(it["val"]), "filed": it["filed"],
+                     "form": it.get("form"), "frame": it.get("frame"),
+                     "fy": it.get("fy"), "fp": it.get("fp")})
     df = pd.DataFrame(rows)
     if df.empty:
         return df
@@ -197,15 +244,24 @@ def _derive_quarters(flow: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     return q.sort_values(["end", "filed"]).reset_index(drop=True), a.sort_values(["end", "filed"]).reset_index(drop=True)
 
 
-def _ttm_tab(qt: _Tab, at: _Tab, as_of: np.datetime64) -> float | None:
+def _ttm_tab_dated(qt: _Tab, at: _Tab, as_of: np.datetime64):
+    """(TTM value, period end) at as_of. The end lets a caller compare how CURRENT
+    each candidate tag is, which is what distinguishes a live tag from a retired one
+    that still returns a decade-old figure."""
     q = qt.knowable(as_of).dedupe_by_end()
     if len(q.end) >= 4:
         s, e, v = q.start[-4:], q.end[-4:], q.val[-4:]
         gaps = (s[1:] - e[:-1]).astype("timedelta64[D]").astype(int)
         if np.all(gaps <= 12):
-            return float(v.sum())
+            return float(v.sum()), e[-1]
     a = at.knowable(as_of).dedupe_by_end()
-    return float(a.val[-1]) if len(a.end) else None
+    if len(a.end):
+        return float(a.val[-1]), a.end[-1]
+    return None, None
+
+
+def _ttm_tab(qt: _Tab, at: _Tab, as_of: np.datetime64) -> float | None:
+    return _ttm_tab_dated(qt, at, as_of)[0]
 
 
 def _ttm_prev_tab(qt: _Tab, at: _Tab, as_of: np.datetime64) -> float | None:
@@ -247,6 +303,21 @@ class PreparedFacts:
     """One symbol's facts pre-split per concept/tag into period tables."""
     flows: dict[str, list[tuple[_Tab, _Tab]]]      # concept -> [(quarters, annual)] in tag order
     instants: dict[str, list[_Tab]]                # concept -> [tab] in tag order
+    currency: str = "USD"                          # the filer's own statement currency
+
+
+def _statement_currency(sym_facts: pd.DataFrame) -> str:
+    """The currency the income statement is reported in.
+
+    Taken from revenue (falling back to net income) rather than from any monetary tag,
+    so a USD-denominated debt footnote in an otherwise-EUR filer can't flip it.
+    """
+    for concept in ("totalRevenue", "netIncome"):
+        u = sym_facts.loc[sym_facts["concept"] == concept, "unit"]
+        u = u[u != "shares"]
+        if not u.empty:
+            return str(u.mode().iloc[0])
+    return "USD"
 
 
 def prepare_symbol(sym_facts: pd.DataFrame) -> PreparedFacts:
@@ -277,19 +348,45 @@ def prepare_symbol(sym_facts: pd.DataFrame) -> PreparedFacts:
                 lst.append(_Tab.from_df(gt.assign(start=pd.NaT)))
         if lst:
             insts[concept] = lst
-    return PreparedFacts(flows, insts)
+    return PreparedFacts(flows, insts, _statement_currency(sym_facts))
 
 
 def raw_asof_prepared(pf: PreparedFacts, as_of: date, price: float | None,
                       ma50: float | None = None, ma200: float | None = None) -> dict[str, Any] | None:
     ts = np.datetime64(pd.Timestamp(as_of), "ns")
 
+    _pick: dict[str, int | None] = {}
+
+    def _best(concept: str) -> int | None:
+        """Index of the tag whose TTM window ends LATEST.
+
+        Companies switch revenue tags over time (MSFT: Revenues -> SalesRevenueNet ->
+        RevenueFromContractWithCustomerExcludingAssessedTax) and the retired tag keeps
+        returning its final value forever. Taking the first tag that yielded anything
+        therefore pinned MSFT's revenue to a 2010 figure while gross profit stayed
+        current, producing a 338% gross margin. Freshness decides; the FLOW_TAGS order
+        only breaks ties.
+        """
+        if concept in _pick:
+            return _pick[concept]
+        best_i, best_end = None, None
+        for i, (qt, at) in enumerate(pf.flows.get(concept, [])):
+            v, e = _ttm_tab_dated(qt, at, ts)
+            if v is None or e is None:
+                continue
+            if best_end is None or e > best_end:
+                best_i, best_end = i, e
+        _pick[concept] = best_i
+        return best_i
+
     def flow(concept: str, prev: bool = False) -> float | None:
-        for qt, at in pf.flows.get(concept, []):
-            v = _ttm_prev_tab(qt, at, ts) if prev else _ttm_tab(qt, at, ts)
-            if v is not None:
-                return v
-        return None
+        # One tag serves both the current and year-earlier TTM, so a growth ratio is
+        # never computed across two different tags.
+        i = _best(concept)
+        if i is None:
+            return None
+        qt, at = pf.flows[concept][i]
+        return _ttm_prev_tab(qt, at, ts) if prev else _ttm_tab(qt, at, ts)
 
     def inst(concept: str) -> float | None:
         for it in pf.instants.get(concept, []):
@@ -327,7 +424,7 @@ def raw_asof_prepared(pf: PreparedFacts, as_of: date, price: float | None,
         "earningsGrowth": (ni / ni_prev - 1) if (ni is not None and ni_prev and ni_prev > 0) else None,
         "fiftyDayAverage": ma50,
         "twoHundredDayAverage": ma200,
-        "financialCurrency": "USD",
+        "financialCurrency": pf.currency,
     }
 
 
@@ -448,14 +545,20 @@ def raw_asof(sym_facts: pd.DataFrame, as_of: date, price: float | None,
         g = by.get(concept)
         if g is None:
             return None
-        # honour the tag fallback order: first tag with data wins
+        # Freshest tag wins, not the first with data — see _best() in the fast path.
+        # Tie-break by FLOW_TAGS order. Same tag serves current and year-earlier TTM.
+        best_tag, best_end = None, None
         for tag in FLOW_TAGS.get(concept, []):
             gt = g[g["tag"] == tag]
-            if not gt.empty:
-                v = _ttm_prev(gt, ts) if prev else _ttm(gt, ts)
-                if v is not None:
-                    return v
-        return None
+            if gt.empty or _ttm(gt, ts) is None:
+                continue
+            e = gt["end"].max()
+            if best_end is None or e > best_end:
+                best_tag, best_end = tag, e
+        if best_tag is None:
+            return None
+        gt = g[g["tag"] == best_tag]
+        return _ttm_prev(gt, ts) if prev else _ttm(gt, ts)
 
     def inst(concept: str) -> float | None:
         g = by.get(concept)
@@ -499,7 +602,7 @@ def raw_asof(sym_facts: pd.DataFrame, as_of: date, price: float | None,
         "earningsGrowth": (ni / ni_prev - 1) if (ni is not None and ni_prev and ni_prev > 0) else None,
         "fiftyDayAverage": ma50,
         "twoHundredDayAverage": ma200,
-        "financialCurrency": "USD",
+        "financialCurrency": _statement_currency(sym_facts),
     }
     return raw
 

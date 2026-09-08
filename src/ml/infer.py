@@ -54,10 +54,12 @@ def score_today(symbols: list[str], subsectors: dict[str, str],
     from ..data.history_store import HistoryStore
     import lightgbm as lgb
     store = HistoryStore()
-    closes = store.close_matrix(None, adjusted=True)
-    if closes.empty:
+    # The as-of date comes from the manifest: building a full date x symbol pivot of
+    # the entire store just to read its last index was the single most expensive line
+    # in the run, and it grows with the universe.
+    d = pd.Timestamp(as_of) if as_of else store.last_date()
+    if d is None:
         return {}, {"note": "history store has no prices"}
-    d = pd.Timestamp(as_of) if as_of else closes.index.max()
     frame = F.build_feature_frame(store, symbols, subsectors, [d], with_labels=False)
     if frame.empty:
         return {}, {"note": "feature frame empty for today"}

@@ -40,7 +40,8 @@ def graded_calls(symbol: str | None = None) -> list[dict[str, Any]]:
             continue
         grade, window, basis = None, None, None
         for w in (_GRADE_WINDOW, _FALLBACK_WINDOW):
-            for pref, b in (("excess_uni_", "universe"), ("excess_smh_", "SMH"),
+            for pref, b in (("excess_uni_", "universe"),
+                            ("excess_theme_", performance.risk._theme()),
                             ("excess_", "SPY")):
                 v = r.get(f"{pref}{w}")
                 if v is not None:
@@ -330,13 +331,14 @@ def pillar_ic() -> dict[str, Any]:
     definition changed is a different signal). Suggested re-weights are printed
     only when at least one pillar's |t| >= 2 — otherwise the honest answer is
     'not enough independent data yet'."""
-    from .scoring import SCORE_VERSION
+    from .scoring import effective_score_version
+    sv = effective_score_version()
     with storage.get_conn() as cn:
         rows = [dict(r) for r in cn.execute(
             """SELECT s.run_id, s.symbol, s.metrics_json, r.started_at
                FROM screen_scores s JOIN runs r ON r.id=s.run_id
                WHERE r.status='ok' AND r.mode='deep' AND s.score_version=?
-               ORDER BY s.run_id""", (SCORE_VERSION,))]
+               ORDER BY s.run_id""", (sv,))]
     if not rows:
         return {"note": "no rows at the current score version yet "
                         "(accumulates from the next deep runs)"}
@@ -348,10 +350,14 @@ def pillar_ic() -> dict[str, Any]:
             continue
         recs.append({"run_id": r["run_id"], "symbol": r["symbol"],
                      "started_at": str(r["started_at"])[:10],
-                     "technical": m.get("pillar_technical"),
-                     "fundamental": m.get("pillar_fundamental"),
-                     "sentiment": m.get("pillar_sentiment")})
-    df = pd.DataFrame(recs).dropna(subset=list(_PILLARS))
+                     **{pl: m.get(f"pillar_{pl}") for pl in _PILLARS}})
+    df = pd.DataFrame(recs)
+    # Require only the pillars that actually carry data. A newly added pillar has no
+    # history, and dropna() on it would discard every pre-existing row and silently
+    # report an empty study rather than an honest "this pillar has no history yet".
+    present = [pl for pl in _PILLARS if pl in df.columns and df[pl].notna().any()]
+    skipped = [pl for pl in _PILLARS if pl not in present]
+    df = df.dropna(subset=present) if present else df.iloc[0:0]
     if df.empty:
         return {"note": "no scored rows with pillar values yet"}
 
@@ -373,7 +379,7 @@ def pillar_ic() -> dict[str, Any]:
 
     # Per-date cross-sectional Spearman IC (raw fwd returns: subtracting the
     # universe-mean constant per date does not change ranks).
-    per_date: dict[str, list[float]] = {p: [] for p in _PILLARS}
+    per_date: dict[str, list[float]] = {p: [] for p in present}
     dates_used = 0
     for d, g in df.groupby("started_at"):
         t0 = pd.Timestamp(d)
@@ -383,7 +389,7 @@ def pillar_ic() -> dict[str, Any]:
         if len(gg) < 20:
             continue  # too few names for a meaningful cross-section
         fwd_rank = gg["fwd"].rank()
-        for p in _PILLARS:
+        for p in present:
             ic = float(gg[p].rank().corr(fwd_rank))
             if ic == ic:  # not NaN
                 per_date[p].append(ic)
@@ -395,8 +401,11 @@ def pillar_ic() -> dict[str, Any]:
 
     import math
     ics, tstats = {}, {}
-    for p in _PILLARS:
+    for p in present:
         v = per_date[p]
+        if not v:
+            ics[p], tstats[p] = None, None
+            continue
         mean = sum(v) / len(v)
         sd = (sum((x - mean) ** 2 for x in v) / max(len(v) - 1, 1)) ** 0.5
         ics[p] = round(mean, 3)
@@ -405,9 +414,12 @@ def pillar_ic() -> dict[str, Any]:
     cur = config.get("scoring.pillars",
                      {"technical": 0.35, "fundamental": 0.30, "sentiment": 0.35})
     out: dict[str, Any] = {"n_dates": dates_used, "ic": ics, "t_stat": tstats,
-                           "current_weights": cur}
+                           "current_weights": cur, "score_version": sv,
+                           "pillars_measured": present}
+    if skipped:
+        out["pillars_no_history"] = skipped
     if any(t is not None and abs(t) >= 2 for t in tstats.values()):
-        pos = {p: max(v, 0.05) for p, v in ics.items()}
+        pos = {p: max(v, 0.05) for p, v in ics.items() if v is not None}
         tot = sum(pos.values())
         out["suggested_weights"] = {p: round(0.6 * cur.get(p, 0.33) + 0.4 * (pos[p] / tot), 2)
                                     for p in pos}

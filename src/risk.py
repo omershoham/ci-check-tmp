@@ -148,6 +148,11 @@ def portfolio_risk(weights: dict[str, float], shock_pct: float = -20.0) -> dict[
         "vol_aware_bets": vol_aware_bets,
         "n_holdings": len(have),
         "dropped_symbols": dropped,  # no price data — metrics exclude them
+        # Stable keys first: the ticker-derived ones below change name whenever the
+        # configured benchmark changes, which silently turned every consumer reading
+        # them by literal name into None. Prefer beta_bench / beta_theme.
+        "beta_bench": beta_bench,
+        "beta_theme": beta_theme,
         f"beta_{_BENCH.lower()}": beta_bench,
         f"beta_{_THEME.lower()}": beta_theme,
         "benchmark": _BENCH, "theme_benchmark": _THEME,
@@ -177,9 +182,9 @@ def risk_context_lines(rm: dict[str, Any]) -> str:
         f"  - average weighted pairwise correlation: {rm.get('avg_pairwise_corr')}\n"
         f"  - effective independent bets: {rm.get('effective_bets')} "
         f"(vol-aware: {rm.get('vol_aware_bets')}) out of {rm.get('n_holdings')} holdings\n"
-        f"  - portfolio beta vs QQQ: {rm.get('beta_qqq')}; vs SMH (AI-theme proxy): "
-        f"{rm.get('beta_smh')}\n"
-        f"  - scenario: SMH {rm.get('scenario_shock_pct', -20):.0f}% -> portfolio "
+        f"  - portfolio beta vs {rm.get('benchmark')}: {rm.get('beta_bench')}; "
+        f"vs {rm.get('theme_benchmark')} (theme proxy): {rm.get('beta_theme')}\n"
+        f"  - scenario: {rm.get('theme_benchmark')} {rm.get('scenario_shock_pct', -20):.0f}% -> portfolio "
         f"~{rm.get('scenario_drawdown_pct')}% (stressed, beta x1.3: "
         f"~{rm.get('scenario_stressed_pct')}%); worst actual 20d in lookback: "
         f"{rm.get('worst_20d_pct')}%\n"

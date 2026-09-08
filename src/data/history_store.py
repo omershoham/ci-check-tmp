@@ -35,8 +35,13 @@ class HistoryStore:
 
     # ------------------------------------------------------------------ io
     @staticmethod
-    def _read(path: Path) -> pd.DataFrame:
-        return pd.read_parquet(path) if path.exists() else pd.DataFrame()
+    def _read(path: Path, columns: list[str] | None = None,
+              filters: list | None = None) -> pd.DataFrame:
+        """Read a parquet table, pushing column projection and row filters down to
+        pyarrow so unread columns are never materialised."""
+        if not path.exists():
+            return pd.DataFrame()
+        return pd.read_parquet(path, columns=columns, filters=filters)
 
     @staticmethod
     def _write(path: Path, df: pd.DataFrame) -> None:
@@ -84,26 +89,51 @@ class HistoryStore:
         return len(df)
 
     def prices(self, symbols: list[str] | None = None, start: date | None = None,
-               end: date | None = None) -> pd.DataFrame:
-        df = self._read(self.prices_path)
+               end: date | None = None, columns: list[str] | None = None) -> pd.DataFrame:
+        """Long price frame. `columns` projects (date/symbol are always included);
+        symbol and date bounds are pushed into the parquet read rather than applied
+        after materialising the whole table."""
+        cols = None
+        if columns:
+            cols = list(dict.fromkeys(["date", "symbol", *columns]))
+        filters: list = []
+        if symbols:
+            filters.append(("symbol", "in", set(symbols)))
+        if start:
+            filters.append(("date", ">=", pd.Timestamp(start)))
+        if end:
+            filters.append(("date", "<=", pd.Timestamp(end)))
+        df = self._read(self.prices_path, columns=cols, filters=filters or None)
         if df.empty:
             return df
         df["date"] = pd.to_datetime(df["date"])
-        if symbols:
-            df = df[df["symbol"].isin(set(symbols))]
-        if start:
-            df = df[df["date"] >= pd.Timestamp(start)]
-        if end:
-            df = df[df["date"] <= pd.Timestamp(end)]
         return df.sort_values(["symbol", "date"]).reset_index(drop=True)
+
+    def last_date(self) -> pd.Timestamp | None:
+        """Most recent price date in the store.
+
+        Served from the manifest so callers that only need "how current is the store?"
+        do not read (or pivot) the price table. Falls back to a read when the manifest
+        is missing or stale-shaped.
+        """
+        last = (self.manifest().get("prices") or {}).get("last")
+        if last:
+            try:
+                return pd.Timestamp(last)
+            except ValueError:
+                pass
+        df = self._read(self.prices_path)
+        if df.empty:
+            return None
+        return pd.Timestamp(pd.to_datetime(df["date"]).max())
 
     def close_matrix(self, symbols: list[str] | None = None, adjusted: bool = True,
                      start: date | None = None, end: date | None = None) -> pd.DataFrame:
         """Wide date x symbol frame of (adjusted) closes — the harness's workhorse."""
-        df = self.prices(symbols, start, end)
+        col = "adj_close" if adjusted else "close"
+        df = self.prices(symbols, start, end, columns=[col])
         if df.empty:
             return df
-        col = "adj_close" if adjusted else "close"
         return df.pivot(index="date", columns="symbol", values=col).sort_index()
 
     # --------------------------------------------------------------- facts
