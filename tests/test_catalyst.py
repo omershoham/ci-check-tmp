@@ -186,7 +186,7 @@ def test_backtest_refuses_to_replay_a_weighted_unreplayable_pillar(monkeypatch):
 
 
 # ----------------------------------------------------------------- theme packs
-def test_curated_universe_is_unchanged_by_the_move_to_a_pack():
+def test_curated_universe_is_unchanged_by_the_move_to_a_pack(curated):
     """The 105 curated tickers moved from config.yaml into themes/ai_infra.yaml. If a
     single name were dropped in the move, every backtest baseline would silently
     describe a different universe."""

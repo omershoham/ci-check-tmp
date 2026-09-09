@@ -255,7 +255,7 @@ def test_max_symbols_caps_by_dollar_volume(pit_store):
 
 
 # ------------------------------------------------------------- curated is intact
-def test_curated_build_universe_is_the_theme_pack_list():
+def test_curated_build_universe_is_the_theme_pack_list(curated):
     """The shipped default must be byte-identical to what it always was: the four
     sub-sector lists, deduped, first sub-sector winning on overlap. They moved from
     config.yaml into themes/ai_infra.yaml; the RESULT may not have moved with them."""

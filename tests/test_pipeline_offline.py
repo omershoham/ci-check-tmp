@@ -13,7 +13,7 @@ import json
 import pytest
 
 from src import (deep_research, fundamentals, health, ibkr, learning, local_llm, news,
-                 pipeline, regime, technical, universe)
+                 pipeline, regime, technical)
 
 SYMS = ["NVDA", "AMD", "AVGO", "TSM", "VRT", "ANET", "GOOGL", "AMZN", "MSFT", "CEG",
         "IREN", "META"]
@@ -66,10 +66,11 @@ def _fake_claude(prompt, allowed_tools=None, timeout=None, extra_args=None):
 
 
 @pytest.fixture
-def offline(monkeypatch, workspace):
-    # Pin the universe source: the fake metrics below are the curated names, and the
-    # broad path would otherwise pull in whatever registrant table this machine has.
-    monkeypatch.setattr(universe, "configured_source", lambda: "curated")
+def offline(monkeypatch, workspace, curated):
+    # `curated` pins BOTH universe.source and the theme pack: the fake metrics below
+    # are the curated names, and the shipped default (broad + general) would otherwise
+    # pull in whatever registrant table this machine has — or, with only the source
+    # pinned, an empty universe, because the general pack ships no ticker list.
     monkeypatch.setattr(fundamentals, "from_store", _fake_metrics)
     # `.info` survives only as enrich() on the shortlist; the offline run must make no
     # network call at all, so it returns nothing and forwardPE simply stays absent.

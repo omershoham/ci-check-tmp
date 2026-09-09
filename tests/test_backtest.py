@@ -2,11 +2,14 @@
 multiple-testing guard must bite as trials grow."""
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pandas as pd
 
 from src.backtest import metrics as M
-from src.backtest.engine import BacktestSpec, log_trial, n_trials, run_rank_backtest
+from src.backtest.engine import (BacktestSpec, config_hash, log_trial, n_trials,
+                                 n_trial_runs, run_rank_backtest, trial_hashes)
 
 
 def _market(seed=0, n_sym=40, n_days=1500, signal_strength=0.0):
@@ -89,7 +92,41 @@ def test_wilson_free_metrics_edge_cases():
     assert M.turnover(pd.Series({"A": 1.0}), pd.Series({"B": 1.0})) == 2.0
 
 
-def test_trials_log_counts(tmp_path):
+def test_trials_log_counts_distinct_configs_not_runs(tmp_path):
+    """Deflated Sharpe charges you for SEARCHING. Re-running a config you already ran
+    is verification, not another lottery ticket — 109 of this project's trial lines
+    were 13 configurations."""
     assert n_trials(tmp_path) == 0
-    log_trial(tmp_path, "a", {}, {"ic_mean": 0.1})
-    assert log_trial(tmp_path, "b", {"x": 1}, {}) == 2
+    p = {"start": "2016-01-01", "rebalance": "BME", "top_frac": 0.1, "top_n": None,
+         "cost_bps": 15.0}
+    assert log_trial(tmp_path, "composite", p, {"ic_mean": 0.1}, universe="curated") == 1
+    # The SAME configuration again: recorded, but not a new trial.
+    assert log_trial(tmp_path, "composite", p, {"ic_mean": 0.1}, universe="curated") == 1
+    assert n_trial_runs(tmp_path) == 2
+    # A changed cost assumption IS a new hypothesis.
+    assert log_trial(tmp_path, "composite", {**p, "cost_bps": 30.0}, {},
+                     universe="curated") == 2
+    # So is the same signal on a different universe...
+    assert log_trial(tmp_path, "composite", p, {}, universe="broad") == 3
+    # ...and a different rebalance/label horizon.
+    assert log_trial(tmp_path, "composite", {**p, "rebalance": "10d"}, {},
+                     universe="broad") == 4
+    # ...and a different signal.
+    assert log_trial(tmp_path, "technical", p, {}, universe="broad") == 5
+
+
+def test_legacy_trial_lines_are_hashed_from_the_fields_they_did_record(tmp_path):
+    """Lines predate config_hash and universe. They must still count — as one trial
+    each per distinct config, carrying universe=None, which is all that was knowable."""
+    old = {"at": "2026-09-08T07:34:00+00:00", "name": "momentum",
+           "params": {"start": "2016-01-01", "rebalance": "BME", "top_frac": 0.1,
+                      "top_n": None, "cost_bps": 15.0},
+           "ic_mean": 0.0154, "ic_t": 0.77}
+    lines = [json.dumps(old), json.dumps(old), json.dumps({**old, "name": "technical"})]
+    (tmp_path / "trials.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert n_trial_runs(tmp_path) == 3
+    assert n_trials(tmp_path) == 2
+    assert config_hash("momentum", old["params"], None) in trial_hashes(tmp_path)
+    # A new run of the same config on the CURATED universe is a distinct trial: the
+    # legacy line never said which universe it was, so it cannot claim to be the same one.
+    assert log_trial(tmp_path, "momentum", old["params"], {}, universe="curated") == 3

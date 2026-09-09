@@ -288,7 +288,7 @@ def test_horizon_columns_exist(storage):
     assert {"horizon", "horizon_source"} <= picks
     assert {"horizon", "horizon_rationale", "horizon_source", "quant_horizon",
             "expected_move_pct", "invalidation_level"} <= rr
-    assert ver == 3
+    assert ver == 4      # 4: screen_scores.blended_pct
 
 
 def test_upsert_research_persists_the_horizon_fields(storage):

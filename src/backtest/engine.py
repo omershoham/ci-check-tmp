@@ -22,6 +22,7 @@ Everything is graded with the SAME forward-return convention as src/performance.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -220,21 +221,88 @@ def _summarize(per: pd.DataFrame, deciles: pd.DataFrame, spec: BacktestSpec,
 
 
 # ------------------------------------------------------------------ trials log
-def log_trial(root: Path, name: str, params: dict[str, Any], summary: dict[str, Any]) -> int:
-    """Append one configuration to trials.jsonl and return the running trial count.
-    EVERY run counts, including the ones you throw away — that count is what deflates
-    the Sharpe of the one you keep."""
+# Fields that make a run a DIFFERENT hypothesis. Anything not listed here (the wall
+# clock, how many symbols happened to have prices that day, which report directory it
+# landed in) is bookkeeping, not a new bet on the data.
+_HASH_FIELDS = ("start", "rebalance", "top_frac", "top_n", "cost_bps")
+
+
+def config_hash(name: str, params: dict[str, Any], universe: str | None = None) -> str:
+    """Stable short hash of the strategy configuration a trial tested.
+
+    The multiple-testing correction exists to charge you for SEARCHING: every distinct
+    configuration you try is a lottery ticket, and Deflated Sharpe deflates the winner
+    by how many you bought. Re-running a configuration you already ran buys no new
+    ticket — it is verification, not search — so counting it inflates the penalty for
+    doing the careful thing.
+
+    Concretely: `trials.jsonl` reached 109 lines in this project but held only 13
+    distinct configurations. The other 96 were identical re-runs proving a refactor was
+    byte-identical, plus the horizon grid re-run on a corrected exchange calendar.
+    Every Deflated Sharpe here was being penalised for regression testing.
+
+    `universe` is part of the identity because the same signal on 105 curated names and
+    on 1,500 registrant-derived ones are two different hypotheses about two different
+    populations. It is None on lines written before the field existed, and stays None
+    when those are re-hashed, so history keeps exactly the identity it can honestly
+    claim and no more.
+    """
+    payload = {"name": name, "universe": universe,
+               **{k: params.get(k) for k in _HASH_FIELDS}}
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+
+
+def log_trial(root: Path, name: str, params: dict[str, Any], summary: dict[str, Any],
+              universe: str | None = None) -> int:
+    """Append one run to trials.jsonl; return the count of DISTINCT configurations.
+
+    Every run is still written down — the file is the audit trail of what was actually
+    executed — but only distinct `config_hash` values count as trials.
+    """
     root.mkdir(parents=True, exist_ok=True)
     p = root / "trials.jsonl"
     rec = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "name": name,
-           "params": params, "ic_mean": summary.get("ic_mean"), "ic_t": summary.get("ic_t"),
+           "params": params, "universe": universe,
+           "config_hash": config_hash(name, params, universe),
+           "ic_mean": summary.get("ic_mean"), "ic_t": summary.get("ic_t"),
            "sharpe_ls_ew": summary.get("sharpe_ls_ew"), "n_dates": summary.get("n_dates")}
     with p.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(rec, default=str) + "\n")
     return n_trials(root)
 
 
+def trial_hashes(root: Path) -> set[str]:
+    """Every distinct configuration ever logged.
+
+    Lines written before `config_hash` existed are hashed from the fields they DID
+    record, so pre-existing history is not thrown away.
+    """
+    p = root / "trials.jsonl"
+    if not p.exists():
+        return set()
+    out: set[str] = set()
+    with p.open(encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            h = rec.get("config_hash")
+            out.add(h or config_hash(rec.get("name", ""), rec.get("params") or {},
+                                     rec.get("universe")))
+    return out
+
+
 def n_trials(root: Path) -> int:
+    """How many DISTINCT configurations have been tried — the multiple-testing count."""
+    return len(trial_hashes(root))
+
+
+def n_trial_runs(root: Path) -> int:
+    """How many runs are recorded, distinct or not. The audit number, not the penalty."""
     p = root / "trials.jsonl"
     if not p.exists():
         return 0

@@ -64,6 +64,76 @@ def _gather_signals(shortlist: list[dict]) -> tuple[dict[str, dict], dict[str, l
     return signals, news_map, use_llm
 
 
+UNKNOWN_SECTOR = "Unknown"
+
+
+def select_finalists(board: list[dict], n: int, per_sector_cap: int | None = None,
+                     sectors: dict[str, str] | None = None) -> list[dict]:
+    """Choose the `n` names Claude researches, at most `per_sector_cap` from any sector.
+
+    `board` must already be ranked best-first (score_universe sorts it), so this is a
+    single deterministic greedy pass: walk the ranking, take a name unless its sector
+    is already full.
+
+    The failure this prevents: on a 1,500-name universe the top 10 by composite land
+    in whichever sector the composite currently favours — broad-250 was already 34%
+    Information Technology — so the deep-research cohort becomes a sector bet, and
+    `claude_vs_screen` degenerates into comparing one sector against the market rather
+    than comparing an analyst against a screen. A cap makes the cohort a cross-section.
+
+    The cap YIELDS rather than shrinking the cohort. If the capped pass cannot fill n
+    (a single-sector universe — which is exactly what the curated ai_infra list is),
+    the remaining slots go to the best names left over regardless of sector. A hard cap
+    there would quietly cut the research budget from 10 names to 3, which is a
+    different change from the one intended: with only one sector on the board there is
+    no sector comparison left to degenerate.
+    """
+    if n <= 0 or not board:
+        return []
+    cap = int(per_sector_cap or 0)
+
+    def _sec(row: dict) -> str:
+        if sectors and row["symbol"] in sectors:
+            return sectors[row["symbol"]] or UNKNOWN_SECTOR
+        return row.get("sector") or UNKNOWN_SECTOR
+
+    if cap <= 0:
+        return board[:n]
+    chosen: list[dict] = []
+    taken: set[str] = set()
+    counts: dict[str, int] = {}
+    for r in board:
+        if len(chosen) >= n:
+            break
+        s = _sec(r)
+        if counts.get(s, 0) >= cap:
+            continue
+        chosen.append(r)
+        taken.add(r["symbol"])
+        counts[s] = counts.get(s, 0) + 1
+    for r in board:                      # cap yields to the budget, see docstring
+        if len(chosen) >= n:
+            break
+        if r["symbol"] not in taken:
+            chosen.append(r)
+            taken.add(r["symbol"])
+    return chosen
+
+
+def sector_mix(rows: list[dict]) -> str:
+    """`Information Technology 3 · Health Care 2 · ...`, best-represented first.
+
+    Goes in the run's health note because a finalist cohort that is 8/10 one sector is
+    a fact about the RUN, not about any one name, and nothing else on the board says it.
+    """
+    counts: dict[str, int] = {}
+    for r in rows:
+        s = r.get("sector") or UNKNOWN_SECTOR
+        counts[s] = counts.get(s, 0) + 1
+    return " · ".join(f"{s} {c}" for s, c in
+                      sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
 def run(mode: str = "deep") -> int:
     assert mode in ("deep", "light")
     storage.init_db()
@@ -259,7 +329,13 @@ def run(mode: str = "deep") -> int:
         if mode == "deep":
             finalist_n = min(int(config.get("screen.finalist_size", 10)),
                              int(config.get("claude.max_finalists", 10)))
-            unscanned = [r for r in board[:finalist_n] if r["symbol"] not in signals]
+            sector_cap = int(config.get("screen.max_finalists_per_sector", 0) or 0)
+            # SAME selection as the final cut below. If this used the raw top-N while
+            # the cut below stratified, the rescan would news-scan names that never
+            # become finalists and miss the ones that do — reopening the exact funnel
+            # leak it exists to close.
+            unscanned = [r for r in select_finalists(board, finalist_n, sector_cap)
+                         if r["symbol"] not in signals]
             if unscanned:
                 _log(f"scanning {len(unscanned)} unscanned finalists: "
                      f"{[r['symbol'] for r in unscanned]}")
@@ -273,6 +349,20 @@ def run(mode: str = "deep") -> int:
         storage.upsert_signals(run_id, [
             {"symbol": s, **v} for s, v in signals.items()
         ])
+
+        # The finalist cohort. Computed in BOTH modes even though only a deep run
+        # researches it: the cut is what `claude_vs_screen` treats as the control
+        # cohort, so its sector mix is a property of the run worth recording every
+        # time, and a light run is the cheap way to see whether the cap is binding.
+        finalist_n = min(int(config.get("screen.finalist_size", 10)),
+                         int(config.get("claude.max_finalists", 10)))
+        sector_cap = int(config.get("screen.max_finalists_per_sector", 0) or 0)
+        top_finalists = select_finalists(board, finalist_n, sector_cap)
+        fmix = sector_mix(top_finalists)
+        _log(f"finalists ({len(top_finalists)}, cap {sector_cap or 'none'}/sector): "
+             f"{[r['symbol'] for r in top_finalists]} — {fmix}")
+        hz.ok("finalists", f"{len(top_finalists)} chosen, cap "
+                           f"{sector_cap or 'none'}/sector — {fmix}")
 
         # Stage 4 (data overlay): IBKR holdings + quotes for the visible board
         board_syms = [r["symbol"] for r in board[:max(shortlist_n, 40)]]
@@ -338,10 +428,7 @@ def run(mode: str = "deep") -> int:
 
         # Stage 3: Claude deep research on finalists (deep mode only)
         if mode == "deep":
-            finalist_n = min(int(config.get("screen.finalist_size", 10)),
-                             int(config.get("claude.max_finalists", 10)))
             holdings_map = {h["symbol"]: h for h in ib.get("holdings", [])}
-            top_finalists = board[:finalist_n]
             finalists = list(top_finalists)
             fsyms = {r["symbol"] for r in finalists}
             # Always research held names that are in-universe, even if below the cutoff,
@@ -352,7 +439,8 @@ def run(mode: str = "deep") -> int:
             auth = deep_research.auth_status()
             _log(f"Claude auth: {auth}")
             _log(f"deep research on {len(finalists)} names "
-                 f"({len(top_finalists)} top + {len(held_extra)} held)")
+                 f"({len(top_finalists)} top + {len(held_extra)} held); "
+                 f"finalist sectors: {fmix}")
             if not auth.get("claude_on_path") or not auth.get("oauth_token_set"):
                 hz.failed("research", "claude CLI missing or CLAUDE_CODE_OAUTH_TOKEN unset")
             # Overall wall-clock budget so a run of slow/timing-out finalists can't blow

@@ -7,19 +7,23 @@ paths:
 
 # Which theme pack in themes/ supplies the board's name, the actors named in the
 # catalyst/research prompts, and (for `universe.source: curated`) the ticker lists.
-# `general` is the theme-free default. The catalyst KEY SET is never theme-varying —
+# `general` is the theme-free default and what ships with `universe.source: broad`.
+# The catalyst KEY SET is never theme-varying —
 # it lives in src/local_llm.CATALYST_KEYS so signals stay poolable across themes.
-theme: ai_infra
+theme: general
 
 universe:
-  # curated = the theme pack's hand-picked lists (the shipped default; ai_infra).
   # broad   = every US-listed SEC registrant that files financial statements, floored
-  #           point-in-time by src/universe.py::investable(). Needs the registrant
-  #           table and candidate prices first:
+  #           point-in-time by src/universe.py::investable(). THE SHIPPED DEFAULT since
+  #           Phase 7. Needs the registrant table and candidate prices first:
   #             python -m scripts.data_refresh --registrants --shares-bulk --screen-prices
-  source: curated
+  # curated = the theme pack's hand-picked lists. Still fully supported; pair it with
+  #           `theme: ai_infra`, which is the pack that owns those lists. A curated
+  #           universe is chosen with hindsight, which is what its backtest disclosure
+  #           line says out loud.
+  source: broad
   broad:
-    max_symbols: 250             # the phasing knob: 250 -> 750 -> 1500
+    max_symbols: 1500            # the phasing knob: 250 -> 750 -> 1500 (shipped: 1500)
     rank_by: adv                 # which measure the cap keeps the top of
     exchanges: [Nasdaq, NYSE, NYSE American, Cboe]
     exclude_sic: [6726, 6770]    # funds/CEFs/BDCs, blank checks. REITs (6798) stay in
@@ -33,14 +37,38 @@ universe:
     min_price: 5.0                 # $
     min_avg_dollar_volume: 5000000 # $5M average daily traded value
 
-  # Curated universe: see themes/ai_infra.yaml (`subsectors:`), which owns both the
-  # ticker lists and their display labels. A `universe.sectors:` block here still
-  # overrides the pack wholesale (config._REPLACE_KEYS) if you want your own list.
+  # Curated universe (only when source: curated): see themes/ai_infra.yaml
+  # (`subsectors:`), which owns both the ticker lists and their display labels. A
+  # `universe.sectors:` block here still overrides the pack wholesale
+  # (config._REPLACE_KEYS) if you want your own list.
 
 screen:
-  shortlist_size: 35   # passed from quant screen to local-LLM signal stage
+  # Names handed to the serial, GPU-bound local-LLM signal stage. One 9-key catalyst
+  # call costs ~9.5s warm, so this IS the stage's wall-clock: 100 names ~= 16 min per
+  # run. Raising it costs no Claude/subscription usage (that is capped by
+  # finalist_size), only GPU time on the box.
+  shortlist_size: 100
   finalist_size: 10    # passed to Claude deep research (the cost cap)
+  # At most this many finalists from any one GICS-like sector. The top 10 of a
+  # 1,500-name board concentrate in whichever sector the composite currently favours
+  # (broad-250 was 34% Information Technology), which turns claude_vs_screen from
+  # "analyst vs screen" into "one sector vs the market". Set 0 to disable.
+  # The cap yields rather than shrinking the cohort on a single-sector universe -
+  # see pipeline.select_finalists.
+  max_finalists_per_sector: 3
   earnings_soon_days: 7  # tag a name "earnings-soon" if it reports within this many days
+
+# Where the screen-only (unresearched) buy/hold/avoid labels cut the board.
+# QUANTILES of the run's own composite, never absolute score values: `blended` is a
+# weighted mean of percentile ranks, so its spread shrinks as pillars are added
+# (sd 0.167 with three, 0.130 with five) and a fixed 0.66 cut would quietly drop
+# P(buy) from ~19% to ~11% the day a dark pillar is switched on, with no change in
+# skill. These labels are DISPLAY ONLY - `performance._bucket` grades on
+# research_reports.rating and claude_vs_screen's control cohort is the pipeline's
+# finalist cut, so moving them invalidates no calibration statistic.
+recommend:
+  screen_buy_quantile: 0.90   # top 10% of the board -> provisional buy
+  screen_hold_quantile: 0.60  # top 40% -> hold; below -> avoid
 
 # Your investment policy — every stage (deep dives, PM reconcile, sizing hints, digest)
 # optimizes against THESE numbers, not implicit defaults. Edit to taste.
@@ -134,10 +162,10 @@ scoring:
       flag_if_unprofitable: true
       valuation_pct_floor: 0.15  # in the most expensive 15% of its OWN sector
       sector_pe_multiple: 2.5    # or PE > this x the sector's median PE
-      # DEPRECATED, honoured for one release: a flat ceiling is a sector bet dressed as
-      # a risk rule (60x is ordinary for software, absurd for a utility). Set to 0 to
-      # switch it off now. "PE is N/A" no longer means risky — it gets `no-earnings`.
-      pe_risk_ceiling: 60
+      # `pe_risk_ceiling` (a flat 60x) was deprecated in Phase 4 and is REMOVED here.
+      # It was a sector bet dressed as a risk rule and it kept flagging EQIX/DLR
+      # higher-risk at 67x/92x P/E when their P/FFO is ~20x. The two rules above are
+      # its sector-aware replacement. "PE is N/A" gets the neutral `no-earnings` tag.
 
 news:
   # SEC EDGAR fair-access wants a contact address in the request User-Agent.

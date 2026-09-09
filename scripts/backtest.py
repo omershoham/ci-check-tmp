@@ -6,7 +6,9 @@
     python -m scripts.backtest --all             # every baseline, one report each
 
 Reports land under $CLAUDE_TRADER_HOME/data/history/backtests/<name>_<timestamp>/ and
-every run is appended to trials.jsonl (the count deflates the Sharpe of whatever you keep).
+every run is appended to trials.jsonl. The number of DISTINCT configurations in that
+file (not the number of runs) deflates the Sharpe of whatever you keep: re-running a
+config you already ran is verification, not another lottery ticket.
 """
 from __future__ import annotations
 
@@ -17,7 +19,8 @@ import pandas as pd
 
 from src import universe
 from src.backtest import signals
-from src.backtest.engine import BacktestSpec, log_trial, n_trials, run_rank_backtest
+from src.backtest.engine import (BacktestSpec, config_hash, log_trial, n_trials,
+                                 run_rank_backtest, trial_hashes)
 from src.data.history_store import HistoryStore
 from src.data.yfinance_live import every_n_trading_days, month_ends
 
@@ -124,11 +127,22 @@ def run_one(name: str, store: HistoryStore, start: date, top_frac: float, top_n:
     eligible = {d: set(store.universe_asof(d.date(), source=src)) for d in scores.index}
     note = universe_note(store, eligible, src)
     trials_root = store.root
+    params = {**spec.params, "top_frac": top_frac, "top_n": top_n, "cost_bps": cost_bps}
+    # DISTINCT configurations, not runs. Re-running this exact config (a refactor
+    # verification, a byte-identical gate) is not a new hypothesis and must not deflate
+    # the Sharpe of the one you keep - see engine.config_hash. The +1 covers THIS run
+    # when it is a configuration never tried before; when it is a repeat the hash is
+    # already in the set and the count does not move.
+    # The universe tag carries the SIZE CAP too: broad-250, broad-750 and broad-1500
+    # are three different populations, so the same signal on them is three hypotheses,
+    # not one re-run. `curated` has no cap and needs none.
+    uni_tag = (f"broad:{universe.broad_cfg('max_symbols')}" if src == "broad" else src)
     n_prior = n_trials(trials_root)
-    res = run_rank_backtest(scores, closes, spec, eligible=eligible, n_trials=n_prior + 1,
+    this_hash = config_hash(name, params, uni_tag)
+    n_this = n_prior + (0 if this_hash in trial_hashes(trials_root) else 1)
+    res = run_rank_backtest(scores, closes, spec, eligible=eligible, n_trials=n_this,
                             universe_note=note)
-    log_trial(trials_root, name, {**spec.params, "top_frac": top_frac, "top_n": top_n,
-                                  "cost_bps": cost_bps}, res.summary)
+    log_trial(trials_root, name, params, res.summary, universe=uni_tag)
     suffix = f"_h{horizon_days}" if horizon_days else ""
     out = (store.root / "backtests"
            / f"{name}{suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")

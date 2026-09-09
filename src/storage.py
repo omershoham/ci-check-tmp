@@ -65,6 +65,10 @@ CREATE TABLE IF NOT EXISTS screen_scores (
                                -- replaced the deal score. Kept so historical rows
                                -- stay readable; nothing computes it any more.
     blended      REAL,
+    blended_pct  REAL,         -- the row's percentile inside its OWN run (0..1).
+                               -- NULL on rows scored before Phase 7, which is exactly
+                               -- what makes recommend.py fall back to the old
+                               -- absolute cut for them instead of mislabelling them.
     rank         INTEGER,
     tags         TEXT,         -- JSON array of strings
     metrics_json TEXT,         -- JSON of raw fundamentals/subscores
@@ -211,7 +215,8 @@ CREATE TABLE IF NOT EXISTS portfolio_summary (
 # Bumped whenever _migrate gains a step. Recorded in the schema_version table so a
 # future non-additive change (a rename needs a copy-table in SQLite) has a real anchor
 # to branch on instead of re-deriving state from PRAGMA every time.
-SCHEMA_VERSION = 3   # 3: per-idea horizon + horizon_source on picks,
+SCHEMA_VERSION = 4   # 4: screen_scores.blended_pct (percentile form of the composite)
+                     # 3: per-idea horizon + horizon_source on picks,
                      #    research_reports and portfolio_positions
 
 
@@ -320,6 +325,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # Which pillars composed the score. An integer score_version cannot express two
     # independently dark pillars; this can.
     _add_col(conn, "screen_scores", "pillar_set", "TEXT")
+    # Phase 7. The percentile form of `blended`, so a fixed recommendation cut stops
+    # drifting with pillar count and universe size. Deliberately NOT backfilled: the
+    # percentile depends on the whole cross-section of its run, and recomputing it from
+    # today's board would rewrite what a past run said.
+    _add_col(conn, "screen_scores", "blended_pct", "REAL")
     # Two-level taxonomy for the broad universe. `subsector` keeps meaning "the peer
     # group this name is ranked inside" (it carries industry_group in broad mode), so
     # nothing that already reads it has to change; these two record WHICH taxonomy the
@@ -474,6 +484,7 @@ def upsert_screen_scores(run_id: int, rows: Iterable[dict[str, Any]]) -> None:
             "quality": r.get("quality"),
             "deal": r.get("deal"),
             "blended": r.get("blended"),
+            "blended_pct": r.get("blended_pct"),
             "rank": r.get("rank"),
             "tags": json.dumps(r.get("tags", [])),
             "metrics_json": json.dumps(r.get("metrics", {})),
@@ -485,10 +496,11 @@ def upsert_screen_scores(run_id: int, rows: Iterable[dict[str, Any]]) -> None:
         })
     with get_conn() as conn:
         conn.executemany(
-            """INSERT INTO screen_scores(run_id,symbol,quality,deal,blended,rank,tags,metrics_json,score_version,pillar_set)
-               VALUES(:run_id,:symbol,:quality,:deal,:blended,:rank,:tags,:metrics_json,:score_version,:pillar_set)
+            """INSERT INTO screen_scores(run_id,symbol,quality,deal,blended,blended_pct,rank,tags,metrics_json,score_version,pillar_set)
+               VALUES(:run_id,:symbol,:quality,:deal,:blended,:blended_pct,:rank,:tags,:metrics_json,:score_version,:pillar_set)
                ON CONFLICT(run_id,symbol) DO UPDATE SET
                  quality=excluded.quality, deal=excluded.deal, blended=excluded.blended,
+                 blended_pct=excluded.blended_pct,
                  rank=excluded.rank, tags=excluded.tags, metrics_json=excluded.metrics_json,
                  score_version=excluded.score_version, pillar_set=excluded.pillar_set""",
             payload,
@@ -585,7 +597,7 @@ def get_board(run_id: int) -> list[dict[str, Any]]:
         rows = conn.execute(
             """
             SELECT s.symbol, t.name, t.subsector, s.quality, s.deal, s.blended,
-                   s.rank, s.tags, s.metrics_json,
+                   s.blended_pct, s.rank, s.tags, s.metrics_json,
                    g.hyperscaler_signal, g.catalyst_json, g.signal_version,
                    g.catalysts_json AS sig_catalysts, g.summary,
                    r.rating, r.conviction, r.deal_likelihood, r.thesis, r.chart_pattern,

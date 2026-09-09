@@ -502,6 +502,10 @@ def score_universe(metrics: dict[str, dict],
     wsum = wsum.where(wsum > 0, 1.0)
     composite = (technical_r * wT + fundamental_r.fillna(0.0) * wF_row
                  + sentiment_r * wS + learned_r * wL + catalyst_r * wC) / wsum
+    # Percentile of the composite WITHIN THIS RUN. Free (the rows get ranked anyway)
+    # and it is the only cross-run-comparable form of the score — see the comment on
+    # the `blended_pct` row field below.
+    composite_pct = composite.rank(pct=True)
 
     # Sector-relative valuation: median PE / fwd PE / EV-EBITDA per sub-sector.
     df["_sub"] = [subsectors.get(s, "") for s in df.index]
@@ -523,10 +527,12 @@ def score_universe(metrics: dict[str, dict],
     q_thresh = tagcfg.get("quality_threshold", 0.6)
     require_fcf = config.get("scoring.quality.require_positive_fcf_for_tag", True)
     hr = tagcfg.get("higher_risk", {})
-    # DEPRECATED (one release): a flat PE ceiling is a sector bet dressed as a risk
-    # rule — 60x is ordinary for software and absurd for a utility. Superseded by
-    # valuation_pct_floor / sector_pe_multiple below; remove after the next release.
-    pe_ceiling = hr.get("pe_risk_ceiling", 60)
+    # The flat `pe_risk_ceiling` was deprecated in favour of the two sector-relative
+    # rules below and is now GONE. It was a sector bet dressed as a risk rule: 60x is
+    # ordinary for software and absurd for a utility, and concretely it kept flagging
+    # EQIX and DLR `higher-risk` at 67x/92x P/E when their P/FFO — the multiple a REIT
+    # is actually priced on — is ~20x. A flat ceiling cannot know that; a sector
+    # percentile and a sector-median multiple can.
     val_floor = float(hr.get("valuation_pct_floor", 0.15) or 0)
     pe_mult = float(hr.get("sector_pe_multiple", 2.5) or 0)
     # A tail cut needs a tail. With 2 names in a sector, "the most expensive 15%" flags
@@ -568,8 +574,6 @@ def score_universe(metrics: dict[str, dict],
         if (pe_mult and isinstance(pe, (int, float)) and pe > 0
                 and smed and smed == smed and pe > pe_mult * smed):
             higher_risk = True
-        if pe_ceiling and isinstance(pe, (int, float)) and pe > pe_ceiling:
-            higher_risk = True
         if higher_risk:
             tags.append("higher-risk")
         if pe is None:
@@ -592,6 +596,15 @@ def score_universe(metrics: dict[str, dict],
             "fundamental": round(f_val, 4) if f_val is not None else None,
             "sentiment": round(float(sentiment[s]), 4),
             "blended": round(float(composite[s]), 4),   # composite = ranking score
+            # The same score expressed as this row's PERCENTILE inside this run
+            # (0..1, 1 = best). `blended` is a weighted mean of uniforms, so its
+            # spread shrinks every time a pillar is added (sd 0.167 with three
+            # balanced pillars, 0.130 with five) and shifts with universe size.
+            # Anything that puts a fixed CUT on the score — recommend.recommendation
+            # is the live one — has to read this instead, or it silently gets stricter
+            # when a dark pillar is switched on. Near-zero cost: the rows are already
+            # ranked below.
+            "blended_pct": round(float(composite_pct[s]), 4),
             # kept for back-compat / tags
             "quality": round(f_val, 4) if f_val is not None else None,
             "tags": tags,

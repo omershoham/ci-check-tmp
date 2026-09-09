@@ -40,9 +40,15 @@ def check_python() -> None:
 
 
 def check_packages() -> None:
+    # pandas_market_calendars is REQUIRED, not optional: src/market_calendar.trading_days
+    # falls back to business days without it, which silently shifts every horizon-grid
+    # rebalance date by the year's holidays. The Phase 6 grid measured that shift at
+    # mean |dt| 0.45 - larger than the effects the grid exists to detect. A measurement
+    # harness whose date convention depends on what happens to be installed is not
+    # reproducible, so its absence is a FAIL.
     required = ["yfinance", "pandas", "numpy", "requests", "feedparser", "yaml", "dotenv",
-                "plotly", "streamlit"]
-    optional = ["ib_async", "pandas_market_calendars", "streamlit_autorefresh", "pytest"]
+                "plotly", "streamlit", "pandas_market_calendars"]
+    optional = ["ib_async", "streamlit_autorefresh", "pytest"]
     missing = [m for m in required if importlib.util.find_spec(m) is None]
     _rec(FAIL if missing else OK, "required packages",
          f"missing: {missing}" if missing else f"{len(required)} present")
