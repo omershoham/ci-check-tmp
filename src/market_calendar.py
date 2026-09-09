@@ -55,7 +55,11 @@ def is_trading_day(d: datetime.date | None = None) -> bool:
 
 
 def reason_closed(d: datetime.date | None = None) -> str:
+    """Why the market is closed on `d` -- or "open" if it isn't. Callers used to have
+    to remember this was only meaningful after is_trading_day() returned False."""
     d = d or datetime.date.today()
+    if is_trading_day(d):
+        return "open"
     if d.weekday() >= 5:
         return "weekend"
     return "market holiday"

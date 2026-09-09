@@ -8,6 +8,7 @@ falls back to per-token API usage. NOTE: we deliberately do NOT use `--bare`
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import date
 from typing import Any
 

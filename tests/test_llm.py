@@ -132,3 +132,16 @@ def test_get_provider_reads_config(monkeypatch):
     monkeypatch.setattr(llm.config, "get", lambda k, d=None: "nope" if k == "llm.provider" else d)
     with pytest.raises(RuntimeError):
         llm.get_provider()
+
+
+def test_auth_status_is_callable_and_reports_both_facts(monkeypatch):
+    """The pipeline calls this right before the research loop. The offline deep-run test
+    replaces it with a stub, so a missing import here (it happened: `shutil`) would crash
+    a real deep run 40 minutes in and never fail a test. Call the real function."""
+    from src import deep_research
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "x")
+    a = deep_research.auth_status()
+    assert set(a) >= {"claude_on_path", "oauth_token_set"}
+    assert a["oauth_token_set"] is True
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    assert deep_research.auth_status()["oauth_token_set"] is False
