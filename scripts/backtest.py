@@ -113,7 +113,8 @@ def run_one(name: str, store: HistoryStore, start: date, top_frac: float, top_n:
         from src.data import registrants
         reg = registrants.load_registrants(store)
         subs.update(dict(zip(reg["symbol"], reg["industry_group"])))
-        ever = set().union(*(set(store.universe_asof(d.date(), source=mask)) for d in dates))             if dates else set()
+        ever = (set().union(*(set(v) for v in store.universe_asof_many(dates, source=mask).values()))
+                if dates else set())
         syms = sorted(set(syms) | ever)
     # Membership is a set question; it used to be answered by pivoting the whole store
     # into a date x symbol matrix and reading `.columns`.
@@ -137,7 +138,9 @@ def run_one(name: str, store: HistoryStore, start: date, top_frac: float, top_n:
     if scores.empty:
         raise SystemExit(f"{name}: signal produced no scores (missing data?)")
     # PIT universe where recorded; otherwise the current curated list (disclosed).
-    eligible = {d: set(store.universe_asof(d.date(), source=mask)) for d in scores.index}
+    # One read of membership for every date (see universe_asof_many): the per-date call
+    # re-read the whole file ~118 times per run.
+    eligible = {d: set(v) for d, v in store.universe_asof_many(scores.index, source=mask).items()}
     note = universe_note(store, eligible, src, mask=mask)
     trials_root = store.root
     params = {**spec.params, "top_frac": top_frac, "top_n": top_n, "cost_bps": cost_bps}

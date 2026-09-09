@@ -46,6 +46,42 @@ _CCY_SENSITIVE = ("net_cash", "fcf_yield", "p_fcf", "ev_sales", "enterpriseToEbi
 # risk flag, while `.info` says 31.8 and is right.
 _CCY_FALLBACK_ONLY = ("trailingPE", "priceToBook")
 
+# THE VOCABULARY: every key `derive()` can put on its output dict.
+#
+# It exists so a metric name can never be referenced by something that consumes these
+# rows without that reference being checked. `scoring`'s component lists are plain
+# strings, and `_component_percentiles` skips a column the frame does not carry — which
+# is the RIGHT behaviour for a company that simply lacks a value, and a silent, total
+# failure for a TYPO. A misspelt component would drop out of the pillar on every name,
+# in every run, forever, and no test would go red: the pillar would just quietly run on
+# fewer inputs than it was designed with. `scoring` validates its lists against this
+# tuple at import, so that class of bug becomes an ImportError instead of a number
+# nobody can see. `tests/test_metric_contract.py` pins the tuple to what `derive`
+# actually emits so the declaration cannot drift away from the function.
+#
+# `earnings_date`/`days_to_earnings` are conditional (a live `.info` row carries an
+# earnings timestamp, an SEC snapshot does not); every other key is always present,
+# with None meaning "not computable for this company".
+DERIVED_FIELDS = (
+    # passthrough / identity
+    "price", "marketCap", "freeCashflow", "totalRevenue", "financial_currency",
+    # valuation
+    "trailingPE", "forwardPE", "pegRatio", "enterpriseValue", "enterpriseToEbitda",
+    "ev_sales", "priceToSalesTrailing12Months", "priceToBook", "p_fcf", "p_ffo",
+    # cash flow
+    "fcf_yield", "fcf_margin", "ffo", "ffo_yield", "ffo_margin", "net_cash",
+    "cash_runway_quarters",
+    # growth
+    "revenueGrowth", "earningsGrowth", "rule_of_40",
+    # quality
+    "grossMargins", "operatingMargins", "returnOnEquity", "returnOnAssets",
+    "debtToEquity", "profitable",
+    # price vs moving averages
+    "mom_50", "mom_200",
+    # live-only (an SEC snapshot has no earnings calendar)
+    "earnings_date", "days_to_earnings",
+)
+
 
 def _pos(x) -> float | None:
     try:
@@ -187,3 +223,21 @@ def derive(raw: dict[str, Any], as_of: date | None = None) -> dict[str, Any]:
         except (ValueError, OSError, OverflowError, TypeError):
             pass
     return m
+
+
+def _check_vocabulary() -> None:
+    """The masking tuples must name metrics `derive` emits.
+
+    Prevents the same silent failure `DERIVED_FIELDS` exists for, one level down: a
+    misspelt entry in `_CCY_SENSITIVE` would mean an ADR keeps a meaningless USD-cap-
+    over-local-currency multiple (the TSM P/E-of-206 bug) with nothing to show for it.
+    """
+    unknown = sorted(set(_CCY_SENSITIVE) - set(DERIVED_FIELDS))
+    if unknown:
+        raise ValueError(f"_CCY_SENSITIVE names metrics derive() never emits: {unknown}")
+    unknown = sorted(set(_CCY_FALLBACK_ONLY) - set(_CCY_SENSITIVE))
+    if unknown:
+        raise ValueError(f"_CCY_FALLBACK_ONLY entries are not currency-sensitive: {unknown}")
+
+
+_check_vocabulary()

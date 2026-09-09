@@ -38,6 +38,7 @@ whose `as_of` <= the requested date, and snapshots are built only from facts wit
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -129,8 +130,24 @@ class HistoryStore:
 
     @staticmethod
     def _write(path: Path, df: pd.DataFrame) -> None:
+        """Write atomically: full file to a sibling temp, then os.replace.
+
+        A reader that opens a parquet file mid-write sees a truncated footer and gets
+        `ArrowInvalid: Parquet magic bytes not found`. That is not hypothetical -- the
+        dashboard reads this store continuously while a pipeline run writes to it (the
+        SQLite side has WAL for exactly this reason; parquet had nothing), and a
+        backtest reading during a refresh hit it. os.replace is atomic on the same
+        volume on Windows and POSIX, so a reader sees either the old file or the new
+        one, never half of either."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(path, index=False)
+        # Leading dot: pyarrow.dataset ignores "." and "_" prefixes, so a temp file
+        # sitting in a scanned directory can never be read as a data fragment.
+        tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+        try:
+            df.to_parquet(tmp, index=False)
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     @staticmethod
     def _read_parts(directory: Path, partitioning, columns: list[str] | None = None,
@@ -164,8 +181,16 @@ class HistoryStore:
                 p.unlink()
             existing = []
         n = 0 if not existing else int(existing[-1].stem.split("-")[1]) + 1
-        pq.write_table(table, directory / _PART_NAME.format(n=n), compression="zstd",
-                       use_dictionary=True, row_group_size=row_group_size)
+        # Same atomicity rule as _write: a partition file must appear whole or not at
+        # all, because a concurrent reader globs this directory.
+        final = directory / _PART_NAME.format(n=n)
+        tmp = final.with_name(f".{final.name}.tmp-{os.getpid()}")
+        try:
+            pq.write_table(table, tmp, compression="zstd",
+                           use_dictionary=True, row_group_size=row_group_size)
+            os.replace(tmp, final)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def _touch_manifest(self, table: str, n_rows: int, extra: dict | None = None) -> None:
         man = {}
@@ -676,6 +701,39 @@ class HistoryStore:
         self._write(self.universe_path, rows)
         self._touch_manifest("universe", len(rows))
         return len(rows)
+
+    def universe_asof_many(self, dates, source: str = "curated") -> dict:
+        """Membership for MANY as-of dates in ONE read.
+
+        `universe_asof` re-reads membership.parquet on every call, and the backtest asks
+        it once per rebalance date -- ~118 full reads of the same file per run. That is
+        wasteful on its own, and it multiplies the window in which a concurrent writer
+        (a pipeline run recording today's membership) can be caught mid-write by a
+        factor of a hundred. One read, then an as-of join per date."""
+        want = [pd.Timestamp(d) for d in dates]
+        # The no-recorded-membership fallback is the SAME answer for every date (the
+        # current config list for `curated`, nothing otherwise), so resolve it once.
+        # Calling universe_asof per date here is what made the first version of this
+        # method exactly as slow as the loop it replaced.
+        if source == "curated":
+            from .. import universe
+            fallback = universe.symbols()
+        else:
+            fallback = []
+        df = self._read(self.universe_path)
+        if not df.empty:
+            df = df[df["source"] == source].copy()
+        if df.empty:
+            return {d: list(fallback) for d in want}
+        df["as_of"] = pd.to_datetime(df["as_of"])
+        by_date = {ts: sorted(g["symbol"].tolist()) for ts, g in df.groupby("as_of")}
+        recorded = sorted(by_date)
+        out, i = {}, 0
+        for d in sorted(want):                      # one merge pass, not a scan per date
+            while i < len(recorded) and recorded[i] <= d:
+                i += 1
+            out[d] = by_date[recorded[i - 1]] if i else list(fallback)
+        return {d: out[d] for d in want}
 
     def universe_asof(self, as_of: date, source: str = "curated") -> list[str]:
         """Membership on the latest recorded date <= as_of. Falls back to the current

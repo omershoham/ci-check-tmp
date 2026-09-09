@@ -21,12 +21,14 @@ fundamental pillar drops out of its composite entirely, rather than being fabric
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from . import config, local_llm
+from .analytics.metrics import DERIVED_FIELDS
 
 # Bump whenever a pillar's DEFINITION changes (components, ranking method, signs).
 # pillar_ic filters to the current version so pre-change scores can't contaminate
@@ -150,6 +152,68 @@ SECTOR_METRICS: dict[str, dict[str, list[tuple[str, bool]]]] = {
 # anything; below it the pillar is NaN and drops out of that name's composite.
 _MIN_FAMILIES = 2
 
+# The metric names `derive()` can actually produce. Every component list above is
+# checked against it AT IMPORT (below) and again per call in `_designed`.
+_VOCABULARY = frozenset(DERIVED_FIELDS)
+
+
+def _check_metric_vocabulary() -> None:
+    """Fail loudly if any component list names a metric `derive()` never emits.
+
+    The failure this prevents: `_component_percentiles` skips a column the frame does
+    not carry, which is correct for a company that lacks a value and catastrophic for a
+    TYPO — a misspelt component silently leaves the pillar for every name in every run,
+    the pillar quietly runs on fewer inputs than it was designed with, and `coverage`
+    (measured against the surviving list until this change) still reads healthy. Nothing
+    goes red. Making this an ImportError is deliberate: these are module constants, so a
+    violation is a static wiring bug that is broken for everybody, not a data condition
+    a live run could hit. A run that starts at all is a run whose pillar is fully wired.
+    """
+    bad: dict[str, list[str]] = {}
+    for name, comps in (("_VALUATION", _VALUATION), ("_CASHFLOW", _CASHFLOW),
+                        ("_GROWTH", _GROWTH), ("_QUALITY", _QUALITY)):
+        miss = [c for c, _ in comps if c not in _VOCABULARY]
+        if miss:
+            bad[name] = miss
+    for sector, fams in SECTOR_METRICS.items():
+        for fam, comps in fams.items():
+            miss = [c for c, _ in comps if c not in _VOCABULARY]
+            if miss:
+                bad[f'SECTOR_METRICS["{sector}"]["{fam}"]'] = miss
+    miss = sorted(_MASK_NONPOS - _VOCABULARY)
+    if miss:
+        bad["_MASK_NONPOS"] = miss
+    if bad:
+        detail = "; ".join(f"{k}: {v}" for k, v in sorted(bad.items()))
+        # Logged as well as raised: the traceback can be swallowed by a caller that
+        # catches ImportError, and this message must reach the run log regardless.
+        logging.getLogger(__name__).error(
+            "FUNDAMENTAL PILLAR MIS-WIRED — unknown metric names: %s", detail)
+        raise ValueError(
+            "scoring references metrics analytics.metrics.derive() never emits — these "
+            f"would be silently dropped from the fundamental pillar: {detail}")
+
+
+_check_metric_vocabulary()
+
+
+def _designed(components: list[tuple[str, bool]]) -> list[tuple[str, bool]]:
+    """The family's DESIGNED components: deduped, every name checked against the
+    vocabulary. This is the denominator `coverage` is measured against — a metric no
+    name in the universe can supply must read as missing coverage, not vanish from the
+    denominator and leave the pillar looking fully fed."""
+    out: list[tuple[str, bool]] = []
+    seen: set[str] = set()
+    for col, hib in components:
+        if col in seen:
+            continue
+        seen.add(col)
+        out.append((col, hib))
+    unknown = [c for c, _ in out if c not in _VOCABULARY]
+    if unknown:
+        raise KeyError(f"metric(s) analytics.metrics.derive() never emits: {unknown}")
+    return out
+
 
 def sector_metrics(sector: str, family: str) -> list[tuple[str, bool]]:
     """The (column, higher_is_better) list one sector uses for one metric family."""
@@ -219,8 +283,8 @@ def _component_percentiles(df: pd.DataFrame, components: list[tuple[str, bool]],
     """
     ranks: dict[str, pd.Series] = {}
     present: dict[str, pd.Series] = {}
-    for col, hib in components:
-        if col not in df.columns or col in ranks:
+    for col, hib in _designed(components):
+        if col not in df.columns:
             continue
         raw = pd.to_numeric(df[col], errors="coerce")
         if col in _MASK_NONPOS:
@@ -244,10 +308,30 @@ def _subscore(df: pd.DataFrame, components: list[tuple[str, bool]],
 
 
 def _family_score(df, components, groups, k, shrink_to, min_components):
-    """-> (subscore, components present per row, components configured per row)."""
+    """-> (subscore, components present per row, components RANKABLE per row).
+
+    The denominator is the columns that carry data for at least one name in this
+    cross-section, not the full designed list. The distinction matters for exactly one
+    metric: `forwardPE` is an analyst estimate the SEC store cannot hold, so it is
+    absent for every name except the ~50 that `fundamentals.enrich()` reaches. Counting
+    it as missing coverage on the other ~1,400 penalises all of them identically — it
+    shifts the whole distribution down (median 0.833 -> 0.778, and 68 more names trip
+    the low-coverage note in the research prompt) while discriminating between none of
+    them. A constant is not a diagnostic.
+
+    Coverage is NOT the defence against a mis-wired metric name; `_check_metric_vocabulary`
+    is, and it raises at import. This value answers a different question: of the inputs
+    obtainable on the path that served this row, how many did this company supply."""
     R, P = _component_percentiles(df, components, groups, k, shrink_to)
     zeros = pd.Series(0.0, index=df.index)
+    _designed(components)          # validate the names even when nothing is rankable
     if R.empty:
+        # Nothing rankable -> a rankable count of ZERO, not the designed count. Returning
+        # the designed count here would contradict the rule the rest of this function
+        # follows and hand the family a non-zero denominator with a zero numerator, so a
+        # sector whose whole family is unavailable would read as 0% covered rather than
+        # dropping out of the ratio. Latent today (every sector has a rankable valuation
+        # column); pinned by test so the two branches cannot drift apart again.
         empty = pd.Series(np.nan if min_components else 0.5, index=df.index)
         return empty, zeros, zeros
     n_present = P.sum(axis=1).astype(float)
@@ -294,8 +378,15 @@ def _blended_family(df: pd.DataFrame, family: str, sectors: pd.Series,
                 cols.append((c, hib))
     R, P = _component_percentiles(df, cols, groups, k, "universe")
     zeros = pd.Series(0.0, index=df.index)
+    # Rankable count for the row's sector: the sector's designed components minus any
+    # that carry no data anywhere in this cross-section (see _family_score's docstring —
+    # forwardPE is the one real case). Consistent with the sector-neutral path.
+    n_cols = pd.Series(0.0, index=df.index)
+    for sec, idx in df.groupby(sectors, sort=False).groups.items():
+        n_cols.loc[idx] = float(sum(
+            1 for c, _ in _designed(sector_metrics(str(sec), family)) if c in R.columns))
     if R.empty:
-        return pd.Series(np.nan if min_components else 0.5, index=df.index), zeros, zeros
+        return pd.Series(np.nan if min_components else 0.5, index=df.index), zeros, n_cols
     use = pd.DataFrame(False, index=df.index, columns=R.columns)
     for sec, idx in df.groupby(sectors, sort=False).groups.items():
         want = [c for c, _ in sector_metrics(str(sec), family) if c in R.columns]
@@ -303,9 +394,12 @@ def _blended_family(df: pd.DataFrame, family: str, sectors: pd.Series,
             use.loc[idx, want] = True
     sub = R.where(use).mean(axis=1)
     n_present = (P & use).sum(axis=1).astype(float)
-    n_cols = use.sum(axis=1).astype(float)
+    # The floor is against the RANKABLE columns, not the designed ones: a name cannot be
+    # asked for a component no name in the universe has, so requiring it would drop
+    # pillars for a data gap rather than for thin data. Coverage is what reports the gap.
+    n_rankable = use.sum(axis=1).astype(float)
     if min_components:
-        sub = sub.where(n_present >= np.minimum(min_components, n_cols))
+        sub = sub.where(n_present >= np.minimum(min_components, n_rankable))
     return sub, n_present, n_cols
 
 
@@ -348,6 +442,11 @@ def fundamental_detail(df: pd.DataFrame, subsectors: dict[str, str],
     if mc:
         pillar = pillar.where(n_ok >= _MIN_FAMILIES)
     denom = (vd + cd + gd + qd).replace(0.0, np.nan)
+    # Share of this name's sector's DESIGNED metric set that had real data. Designed,
+    # not surviving: see `_family_score`. `forwardPE` is the standing example — it is
+    # part of the valuation design, the SEC store cannot supply it, and only `enrich()`
+    # fills it for the ~50 shortlist names, so every SEC-served row is honestly one
+    # valuation input short and now says so.
     coverage = ((vn + cn + gn + qn) / denom).fillna(0.0)
     # The UNSHRUNK within-sector valuation percentile. Scoring uses the shrunk `val`;
     # the risk tags need a plain percentile, because a fixed cut ("the most expensive
