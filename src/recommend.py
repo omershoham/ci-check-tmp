@@ -1,5 +1,11 @@
 """Map a scored/researched board row to a single display recommendation.
 
+Six labels, plus `watch`: a researched, neutral-rated name you do NOT own that has an
+armed candidate trigger or a stated entry level. It exists because `hold` means "you
+own it, keep it", and reusing that word for "good company, wrong price" made the two
+indistinguishable on the board — which is exactly the state where the picker is
+supposed to be telling you to wait for a level.
+
 Priority of evidence:
   1. Claude's explicit `rating` from deep research (most trustworthy).
   2. Else, derive from Claude `conviction` (0-10) if the name was researched.
@@ -32,12 +38,18 @@ BADGE = {
     "strong_buy":  "🟩 Strong Buy",
     "buy":         "🟢 Buy",
     "hold":        "🟡 Hold",
+    "watch":       "👀 Watch",
     "sell":        "🟠 Sell",
     "strong_sell": "🔴 Strong Sell",
     "avoid":       "⬜ Avoid",
     "unrated":     "❔ Unrated",
 }
-WEIGHT = {"strong_buy": 5, "buy": 4, "hold": 3, "avoid": 2, "sell": 1.5,
+# `watch` sits between hold and avoid on purpose. It is NOT a weaker hold: `hold` means
+# "you own this, keep it", so applying it to a name you do not own reads as an
+# instruction to do nothing about a name you have no position in. `watch` means "good
+# company, wrong price — there is an armed level that would change the answer", which
+# is a strictly more actionable state than `avoid` and strictly less than owning it.
+WEIGHT = {"strong_buy": 5, "buy": 4, "hold": 3, "watch": 2.5, "avoid": 2, "sell": 1.5,
           "strong_sell": 1, "unrated": 0, None: 0}
 
 # LEGACY absolute cuts on `blended`. Used ONLY for rows scored before `blended_pct`
@@ -63,10 +75,28 @@ def blended_pct(row: dict[str, Any]) -> float | None:
     return None
 
 
+def is_watch(row: dict[str, Any]) -> bool:
+    """True when a neutral rating on a name you do NOT own has an armed level.
+
+    `candidate_triggers` is the count of active source='candidate' triggers for the
+    symbol (storage.get_board computes it); `entry_level` is a level the report stated
+    outright. Either one means there is a price at which the answer changes, which is
+    the whole difference between "watch" and "avoid".
+    """
+    if row.get("held_position"):
+        return False
+    return bool(row.get("candidate_triggers") or row.get("entry_level"))
+
+
 def recommendation(row: dict[str, Any]) -> tuple[str, str]:
     """Return (label_key, basis) where basis is 'claude' or 'screen'."""
     rating = (row.get("rating") or "").strip().lower()
     if rating in BADGE:
+        # A researched `hold` on a name you do not own is not "keep holding it" — it is
+        # "not at this price". Say so, and only when there is an armed level that would
+        # change the answer, so `watch` stays a claim about something checkable.
+        if rating == "hold" and is_watch(row):
+            return "watch", "claude"
         return rating, "claude"
 
     conv = row.get("conviction")
@@ -76,7 +106,7 @@ def recommendation(row: dict[str, Any]) -> tuple[str, str]:
         if conv >= 6.5:
             return "buy", "claude"
         if conv >= 5:
-            return "hold", "claude"
+            return "watch" if is_watch(row) else "hold", "claude"
         return "sell", "claude"
 
     # Research was ATTEMPTED but produced no rating/conviction (error or parse fail):

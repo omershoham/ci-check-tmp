@@ -17,7 +17,7 @@ from datetime import date, datetime
 
 import pandas as pd
 
-from src import universe
+from src import config, universe
 from src.backtest import signals
 from src.backtest.engine import (BacktestSpec, config_hash, log_trial, n_trials,
                                  run_rank_backtest, trial_hashes)
@@ -52,27 +52,35 @@ def build_signal(name: str, store: HistoryStore, syms: list[str], subs: dict[str
     raise SystemExit(f"unknown signal {name}")
 
 
-def universe_note(store: HistoryStore, eligible: dict, source: str) -> str:
+def universe_note(store: HistoryStore, eligible: dict, source: str,
+                  mask: str | None = None) -> str:
     """The disclosure line printed at the top of every report.
 
     The curated wording is unchanged on purpose: nothing ever LEAVES a hand-written
     config list, so exit counts would be zero by construction and the only honest thing
     to say about it is that it was chosen with hindsight. The broad wording reports the
     membership actually recorded — how many names at each end and how many left — plus
-    the bias that survives even so."""
+    the bias that survives even so.
+
+    `mask` is the tag the eligibility history is keyed by (`broad:1500`). Naming it is
+    the point: broad-250 and broad-1500 are different populations, and a report that
+    said only "broad" could not be reproduced once the cap moved."""
     dates = sorted(eligible)
     first, last = dates[0].date(), dates[-1].date()
+    mask = mask or source
     if source != "broad":
-        return (f"curated list; membership {store.universe_source(first)} at start, "
-                f"{store.universe_source(last)} at end. Absolute returns are "
-                f"upward-biased by hindsight selection — read the RANKING metrics.")
+        return (f"curated list; membership {store.universe_source(first, source=mask)} "
+                f"at start, {store.universe_source(last, source=mask)} at end. Absolute "
+                f"returns are upward-biased by hindsight selection — read the RANKING "
+                f"metrics.")
     ever = set().union(*eligible.values()) if eligible else set()
     m0, m1 = eligible[dates[0]], eligible[dates[-1]]
-    return (f"broad SEC-registrant universe, membership recomputed point-in-time at "
+    return (f"broad SEC-registrant universe (eligibility mask `{mask}`), membership "
+            f"recomputed point-in-time at "
             f"each month-end: {len(m0)} names at {first}, {len(m1)} at {last}, "
             f"{len(ever - m1)} of the {len(ever)} names ever a member had exited by the "
-            f"end. Membership is {store.universe_source(first, source='broad')} at start, "
-            f"{store.universe_source(last, source='broad')} at end. Names delisted "
+            f"end. Membership is {store.universe_source(first, source=mask)} at start, "
+            f"{store.universe_source(last, source=mask)} at end. Names delisted "
             f"before the price store's first download are absent entirely, so residual "
             f"survivorship bias remains — read the RANKING metrics.")
 
@@ -80,6 +88,11 @@ def universe_note(store: HistoryStore, eligible: dict, source: str) -> str:
 def run_one(name: str, store: HistoryStore, start: date, top_frac: float, top_n: int | None,
             cost_bps: float, horizon_days: int | None = None) -> None:
     src = universe.configured_source()
+    # The eligibility mask is keyed by source AND cap, so a report always runs on the
+    # membership recorded for the cap it is configured at. Reading a bare `broad` mask
+    # is what silently ran the first broad-750 backtests on a 250-name eligibility
+    # history in Phase 7.
+    mask = universe.membership_source(src)
     uni = universe.current_universe(store=store)
     syms = [u["symbol"] for u in uni]
     subs = {u["symbol"]: u["subsector"] for u in uni}
@@ -100,7 +113,7 @@ def run_one(name: str, store: HistoryStore, start: date, top_frac: float, top_n:
         from src.data import registrants
         reg = registrants.load_registrants(store)
         subs.update(dict(zip(reg["symbol"], reg["industry_group"])))
-        ever = set().union(*(set(store.universe_asof(d.date(), source=src)) for d in dates))             if dates else set()
+        ever = set().union(*(set(store.universe_asof(d.date(), source=mask)) for d in dates))             if dates else set()
         syms = sorted(set(syms) | ever)
     # Membership is a set question; it used to be answered by pivoting the whole store
     # into a date x symbol matrix and reading `.columns`.
@@ -124,8 +137,8 @@ def run_one(name: str, store: HistoryStore, start: date, top_frac: float, top_n:
     if scores.empty:
         raise SystemExit(f"{name}: signal produced no scores (missing data?)")
     # PIT universe where recorded; otherwise the current curated list (disclosed).
-    eligible = {d: set(store.universe_asof(d.date(), source=src)) for d in scores.index}
-    note = universe_note(store, eligible, src)
+    eligible = {d: set(store.universe_asof(d.date(), source=mask)) for d in scores.index}
+    note = universe_note(store, eligible, src, mask=mask)
     trials_root = store.root
     params = {**spec.params, "top_frac": top_frac, "top_n": top_n, "cost_bps": cost_bps}
     # DISTINCT configurations, not runs. Re-running this exact config (a refactor
@@ -136,7 +149,7 @@ def run_one(name: str, store: HistoryStore, start: date, top_frac: float, top_n:
     # The universe tag carries the SIZE CAP too: broad-250, broad-750 and broad-1500
     # are three different populations, so the same signal on them is three hypotheses,
     # not one re-run. `curated` has no cap and needs none.
-    uni_tag = (f"broad:{universe.broad_cfg('max_symbols')}" if src == "broad" else src)
+    uni_tag = mask   # same tag the eligibility mask is keyed by: one name for one population
     n_prior = n_trials(trials_root)
     this_hash = config_hash(name, params, uni_tag)
     n_this = n_prior + (0 if this_hash in trial_hashes(trials_root) else 1)
@@ -159,10 +172,24 @@ def main() -> None:
     ap.add_argument("--top-frac", type=float, default=0.10)
     ap.add_argument("--top-n", type=int, default=None)
     ap.add_argument("--cost-bps", type=float, default=15.0)
+    # Comparing two universes must not mean editing the shipped config.yaml and
+    # editing it back: an interrupted comparison used to leave the file describing a
+    # universe nobody chose. These override the config FOR THIS PROCESS ONLY.
+    ap.add_argument("--universe", choices=["curated", "broad"], default=None,
+                    help="override universe.source for this run only")
+    ap.add_argument("--theme", default=None,
+                    help="override the theme pack for this run only (e.g. ai_infra). "
+                         "A curated universe needs the pack that owns its ticker list.")
     ap.add_argument("--horizon-days", type=int, default=None,
                     help="rebalance AND label horizon in trading days (e.g. 10 swing, "
                          "42 position, 126 long). Omit for the default month-end grid.")
     args = ap.parse_args()
+    if args.universe:
+        config.set_override("universe.source", args.universe)
+    if args.theme:
+        config.set_override("theme", args.theme)
+    if args.universe or args.theme:
+        _log(f"config overrides (this process only): {config.overrides()}")
     if args.horizon_days is not None and args.horizon_days < 1:
         ap.error("--horizon-days must be >= 1")
     store = HistoryStore()

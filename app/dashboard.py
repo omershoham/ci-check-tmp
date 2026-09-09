@@ -28,8 +28,8 @@ try:
 except Exception:  # noqa: BLE001
     st_autorefresh = None
 
-from src import (charts, config, health, news, recommend, regime, storage, technical,  # noqa: E402
-                 theme)
+from src import (charts, config, health, news, recommend, regime, risk, storage,  # noqa: E402
+                 technical, theme)
 from src.local_llm import CATALYST_KEYS  # noqa: E402
 from src.universe import SUBSECTOR_LABELS  # noqa: E402
 
@@ -346,6 +346,25 @@ def load_active_triggers_by_symbol() -> dict:
     return out
 
 
+def trigger_bits(symbol: str, price_now: float | None = None) -> list[str]:
+    """One rendering of a symbol's armed/tripped triggers, shared by the board's
+    Details pane and the portfolio positions — the two places that ask the same
+    question ("what is being watched on this name, and did it fire?")."""
+    bits = []
+    for t in [t for t in load_fired_triggers() if t["symbol"] == symbol]:
+        bits.append(f"🚨 **TRIPPED:** {t.get('trigger_detail','')}")
+    for t in load_active_triggers_by_symbol().get(symbol, []):
+        if t["kind"] == "price_below" and t.get("threshold"):
+            dist = (f", {abs(t['threshold'] / price_now - 1) * 100:.0f}% below now"
+                    if price_now else "")
+            bits.append(f"🔻 price under **${t['threshold']:g}**{dist}")
+        elif t["kind"] == "price_above" and t.get("threshold"):
+            bits.append(f"🔺 price over **${t['threshold']:g}**")
+        elif t["kind"] == "news_keyword" and t.get("keyword"):
+            bits.append(f"📰 news says *“{t['keyword']}”*")
+    return bits
+
+
 @st.cache_data(ttl=3600)
 def load_calibration(clock: str = "fixed"):
     from src import performance
@@ -657,7 +676,8 @@ run_id = run_labels[sel]
 watch = storage.get_watch()
 
 rec_filter = st.sidebar.multiselect(
-    "Filter by recommendation", ["strong_buy", "buy", "hold", "sell", "strong_sell", "avoid"],
+    "Filter by recommendation",
+    ["strong_buy", "buy", "hold", "watch", "sell", "strong_sell", "avoid"],
     format_func=lambda k: recommend.BADGE.get(k, k))
 tag_filter = st.sidebar.multiselect(
     "Filter by tag",
@@ -833,7 +853,11 @@ with tab_board:
             "rec#": recommend.WEIGHT.get(_lab, 0),  # numeric so the column SORTS by strength
             "symbol": r["symbol"] + (" ⭐" if watch.get(r["symbol"]) == "pinned" else "")
                       + (" 📌" if r.get("held_position") else "")
-                      + (" 🔬" if r.get("conviction") is not None else ""),
+                      + (" 🔬" if r.get("conviction") is not None else "")
+                      # A trigger that fired in the last 7 days is the single most
+                      # actionable fact on the row, so it travels WITH the ticker
+                      # rather than in a column that can be sorted away.
+                      + (" 🚨" if r.get("fired_triggers") else ""),
             "name": (r.get("name") or "")[:26],
             "sub": SUBSECTOR_LABELS.get(r.get("subsector"), r.get("subsector")),
             "setup": SETUP_EMOJI.get((m.get("setup") or ""), ""),
@@ -842,6 +866,10 @@ with tab_board:
             "📊": m.get("pillar_technical"), "💰": m.get("pillar_fundamental"), "📰": m.get("pillar_sentiment"),
             "RS 3m": m.get("rs_3m"),
             "⚡ catalyst": catalyst_str(r),
+            "fresh": r.get("catalyst_freshness_days"),
+            "Δrank": (r["rank_prev"] - r["rank"]
+                      if r.get("rank_prev") and r.get("rank") else None),
+            "fit": risk.candidate_fit_badge(m.get("book_fit")),
             "conv": r.get("conviction"), "quote": r.get("quote_last"),
             "tags": tag_str(r.get("tags")),
         })
@@ -869,6 +897,21 @@ with tab_board:
                 "⚡ catalyst", width="small",
                 help="Strongest catalyst keys from this run's headline scan (0–10). "
                      "Dark: not in the ranking score."),
+            "fresh": st.column_config.NumberColumn(
+                "fresh", format="%.0fd", width="small",
+                help="Days since the NEWEST headline this run scanned for the name — "
+                     "an upper bound on how fresh the catalyst scores are, so a stale "
+                     "8/10 decays out of view instead of sitting at the top forever."),
+            "Δrank": st.column_config.NumberColumn(
+                "Δrank", format="%+.0f", width="small",
+                help="Places gained since the previous run of this universe "
+                     "(positive = moved up). Blank = new entrant, or no comparable "
+                     "previous run."),
+            "fit": st.column_config.TextColumn(
+                "fit", width="small",
+                help="Book fit: correlation to your closest existing position, and what "
+                     "the sector's weight becomes if you buy it at the default size. "
+                     "⚠ = above policy.max_sector_weight. Finalists only."),
             "horizon": st.column_config.TextColumn(
                 "horizon", width="small",
                 help="swing / position / long — the clock this idea claimed, and the "
@@ -921,7 +964,21 @@ with tab_board:
                 p3.caption(m.get("sentiment_label") or "—")
                 _cat = catalyst_str(r, top=9)
                 if _cat:
-                    st.markdown(f"**⚡ Catalysts (local LLM, 0–10):** {_cat}")
+                    _fresh = r.get("catalyst_freshness_days")
+                    st.markdown(f"**⚡ Catalysts (local LLM, 0–10):** {_cat}"
+                                + (f"  ·  newest headline scanned {_fresh:.0f}d ago"
+                                   if _fresh is not None else ""))
+                # What is armed on this name, and what already fired. A `watch` label is
+                # a claim about a LEVEL, so the level has to be visible next to it.
+                _tb = trigger_bits(pick, r.get("quote_last") or (m.get("price")))
+                if _tb:
+                    st.markdown("**🤖 Watched every run:** " + " · ".join(_tb))
+                _fit_line = risk.candidate_fit_line(m.get("book_fit"))
+                if _fit_line:
+                    st.markdown(f"**🧩 {_fit_line}**")
+                if r.get("rank_prev"):
+                    st.caption(f"Rank {r['rank_prev']} → {r['rank']} "
+                               f"({r['rank_prev'] - r['rank']:+d} vs the previous run)")
                 if m.get("setup_label"):
                     st.markdown(f"**{SETUP_EMOJI.get(m.get('setup'),'')} Setup:** {m['setup_label']}"
                                 + (f" — {' · '.join(m.get('signals') or [])}" if m.get("signals") else ""))
@@ -1189,7 +1246,7 @@ with tab_port:
             st.plotly_chart(afig, width="stretch",
                             config={"scrollZoom": False, "displayModeBar": False})
             top = max(by_sub.values()) / total_mv if total_mv else 0
-            _max_sub = config.get("policy.max_subsector_weight", 40) / 100
+            _max_sub = risk.max_sector_weight() / 100
             if top > _max_sub:
                 st.warning(f"⚠️ Concentration: one sub-sector is {top*100:.0f}% of your "
                            f"portfolio (policy limit: {_max_sub*100:.0f}%).")
@@ -1378,22 +1435,8 @@ with tab_port:
                             st.markdown(f"- {md(_part.strip().rstrip('.'))}")
                 else:
                     st.caption("— none recorded")
-                _sym_trigs = load_active_triggers_by_symbol().get(p["symbol"], [])
-                _sym_fired = [t for t in load_fired_triggers() if t["symbol"] == p["symbol"]]
-                if _sym_trigs or _sym_fired:
-                    _px_now = quote_map.get(p["symbol"]) or p.get("last")
-                    _bits = []
-                    for t in _sym_fired:
-                        _bits.append(f"🚨 **TRIPPED:** {t.get('trigger_detail','')}")
-                    for t in _sym_trigs:
-                        if t["kind"] == "price_below" and t.get("threshold"):
-                            _dist = (f", {abs(t['threshold']/_px_now-1)*100:.0f}% below now"
-                                     if _px_now else "")
-                            _bits.append(f"🔻 price under **${t['threshold']:g}**{_dist}")
-                        elif t["kind"] == "price_above" and t.get("threshold"):
-                            _bits.append(f"🔺 price over **${t['threshold']:g}**")
-                        elif t["kind"] == "news_keyword" and t.get("keyword"):
-                            _bits.append(f"📰 news says *“{t['keyword']}”*")
+                _bits = trigger_bits(p["symbol"], quote_map.get(p["symbol"]) or p.get("last"))
+                if _bits:
                     st.caption("🤖 Watched automatically every run: " + " · ".join(_bits))
                 if p.get("risks_json"):
                     st.markdown("**Risks:** " + md("; ".join(p["risks_json"])))
@@ -1434,7 +1477,56 @@ with tab_port:
 
 # ================================================================ WHAT CHANGED TAB
 with tab_chg:
-    st.subheader("🔄 What changed vs the previous deep run")
+    st.subheader("🔄 What changed")
+    # WHY NOW. A quality screen surfaces the same names every day; without a reason to
+    # act TODAY the board goes stale and stops being read. These four lists are
+    # DISPLAY AND DIFFING ONLY — no score, weight or threshold is involved, so nothing
+    # here needs re-validating against a backtest.
+    _why_sort = st.radio(
+        "Rank by change", ["New entrants", "Rank jumps", "Rating upgrades",
+                           "Fresh catalysts"],
+        horizontal=True, key="whynow_sort",
+        help="Persisted per run: rank_prev is the row's rank in the previous run of the "
+             "same universe, catalyst freshness is days since the newest headline "
+             "scanned for it.")
+    _rows = sorted(board, key=lambda r: r.get("rank") or 10**6)
+    if _why_sort == "New entrants":
+        _rows = [r for r in _rows if r.get("rank_prev") is None]
+        _empty = "Every name on this board was on the previous one too."
+    elif _why_sort == "Rank jumps":
+        _rows = sorted([r for r in board if r.get("rank_prev") and r.get("rank")],
+                       key=lambda r: -(r["rank_prev"] - r["rank"]))
+        _empty = "No comparable previous run — rank deltas start at the next run."
+    elif _why_sort == "Rating upgrades":
+        _rows = sorted([r for r in board if r.get("conviction") is not None],
+                       key=recommend.sort_key, reverse=True)
+        _empty = "Nothing on this board was deep-researched."
+    else:
+        # Freshest FIRST, and only names whose catalyst vector actually fired: a 0/10
+        # everywhere name has no catalyst whose age could mean anything.
+        _rows = [r for r in board
+                 if r.get("catalyst_freshness_days") is not None and catalyst_str(r)]
+        _rows.sort(key=lambda r: r["catalyst_freshness_days"])
+        _empty = "No scanned name carries a non-zero catalyst key."
+    if _rows:
+        st.dataframe(pd.DataFrame([{
+            "symbol": r["symbol"] + (" 🚨" if r.get("fired_triggers") else ""),
+            "recommendation": recommend.badge(r),
+            "rank": r.get("rank"), "prev": r.get("rank_prev"),
+            "Δrank": (r["rank_prev"] - r["rank"]
+                      if r.get("rank_prev") and r.get("rank") else None),
+            "composite": r.get("blended"),
+            "⚡ catalyst": catalyst_str(r),
+            "fresh (d)": r.get("catalyst_freshness_days"),
+        } for r in _rows[:40]]), width="stretch", hide_index=True,
+            column_config={"Δrank": st.column_config.NumberColumn("Δrank", format="%+.0f"),
+                           "fresh (d)": st.column_config.NumberColumn(
+                               "fresh (d)", format="%.0f")})
+    else:
+        st.caption(_empty)
+
+    st.divider()
+    st.subheader("Run-vs-run diff (previous deep run)")
     deep_runs = [r for r in runs if r["mode"] == "deep" and r["status"] == "ok"]
     if len(deep_runs) < 2:
         st.info("Need at least two completed deep runs to compare.")

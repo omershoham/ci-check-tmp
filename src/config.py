@@ -73,8 +73,32 @@ def load_config() -> dict[str, Any]:
     return cfg
 
 
+# PROCESS-LOCAL overrides, set by a CLI flag (`--universe`, `--theme`) and never
+# written to disk. The failure this prevents: comparing two universes used to mean
+# editing the shipped config.yaml, running, and editing it back — so an interrupted
+# comparison left the file describing a universe nobody chose, and every later run
+# silently scored the wrong one. An override lives and dies with the process.
+# Matching is on the EXACT dotted path (`universe.source`, not `universe`), so an
+# override can never partially shadow a whole config section.
+_OVERRIDES: dict[str, Any] = {}
+
+
+def set_override(path: str, value: Any) -> None:
+    _OVERRIDES[path] = value
+
+
+def clear_overrides() -> None:
+    _OVERRIDES.clear()
+
+
+def overrides() -> dict[str, Any]:
+    return dict(_OVERRIDES)
+
+
 def get(path: str, default: Any = None) -> Any:
     """Dotted-path accessor, e.g. get('scoring.weights.deal')."""
+    if path in _OVERRIDES:
+        return _OVERRIDES[path]
     cur: Any = load_config()
     for part in path.split("."):
         if isinstance(cur, dict) and part in cur:

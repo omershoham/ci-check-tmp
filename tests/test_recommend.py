@@ -122,3 +122,31 @@ def test_sort_key_breaks_label_ties_by_percentile_without_crossing_labels():
     # Within one label it does order by percentile.
     assert (recommend.sort_key({"blended_pct": 0.99})
             > recommend.sort_key({"blended_pct": 0.91}))
+
+
+def test_watch_is_a_researched_hold_you_do_not_own_with_an_armed_level():
+    """`hold` means "you own it, keep it". Reusing it for "good company, wrong price"
+    made the two indistinguishable exactly where the picker should say "wait for X"."""
+    assert recommend.recommendation({"rating": "hold", "candidate_triggers": 2}) == \
+        ("watch", "claude")
+    assert recommend.recommendation({"rating": "hold", "entry_level": 88.0})[0] == "watch"
+    # You own it -> it stays a hold, whatever is armed.
+    assert recommend.recommendation(
+        {"rating": "hold", "candidate_triggers": 2, "held_position": 10})[0] == "hold"
+    # Nothing armed -> no claim about a level, so no watch.
+    assert recommend.recommendation({"rating": "hold"})[0] == "hold"
+    # Conviction-derived neutral ratings go the same way.
+    assert recommend.recommendation({"conviction": 5, "candidate_triggers": 1})[0] == "watch"
+    # A screen-only row is never a watch: nothing researched it, nothing armed a level.
+    assert recommend.recommendation({"blended_pct": 0.75})[0] == "hold"
+
+
+def test_watch_sorts_between_hold_and_avoid():
+    assert (recommend.WEIGHT["avoid"] < recommend.WEIGHT["watch"]
+            < recommend.WEIGHT["hold"])
+    # The tie-break must still not let a `watch` cross a `hold` or an `avoid` a `watch`.
+    best_avoid = recommend.sort_key({"blended_pct": 0.599})   # just under the hold cut
+    worst_watch = recommend.sort_key({"rating": "hold", "candidate_triggers": 1,
+                                      "blended_pct": 0.0})
+    assert best_avoid < worst_watch
+    assert recommend.BADGE["watch"].endswith("Watch")

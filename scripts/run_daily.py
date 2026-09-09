@@ -42,7 +42,19 @@ def main() -> None:
     ap.add_argument("--mode", choices=["deep", "light"], default="deep")
     ap.add_argument("--force", action="store_true",
                     help="run even if the US market is closed today (weekend/holiday)")
+    # Process-local config overrides, so comparing universes never means editing (and
+    # forgetting to un-edit) the shipped config.yaml.
+    ap.add_argument("--universe", choices=["curated", "broad"], default=None,
+                    help="override universe.source for this run only")
+    ap.add_argument("--theme", default=None,
+                    help="override the theme pack for this run only (e.g. ai_infra)")
     args = ap.parse_args()
+    if args.universe:
+        config.set_override("universe.source", args.universe)
+    if args.theme:
+        config.set_override("theme", args.theme)
+    if args.universe or args.theme:
+        print(f"[run_daily] config overrides (this process only): {config.overrides()}")
     if (config.get("schedule.skip_when_market_closed", True) and not args.force
             and not market_calendar.is_trading_day()):
         print(f"[run_daily] US market closed today ({market_calendar.reason_closed()}); "

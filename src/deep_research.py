@@ -825,6 +825,17 @@ def build_context(score_row: dict, signal_row: dict | None,
         "Weigh all three pillars (technical setup, fundamentals/valuation, news sentiment) "
         "in your rating; flag when they disagree.",
     ]
+    # How the name fits the book that already exists. This is a CONTEXT line, not a
+    # contract change: the prompt template, its required keys and PROMPT_VERSION (6)
+    # are untouched, so reports before and after remain the same measurement and
+    # nothing in calibration partitions on it. Without it a diversified-looking screen
+    # quietly rebuilds the concentration the owner started with — the fifth
+    # semiconductor idea reads exactly like the first.
+    from . import risk  # local: keeps numpy/pandas/yfinance off deep_research's import path
+    fit_line = risk.candidate_fit_line(m.get("book_fit") or score_row.get("book_fit"))
+    if fit_line:
+        lines.append(fit_line + " Say explicitly whether the overlap changes your rating "
+                                "or your suggested size.")
     if signal_row:
         # The 9-key vector, non-zero keys only. Listing the zeros would bury the two
         # keys that fired under seven that say "nothing happened".

@@ -78,7 +78,13 @@ policy:
   conviction_weight_caps:        # conviction -> max % weight (binding sizing rules)
     3: 10                        # conviction <=3 -> max 10% weight
     5: 15                        # conviction 4-5 -> max 15% weight
-  max_subsector_weight: 40       # % of portfolio in a single sub-sector before it's flagged
+  # % of portfolio in one GICS-like SECTOR before it's flagged. The concentration a
+  # stock picker actually accumulates is sectoral (six software names in three
+  # different "sub-sectors" are one bet), and on the broad universe `subsector` carries
+  # a ~28-way SIC industry group, which is too fine to bind. `max_subsector_weight` is
+  # still honoured as an alias so an existing user config keeps working.
+  max_sector_weight: 40
+  max_subsector_weight: 40       # DEPRECATED alias of max_sector_weight
   min_ballast_weight: 10         # % target of non-AI-theme ballast the synthesis should aim for
   risk_per_position_pct: 1.0     # % of portfolio value risked per new position (sizing hint)
   vol_target_pct: 12             # realized book vol above this -> PM scales gross exposure down (never up)
@@ -210,6 +216,12 @@ ibkr:
   port: 4001                     # IB Gateway live=4001 (via IBC); TWS live=7496, paper=7497
   client_id: 17
   connect_timeout: 8
+  # HARD wall-clock for a whole broker call (connect + handshake + positions + quotes).
+  # connect_timeout only bounds one connect attempt and ib_async can sit inside the
+  # handshake forever when the Gateway's port is open but its session has lapsed (the
+  # nightly-restart / 2FA state). That hung two Phase 7 runs with no health record
+  # written at all. On expiry the run records `broker degraded` and continues.
+  total_timeout: 45
   positions_wait: 3.0            # minimum wait (s) for per-account position bursts
   positions_quiet: 3.0           # stop once no new position rows arrive for this long
   positions_max_wait: 25.0       # hard cap; a cold Gateway can take ~8s to send the first row

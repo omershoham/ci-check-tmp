@@ -70,6 +70,25 @@ def broad_cfg(key: str) -> Any:
     return cfg.get(key, _BROAD_DEFAULTS.get(key))
 
 
+def membership_source(source: str | None = None, max_symbols: int | None = None) -> str:
+    """The tag recorded point-in-time membership is keyed by: `curated`, or
+    `broad:<cap>`.
+
+    The failure this prevents, observed at Phase 7: `record_universe(source="broad")`
+    keyed the eligibility mask by SOURCE only, so raising `max_symbols` 250 -> 1500
+    OVERWROTE the broad-250 membership history and the reports built on it stopped
+    being reproducible. Top-250-by-ADV and top-1500-by-ADV are two different
+    populations; a mask that cannot tell them apart cannot reproduce either. Carrying
+    the cap in the tag lets both histories coexist, and every report names the mask it
+    actually ran on. `curated` has no cap and needs none.
+    """
+    src = (source or configured_source()).lower()
+    if src != "broad":
+        return src
+    cap = int(max_symbols if max_symbols is not None else (broad_cfg("max_symbols") or 0))
+    return f"broad:{cap}" if cap > 0 else "broad"
+
+
 def _curated() -> list[dict[str, str]]:
     """Return [{symbol, subsector}] deduped, first sub-sector wins on overlap.
 

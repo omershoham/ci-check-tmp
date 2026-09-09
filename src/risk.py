@@ -170,6 +170,177 @@ def portfolio_risk(weights: dict[str, float], shock_pct: float = -20.0) -> dict[
     }
 
 
+def max_sector_weight() -> float:
+    """The concentration cap, in percent. `policy.max_sector_weight` with the older
+    `policy.max_subsector_weight` honoured as an alias so an existing user config
+    keeps binding instead of silently falling back to the built-in default."""
+    v = config.get("policy.max_sector_weight")
+    if v is None:
+        v = config.get("policy.max_subsector_weight", 40)
+    return float(v or 0)
+
+
+def default_add_size_pct(atr_pct: float | None = None) -> float:
+    """The weight a NEW position would be opened at, in percent of the book.
+
+    Stated assumption, because there is no such thing as a size-free "what if I buy
+    it": the owner's own two policy knobs. `policy.risk_per_position_pct` risked to a
+    2-ATR stop gives weight = risk% / (2 * ATR%); the LOWEST conviction cap in
+    `policy.conviction_weight_caps` bounds it, because an unresearched candidate has
+    no conviction yet and must not be sized as though it did. With no ATR the cap
+    alone is the answer.
+    """
+    caps = config.get("policy.conviction_weight_caps", {3: 10, 5: 15}) or {}
+    try:
+        cap = min(float(v) for v in caps.values())
+    except (TypeError, ValueError):
+        cap = float(config.get("policy.max_position_weight", 20) or 20)
+    if atr_pct and atr_pct > 0:
+        # atr_pct is a FRACTION of price (technical.py's convention), so the 2-ATR stop
+        # is a 2*atr_pct move and the position that risks risk_pct of the book to it is
+        # risk_pct / (2*atr_pct) percent of the book.
+        risk_pct = float(config.get("policy.risk_per_position_pct", 1.0) or 0)
+        if risk_pct > 0:
+            return round(min(cap, risk_pct / (2.0 * float(atr_pct))), 1)
+    return round(cap, 1)
+
+
+def _fit_from_returns(symbol: str, rets: pd.DataFrame | None,
+                      weights: dict[str, float], sectors: dict[str, str] | None,
+                      size_pct: float) -> dict[str, Any]:
+    """The correlation half of candidate_fit, given a returns frame already downloaded."""
+    out: dict[str, Any] = {"symbol": symbol, "size_pct": size_pct}
+    held = [s for s, w in weights.items() if w and w > 0 and s != symbol]
+    if rets is None or symbol not in rets.columns:
+        return out
+    have = [s for s in held if s in rets.columns and rets[s].notna().sum() >= 40]
+    if not have or rets[symbol].notna().sum() < 40:
+        return out
+    r = rets[[symbol] + have].dropna()
+    if len(r) < 40:
+        return out
+    cm = r.corr()
+    w = np.array([weights[s] for s in have], dtype=float)
+    w = w / w.sum()
+    row = np.array([float(cm.loc[symbol, s]) for s in have])
+    # Same definition portfolio_risk uses for a HOLDING's marginal_corr — a
+    # weight-averaged correlation to the rest of the book — so a candidate's number is
+    # comparable to the ones already on the portfolio page instead of being a second,
+    # subtly different statistic with the same name.
+    out["marginal_corr"] = round(float((row * w).sum()), 2)
+    j = int(np.argmax(row))
+    out["closest"] = have[j]
+    out["closest_corr"] = round(float(row[j]), 2)
+    out["lookback_days"] = int(len(r))
+    return out
+
+
+def candidate_fits(symbols: list[str], weights: dict[str, float],
+                   sectors: dict[str, str] | None = None,
+                   sizes: dict[str, float] | None = None) -> dict[str, dict[str, Any]]:
+    """Book fit for several prospective adds at once — ONE price download for all.
+
+    `weights` is symbol -> % of the current book (the same shape portfolio_risk takes).
+    Per candidate: its marginal correlation to the book, its closest existing position,
+    and what buying it at `sizes[symbol]` (default: default_add_size_pct) would do to
+    its sector's weight against `policy.max_sector_weight`.
+
+    Why this exists: `portfolio_risk.marginal_corr` answers the question only for names
+    you ALREADY hold, so a screen that looks diversified can quietly rebuild the
+    concentration you started with — the fifth semiconductor idea is scored exactly
+    like the first. Batched because one yfinance download for 10 candidates plus the
+    book is one network round trip; ten separate candidate_fit calls are ten.
+    """
+    syms = [s for s in dict.fromkeys(symbols) if s]
+    held = [s for s, w in (weights or {}).items() if w and w > 0]
+    sectors = sectors or {}
+    cap = max_sector_weight()
+    sector_now: dict[str, float] = {}
+    for s in held:
+        sector_now[sectors.get(s) or "Unknown"] = (
+            sector_now.get(sectors.get(s) or "Unknown", 0.0) + float(weights[s]))
+    rets = _returns(list(dict.fromkeys(syms + held))) if (syms and held) else None
+    out: dict[str, dict[str, Any]] = {}
+    for s in syms:
+        size = float((sizes or {}).get(s) or default_add_size_pct())
+        fit = _fit_from_returns(s, rets, weights or {}, sectors, size)
+        sec = sectors.get(s) or "Unknown"
+        # The book is rescaled by the new position: existing weights are diluted to
+        # (100 - size)% of themselves. Adding `size` to the sector total without that
+        # dilution overstates the resulting weight for every large add.
+        now = float(sector_now.get(sec, 0.0))
+        scale = (100.0 - size) / 100.0 if 0 <= size < 100 else 1.0
+        after = now * scale + size
+        fit.update({
+            "sector": sec,
+            "sector_positions": sum(1 for s2 in held if (sectors.get(s2) or "Unknown") == sec),
+            "sector_weight_pct": round(now, 1),
+            "sector_weight_after_pct": round(after, 1),
+            "max_sector_weight_pct": cap or None,
+            "over_cap": bool(cap and after > cap),
+        })
+        out[s] = fit
+    return out
+
+
+def candidate_fit(symbol: str, weights: dict[str, float],
+                  sectors: dict[str, str] | None = None,
+                  size_pct: float | None = None) -> dict[str, Any]:
+    """Book fit for ONE prospective add. See candidate_fits."""
+    sizes = {symbol: size_pct} if size_pct is not None else None
+    return candidate_fits([symbol], weights, sectors, sizes).get(symbol, {"symbol": symbol})
+
+
+def candidate_fit_line(fit: dict[str, Any] | None) -> str:
+    """One prompt/board-ready sentence, or '' when there is nothing measured to say."""
+    if not fit:
+        return ""
+    parts = []
+    n = fit.get("sector_positions")
+    sec = fit.get("sector")
+    if sec and n is not None:
+        parts.append(f"would be your {_ordinal(int(n) + 1)} {sec} position")
+    if fit.get("closest") and fit.get("marginal_corr") is not None:
+        parts.append(f"corr {fit['marginal_corr']:.2f} to the book, "
+                     f"{fit['closest_corr']:.2f} with {fit['closest']}")
+    if fit.get("sector_weight_after_pct") is not None and fit.get("sector") :
+        cap = fit.get("max_sector_weight_pct")
+        tail = ""
+        if cap:
+            tail = (f", ABOVE the {cap:g}% cap" if fit.get("over_cap")
+                    else f", under the {cap:g}% cap")
+        parts.append(f"sector weight {fit.get('sector_weight_pct'):g}% -> "
+                     f"{fit['sector_weight_after_pct']:g}% at a "
+                     f"{fit.get('size_pct'):g}% add{tail}")
+    if not parts:
+        return ""
+    return "Book fit: " + "; ".join(parts) + "."
+
+
+def candidate_fit_badge(fit: dict[str, Any] | None) -> str:
+    """The compact board-column form: `0.81↔NVDA · IT 41%`."""
+    if not fit:
+        return ""
+    bits = []
+    if fit.get("closest") and fit.get("closest_corr") is not None:
+        bits.append(f"{fit['closest_corr']:.2f}↔{fit['closest']}")
+    sec, after = fit.get("sector"), fit.get("sector_weight_after_pct")
+    if sec and after is not None:
+        bits.append(f"{_sector_abbr(sec)} {after:.0f}%"
+                    + ("⚠" if fit.get("over_cap") else ""))
+    return " · ".join(bits)
+
+
+def _ordinal(n: int) -> str:
+    return f"{n}{'th' if 11 <= n % 100 <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
+def _sector_abbr(sector: str) -> str:
+    """Initials of a GICS-like sector name, so a board column stays a column."""
+    words = [w for w in str(sector).replace("-", " ").split() if w[:1].isalpha()]
+    return "".join(w[0].upper() for w in words)[:3] or "?"
+
+
 def risk_context_lines(rm: dict[str, Any]) -> str:
     """Render risk metrics as prompt-ready lines for the synthesis stage."""
     if not rm:

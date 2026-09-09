@@ -9,14 +9,58 @@ from __future__ import annotations
 import argparse
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
+from datetime import date, datetime, timezone
 
 from . import (config, deep_research, fundamentals, health, ibkr, learning, local_llm,
-               news, regime, scoring, storage, technical, triggers, universe)
+               news, regime, risk, scoring, storage, technical, triggers, universe)
 
 
 def _log(msg: str) -> None:
     print(f"[pipeline] {msg}", flush=True)
+
+
+def _freshness_days(items: list[dict]) -> float | None:
+    """Days since the NEWEST headline in the set the catalyst vector was scored on.
+
+    THE HONEST PROXY, stated so nobody mistakes it for more than it is: the local LLM
+    returns one score per catalyst key for the whole batch of headlines and no
+    per-key attribution, so "days since the newest headline behind the top-scoring
+    key" is not computable from what is stored. What IS knowable is the age of the
+    freshest item the model actually read — which is an upper bound on the freshness
+    of every key it scored, and enough to let a six-week-old 8/10 decay out of view.
+    Returns None when nothing was scanned or no item carried a parseable date.
+    """
+    if not items:
+        return None
+    newest = max((news._published_dt(it) for it in items), default=None)
+    if newest is None or newest.year <= 1970:
+        return None
+    return round((datetime.now(timezone.utc) - newest).total_seconds() / 86400.0, 2)
+
+
+def _holdings_weights(holdings: list[dict], metrics: dict[str, dict]) -> dict[str, float]:
+    """symbol -> % of the book by market value, for the book-fit calculation.
+
+    Priced off the screen's own price first, the last stored quote second, and average
+    cost only as a last resort — cost basis is a weight from whenever you bought, not a
+    weight today, so it is a fallback and never a preference.
+    """
+    quotes = storage.quote_map()
+    vals: dict[str, float] = {}
+    for h in holdings or []:
+        sym = h.get("symbol")
+        pos = h.get("position")
+        if not sym or not pos:
+            continue
+        px = ((metrics.get(sym) or {}).get("price") or quotes.get(sym)
+              or h.get("market_price") or h.get("avg_cost"))
+        if not px:
+            continue
+        vals[sym] = abs(float(pos) * float(px))
+    total = sum(vals.values())
+    if not total:
+        return {}
+    return {s: round(v / total * 100.0, 2) for s, v in vals.items()}
 
 
 def _gather_signals(shortlist: list[dict]) -> tuple[dict[str, dict], dict[str, list], bool]:
@@ -51,6 +95,7 @@ def _gather_signals(shortlist: list[dict]) -> tuple[dict[str, dict], dict[str, l
         sig["headlines"] = [
             f"[{news._published_dt(it).strftime('%Y-%m-%d')}] {it.get('title','')}"
             for it in items[:10]]
+        sig["catalyst_freshness_days"] = _freshness_days(items)
         signals[sym] = sig
         if sig.get("error"):
             n_err += 1
@@ -143,7 +188,11 @@ def run(mode: str = "deep") -> int:
     swept = config.sweep_cache(max_age_days=7)
     if swept:
         _log(f"cache sweep: removed {swept} stale files")
-    run_id = storage.create_run(mode)
+    # Record the source THIS RUN will actually score, not whatever config says at the
+    # moment the row is inserted: a `--universe` override (or a test that pins the
+    # source) would otherwise stamp the run with a universe it never used, and
+    # `previous_ranks` — which groups on this column — would find no comparable run.
+    run_id = storage.create_run(mode, universe.configured_source())
     # Health is recorded per stage as we go; status=ok alone proved worthless
     # (5 weeks of 'ok' runs with no portfolio in them — see src/health.py).
     hz = health.RunHealth()
@@ -181,8 +230,12 @@ def run(mode: str = "deep") -> int:
             hz.ok("universe", f"{len(syms)} curated tickers")
         # Record today's membership so future backtests know what was in the universe
         # on this date instead of reconstructing it with hindsight (survivorship guard).
+        # Tagged with the CAP (`broad:1500`), not just the source: raising max_symbols
+        # used to overwrite the smaller cap's membership history and silently destroy
+        # the reproducibility of every report built on it (Phase 7).
+        mask_src = universe.membership_source(src)
         try:
-            store.record_universe(date.today(), uni, source=src)
+            store.record_universe(date.today(), uni, source=mask_src)
         except Exception as exc:  # noqa: BLE001
             _log(f"universe snapshot not recorded: {exc}")
 
@@ -345,7 +398,6 @@ def run(mode: str = "deep") -> int:
                 board = scoring.score_universe(metrics, subs, signals=signals, technicals=techs,
                                                ml_scores=ml_scores, sectors=secs)
 
-        storage.upsert_screen_scores(run_id, board)
         storage.upsert_signals(run_id, [
             {"symbol": s, **v} for s, v in signals.items()
         ])
@@ -363,6 +415,48 @@ def run(mode: str = "deep") -> int:
              f"{[r['symbol'] for r in top_finalists]} — {fmix}")
         hz.ok("finalists", f"{len(top_finalists)} chosen, cap "
                            f"{sector_cap or 'none'}/sector — {fmix}")
+
+        # WHY NOW (8b): each row's rank in the previous run of the SAME universe.
+        # One query, written with the row, because the delta is what makes a board
+        # worth re-reading — a quality screen surfaces the same names every day.
+        prev_ranks = storage.previous_ranks(run_id, universe_source=src)
+        for r in board:
+            r["rank_prev"] = prev_ranks.get(r["symbol"])
+        _log(f"rank deltas vs the previous {src} run: "
+             f"{sum(1 for r in board if r.get('rank_prev') is None)} new entrants "
+             f"of {len(board)}")
+
+        # BOOK FIT (8c): what the finalists would do to the book you already hold.
+        # Held names come from the early broker fetch, or the last stored snapshot when
+        # the Gateway is down. One batched price download for the whole cohort.
+        held_rows = hold_early.get("holdings") or storage.stored_holdings()
+        weights = _holdings_weights(held_rows, metrics)
+        if weights and top_finalists:
+            try:
+                # A held name that has dropped OUT of the scored universe is absent from
+                # `secs`, and an unmapped holding would silently park its weight in
+                # "Unknown" — understating exactly the sector concentration this is for.
+                fit_secs = dict(secs)
+                off_uni = [s for s in weights if not fit_secs.get(s)]
+                if off_uni:
+                    fit_secs.update(universe.sector_map(store=store, symbols=off_uni))
+                sizes = {r["symbol"]: risk.default_add_size_pct(
+                    (r.get("metrics") or {}).get("atr_pct")) for r in top_finalists}
+                fits = risk.candidate_fits([r["symbol"] for r in top_finalists],
+                                           weights, fit_secs, sizes)
+                for r in top_finalists:
+                    f = fits.get(r["symbol"])
+                    if f:
+                        r.setdefault("metrics", {})["book_fit"] = f
+                n_fit = sum(1 for f in fits.values() if f.get("marginal_corr") is not None)
+                _log(f"book fit computed for {n_fit}/{len(fits)} finalists "
+                     f"against {len(weights)} holdings")
+            except Exception as exc:  # noqa: BLE001 - a display/context line, never fatal
+                _log(f"book fit unavailable: {exc}")
+        elif top_finalists:
+            _log("book fit skipped: no holdings to compare against")
+
+        storage.upsert_screen_scores(run_id, board)
 
         # Stage 4 (data overlay): IBKR holdings + quotes for the visible board
         board_syms = [r["symbol"] for r in board[:max(shortlist_n, 40)]]
@@ -452,6 +546,7 @@ def run(mode: str = "deep") -> int:
             budget_hit = False
             per_call_timeout = float(config.get("claude.timeout_seconds", 600))
             claude_horizon: dict[str, str] = {}   # symbol -> the clock Claude named
+            reports: list[dict] = []              # for the candidate-trigger pass
             for i, row in enumerate(finalists, 1):
                 remaining = budget - (time.monotonic() - t0) if budget else None
                 # Stop while a full call (+ possible red team) still fits — otherwise
@@ -496,6 +591,7 @@ def run(mode: str = "deep") -> int:
                              f"haircut={rt.get('confidence_haircut')} -> "
                              f"{report.get('rating')} conv={report.get('conviction')}")
                 storage.upsert_research(run_id, report)
+                reports.append(report)
                 done += 1
                 if report.get("rating") is None:
                     n_unrated += 1
@@ -512,6 +608,28 @@ def run(mode: str = "deep") -> int:
                                         f"rating (timeouts/parse failures)")
             else:
                 hz.ok("research", f"{done}/{len(finalists)} researched")
+
+            # CANDIDATE TRIGGERS (8a): arm levels on researched names you do NOT own.
+            # Held names are excluded because the portfolio deep-dive already supervises
+            # them from a richer prompt, under its own `portfolio` source; installing a
+            # second set here would leave two theses armed on the same position.
+            cand = [r for r in reports if r["symbol"] not in holdings_map]
+            n_cand = 0
+            if cand:
+                storage.set_progress(run_id, "stage 3/4: arming candidate triggers")
+                try:
+                    n_cand = triggers.extract_candidates(run_id, cand, source="candidate")
+                except Exception as exc:  # noqa: BLE001 - never fail a run over this
+                    _log(f"candidate triggers not installed: {exc}")
+                _log(f"candidate triggers: {n_cand} armed across {len(cand)} "
+                     f"researched non-held names")
+                if n_cand == 0:
+                    hz.degraded("candidate_triggers",
+                                f"0 triggers armed for {len(cand)} researched candidates "
+                                f"— a 'buy if it pulls back' will not be noticed")
+                else:
+                    hz.ok("candidate_triggers", f"{n_cand} armed across {len(cand)} names")
+
             # Snapshot ranked opportunity prices for forward tracking, PLUS the benchmark
             # price at the same instant so future excess-return vs SPY is computable.
             # The clock each pick will be graded on: Claude's when it named one, the

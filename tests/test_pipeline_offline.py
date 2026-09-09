@@ -175,3 +175,99 @@ def test_light_run_skips_research(offline, storage):
     assert run["health"] == health.DEGRADED
     assert not storage.runs_with_research()
     assert len(storage.get_board(rid)) == len(SYMS)
+
+
+def test_deep_run_arms_candidate_triggers_and_a_later_run_fires_them(offline, storage,
+                                                                     monkeypatch):
+    """Phase 8's gate: a researched name you do NOT own gets an armed level, is labelled
+    `watch` rather than `hold`, and a later run at a lower price flips it onto the board.
+
+    The fake Claude returns invalidation_level 88 for every name, and the fake metrics
+    price names at 100+i, so run 1 arms 88 and run 2 (prices 60+i) trips it.
+    """
+    from src import recommend, risk, triggers
+    rid = pipeline.run("deep")
+
+    armed = [t for t in storage.active_triggers() if t["source"] == "candidate"]
+    assert armed, "no candidate triggers armed"
+    assert all(t["kind"] == "price_below" and t["threshold"] == 88.0 for t in armed)
+    # Nothing is held in this fixture, so every researched name is a candidate.
+    assert len(armed) == 10
+
+    board = {r["symbol"]: r for r in storage.get_board(rid)}
+    watched = [s for s, r in board.items() if recommend.recommendation(r)[0] == "watch"]
+    # The fake reports rate `buy`; a `hold` on an armed name is what `watch` is for, so
+    # assert the LABELLING RULE directly on a row carrying this run's real trigger count.
+    nvda = dict(board["NVDA"])
+    assert nvda["candidate_triggers"] == 1
+    assert recommend.recommendation({**nvda, "rating": "hold"})[0] == "watch"
+    assert recommend.recommendation({**nvda, "rating": "hold",
+                                     "held_position": 5})[0] == "hold"
+    assert watched == []          # ...and nothing is mislabelled while ratings are buy
+
+    # A second run with the tape 40 points lower: the level trips and the board says so.
+    monkeypatch.setattr(fundamentals, "from_store",
+                        lambda store, symbols, as_of=None, extra=None: {
+                            s: {**v, "price": (v.get("price") or 100.0) - 40.0}
+                            for s, v in _fake_metrics(store, symbols).items()})
+    rid2 = pipeline.run("light")
+    fired = storage.recent_fired_triggers()
+    assert {t["symbol"] for t in fired} >= {"NVDA"}
+    assert any("< 88" in t["trigger_detail"] for t in fired)
+    row2 = {r["symbol"]: r for r in storage.get_board(rid2)}["NVDA"]
+    assert row2["fired_triggers"] >= 1        # the board row carries the fired marker
+    assert row2["candidate_triggers"] == 0    # a fired trigger is no longer armed
+
+
+def test_rank_delta_and_catalyst_freshness_are_persisted(offline, storage):
+    rid1 = pipeline.run("light")
+    with storage.get_conn() as cn:
+        first = cn.execute("SELECT rank_prev FROM screen_scores WHERE run_id=?",
+                           (rid1,)).fetchall()
+    assert all(r["rank_prev"] is None for r in first)      # no comparable earlier run
+    rid2 = pipeline.run("light")
+    with storage.get_conn() as cn:
+        rows = {r["symbol"]: dict(r) for r in cn.execute(
+            "SELECT symbol, rank, rank_prev FROM screen_scores WHERE run_id=?", (rid2,))}
+    assert rows and all(v["rank_prev"] == v["rank"] for v in rows.values())
+    # `news.get_news` is faked to return nothing, so freshness is honestly NULL rather
+    # than a fabricated 0 — the same genuine-0-vs-unknown discipline as the catalysts.
+    with storage.get_conn() as cn:
+        fresh = {r["catalyst_freshness_days"] for r in cn.execute(
+            "SELECT catalyst_freshness_days FROM signals WHERE run_id=?", (rid2,))}
+    assert fresh == {None}
+    assert pipeline._freshness_days([]) is None
+    import datetime as _dt
+    recent = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=3)
+    got = pipeline._freshness_days([{"published": recent.strftime("%Y-%m-%d")},
+                                    {"published": "2020-01-01"}])
+    assert 2.0 <= got <= 4.0                               # newest item wins
+
+
+def test_book_fit_reaches_a_finalists_research_context(offline, storage, monkeypatch):
+    """8c: the analyst is told how the name fits the book that already exists."""
+    from src import deep_research, ibkr, risk
+    monkeypatch.setattr(ibkr, "fetch_holdings", lambda: {
+        "connected": True, "note": "ok",
+        "holdings": [{"symbol": "MSFT", "position": 100.0, "avg_cost": 100.0},
+                     {"symbol": "GOOGL", "position": 100.0, "avg_cost": 100.0}]})
+    monkeypatch.setattr(risk, "candidate_fits", lambda syms, w, secs=None, sizes=None: {
+        s: {"symbol": s, "marginal_corr": 0.81, "closest": "MSFT", "closest_corr": 0.81,
+            "sector": "Information Technology", "sector_positions": 3,
+            "sector_weight_pct": 34.0, "sector_weight_after_pct": 41.0,
+            "max_sector_weight_pct": 40.0, "over_cap": True, "size_pct": 10.0}
+        for s in syms})
+    seen: list[str] = []
+    real = deep_research.build_context
+    monkeypatch.setattr(deep_research, "build_context",
+                        lambda *a, **k: seen.append(real(*a, **k)) or seen[-1])
+    rid = pipeline.run("deep")
+    fit_ctx = [c for c in seen if "Book fit:" in c]
+    assert fit_ctx, "no finalist context carried a book-fit line"
+    assert "4th Information Technology position" in fit_ctx[0]
+    assert "0.81 with MSFT" in fit_ctx[0] and "ABOVE the 40% cap" in fit_ctx[0]
+    # ...and it is persisted on the board row, so the column can render it.
+    board = {r["symbol"]: r for r in storage.get_board(rid)}
+    fits = [r for r in board.values() if (r.get("metrics") or {}).get("book_fit")]
+    assert fits and risk.candidate_fit_badge(fits[0]["metrics"]["book_fit"]) \
+        .endswith("IT 41%⚠")

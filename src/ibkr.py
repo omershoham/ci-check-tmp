@@ -6,7 +6,8 @@ get an "offline" result and the pipeline/dashboard continue without IBKR.
 """
 from __future__ import annotations
 
-from typing import Any
+import threading
+from typing import Any, Callable
 
 from . import config
 
@@ -15,6 +16,49 @@ try:
     _IB_AVAILABLE = True
 except Exception:  # noqa: BLE001
     _IB_AVAILABLE = False
+
+TIMEOUT_NOTE = "timed out (half-dead Gateway?)"
+
+
+def _total_timeout() -> float:
+    return float(config.get("ibkr.total_timeout", 45.0) or 45.0)
+
+
+def _bounded(fn: Callable[[], dict[str, Any]], fallback: dict[str, Any],
+             deadline_s: float | None = None) -> dict[str, Any]:
+    """Run `fn` with a HARD wall-clock; on expiry return `fallback` and keep going.
+
+    The failure this prevents (reproduced twice in Phase 7): with port 4001 open but
+    the Gateway's session lapsed — its state every morning until someone answers the
+    2FA prompt — `ib.connect()` never returns. `get_positions` is capped at
+    positions_max_wait but the connect/handshake is not, and the pipeline put no clock
+    around the call at all, so the whole run blocked forever and wrote NO health
+    record: the one failure mode that is invisible in the dashboard.
+
+    Same shape as technical._download_with_deadline, with one deliberate difference:
+    the worker is a raw DAEMON thread, not a ThreadPoolExecutor. A pool's threads are
+    non-daemon and joined at interpreter exit, so an abandoned thread stuck inside
+    ib.connect() would move the hang from the middle of the run to the end of it.
+    A daemon thread can be abandoned and the process still exits.
+
+    The abandoned thread keeps holding `ibkr.client_id`, so a retry inside the same
+    process can be refused by the Gateway; that degrades to `connected=False` again,
+    which is the same answer, so it is not worth a client-id rotation.
+    """
+    box: dict[str, Any] = {}
+
+    def _work() -> None:
+        try:
+            box["result"] = fn()
+        except Exception as exc:  # noqa: BLE001
+            box["result"] = {**fallback, "note": f"error: {str(exc)[:120]}"}
+
+    t = threading.Thread(target=_work, name="ibkr-bounded", daemon=True)
+    t.start()
+    t.join(deadline_s if deadline_s is not None else _total_timeout())
+    if t.is_alive():
+        return {**fallback, "note": TIMEOUT_NOTE}
+    return box.get("result", fallback)
 
 
 def _connect(client_id: int | None = None):
@@ -141,12 +185,7 @@ def get_quotes(ib, symbols: list[str]) -> list[dict[str, Any]]:
     return out
 
 
-def fetch_holdings() -> dict[str, Any]:
-    """Positions-only fetch (fast), used early so the news scan can cover holdings.
-
-    Uses the same client id as the later quotes fetch; the two calls are sequential
-    (this one disconnects before the quotes fetch connects), so they never collide.
-    """
+def _fetch_holdings() -> dict[str, Any]:
     if not _IB_AVAILABLE:
         return {"connected": False, "holdings": [], "note": "ib_async not installed"}
     ib = _connect()  # same client id as the main fetch; calls are sequential
@@ -161,11 +200,17 @@ def fetch_holdings() -> dict[str, Any]:
             pass
 
 
-def fetch_portfolio_and_quotes(symbols: list[str]) -> dict[str, Any]:
-    """High-level: connect once, pull positions + quotes, disconnect.
+def fetch_holdings() -> dict[str, Any]:
+    """Positions-only fetch (fast), used early so the news scan can cover holdings.
 
-    Returns {'connected': bool, 'holdings': [...], 'quotes': [...], 'note': str}.
+    Uses the same client id as the later quotes fetch; the two calls are sequential
+    (this one disconnects before the quotes fetch connects), so they never collide.
+    Bounded by `ibkr.total_timeout` — connect + handshake + positions, one clock.
     """
+    return _bounded(_fetch_holdings, {"connected": False, "holdings": [], "note": "offline"})
+
+
+def _fetch_portfolio_and_quotes(symbols: list[str]) -> dict[str, Any]:
     if not _IB_AVAILABLE:
         return {"connected": False, "holdings": [], "quotes": [],
                 "note": "ib_async not installed"}
@@ -185,6 +230,18 @@ def fetch_portfolio_and_quotes(symbols: list[str]) -> dict[str, Any]:
             ib.disconnect()
         except Exception:  # noqa: BLE001
             pass
+
+
+def fetch_portfolio_and_quotes(symbols: list[str]) -> dict[str, Any]:
+    """High-level: connect once, pull positions + quotes, disconnect.
+
+    Returns {'connected': bool, 'holdings': [...], 'quotes': [...], 'note': str}.
+    Bounded by `ibkr.total_timeout`: connect, positions AND quotes share one hard
+    wall-clock, because the run needs an answer, not a complete answer.
+    """
+    return _bounded(lambda: _fetch_portfolio_and_quotes(symbols),
+                    {"connected": False, "holdings": [], "quotes": [],
+                     "note": "IB Gateway/TWS offline or refused connection"})
 
 
 if __name__ == "__main__":

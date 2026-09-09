@@ -12,7 +12,7 @@ def _fake_returns(symbols, period="9mo"):
     for i, s in enumerate(symbols):
         if s in ("QQQ", "SMH"):
             data[s] = common * 0.8 + rng.normal(0, 0.005, 90)
-        elif s == "DIV":                       # the uncorrelated diversifier
+        elif s.startswith("DIV"):              # the uncorrelated diversifier(s)
             data[s] = rng.normal(0, 0.01, 90)
         else:                                  # the AI cluster: mostly common factor
             data[s] = common + rng.normal(0, 0.008, 90)
@@ -50,3 +50,59 @@ def test_sizing_rules_tighten_on_drawdown_and_vol(monkeypatch):
     assert abs(cap(hot) - cap(base) * 0.75) < 0.11
     calm = deep_research.sizing_rules_text({"drawdown_from_peak_pct": -3.0, "vol_scale": 1.0})
     assert "DRAWDOWN CONTROL" not in calm and "VOLATILITY TARGET" not in calm
+
+
+# ---------------------------------------------------------------- candidate book fit
+def test_candidate_fit_finds_the_overlap_a_screen_cannot_see(monkeypatch):
+    """`marginal_corr` only ever answered this for names you ALREADY hold, so the fifth
+    semiconductor idea scored exactly like the first."""
+    monkeypatch.setattr(risk, "_returns", _fake_returns)
+    monkeypatch.setattr(risk, "max_sector_weight", lambda: 40.0)
+    weights = {"AAA": 40, "BBB": 40, "DIV": 20}
+    sectors = {"AAA": "Information Technology", "BBB": "Information Technology",
+               "DIV": "Utilities", "CCC": "Information Technology", "DIV2": "Utilities"}
+    fits = risk.candidate_fits(["CCC", "DIV2"], weights, sectors,
+                               sizes={"CCC": 10.0, "DIV2": 10.0})
+    ccc, new = fits["CCC"], fits["DIV2"]
+    # CCC is another member of the common-factor cluster; NEW behaves like the
+    # diversifier, so their marginal correlations must not be close.
+    assert ccc["marginal_corr"] > 0.4 > new["marginal_corr"]
+    assert ccc["closest"] in ("AAA", "BBB") and ccc["closest_corr"] > ccc["marginal_corr"]
+    # Third IT position; the existing 80% IT book is diluted to 72% by the 10% add.
+    assert ccc["sector_positions"] == 2 and ccc["sector"] == "Information Technology"
+    assert ccc["sector_weight_pct"] == 80.0 and ccc["sector_weight_after_pct"] == 82.0
+    assert ccc["over_cap"] is True
+    assert new["sector_weight_after_pct"] == 28.0 and new["over_cap"] is False
+    line = risk.candidate_fit_line(ccc)
+    assert "3rd Information Technology position" in line and "ABOVE the 40% cap" in line
+    badge = risk.candidate_fit_badge(ccc)
+    assert "↔" in badge and "IT 82%⚠" in badge
+
+
+def test_candidate_fit_degrades_when_there_is_nothing_to_compare(monkeypatch):
+    monkeypatch.setattr(risk, "_returns", lambda *a, **k: None)
+    fit = risk.candidate_fit("CCC", {"AAA": 100}, {"CCC": "Utilities"})
+    assert fit["marginal_corr"] is None if "marginal_corr" in fit else True
+    assert "closest" not in fit
+    # The sector half still works with no price history at all.
+    assert fit["sector"] == "Utilities"
+    assert risk.candidate_fit_line(fit).startswith("Book fit:")
+    # No holdings at all -> nothing meaningful to say, and no download attempted.
+    assert risk.candidate_fits(["CCC"], {}, {})["CCC"].get("closest") is None
+
+
+def test_default_add_size_states_its_assumption(monkeypatch):
+    monkeypatch.setattr(risk.config, "get", lambda k, d=None: {
+        "policy.conviction_weight_caps": {3: 10, 5: 15},
+        "policy.risk_per_position_pct": 1.0}.get(k, d))
+    assert risk.default_add_size_pct() == 10.0            # lowest conviction cap
+    # 1% risked to a 2-ATR stop on a 10%-ATR name is a 5% position; on a quiet name the
+    # conviction cap is what binds instead.
+    assert risk.default_add_size_pct(0.10) == 5.0
+    assert risk.default_add_size_pct(0.01) == 10.0
+
+
+def test_max_sector_weight_honours_the_deprecated_alias(monkeypatch):
+    monkeypatch.setattr(risk.config, "get",
+                        lambda k, d=None: {"policy.max_subsector_weight": 33}.get(k, d))
+    assert risk.max_sector_weight() == 33.0

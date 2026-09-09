@@ -21,10 +21,22 @@ Three rules this module exists to enforce, each recording a way to get it wrong:
 
 A broken pool (sandboxed CI, no fork/spawn permission) falls back to the serial loop
 with a log line rather than taking the pipeline down.
+
+THE FOURTH RULE, learned the hard way in Phase 8: a worker that dies must FALL BACK,
+never hang. `spawn` re-executes whatever `sys.modules['__main__'].__file__` points at
+in every child, and Streamlit's AppTest permanently replaces `__main__` with the
+dashboard script — so after a dashboard test, every pool worker in the process tries
+to run the whole Streamlit app, and on an empty data tree that app calls `st.stop()`
+and the worker dies during bootstrap. The pool then breaks, and
+`ProcessPoolExecutor.__exit__` (shutdown with wait=True) deadlocks joining a manager
+thread that is itself stuck closing the call queue — so the `except BrokenProcessPool`
+below was never reached. Two changes: `_spawn_is_safe()` refuses the pool when
+`__main__` has been hijacked, and the executor is never entered with `with`.
 """
 from __future__ import annotations
 
 import os
+import sys
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Callable, Iterable, Sequence
@@ -51,6 +63,35 @@ def default_workers() -> int:
     return max(1, (os.cpu_count() or 2) - _RESERVED)
 
 
+def _spawn_is_safe() -> str:
+    """Empty string if a spawned worker will bootstrap cleanly, else WHY it will not.
+
+    `multiprocessing.spawn` hands each child `__main__.__file__` and the child
+    re-executes that file under the name `__mp_main__`. That is fine when `__main__`
+    is the script that actually started the process, and catastrophic when something
+    has swapped it: Streamlit's AppTest leaves `sys.modules['__main__']` pointing at
+    app/dashboard.py for the rest of the interpreter's life, so every worker would run
+    a Streamlit app instead of a replay. A module with a real `__spec__` is passed by
+    NAME instead of by path and is safe.
+    """
+    main = sys.modules.get("__main__")
+    if main is None or getattr(getattr(main, "__spec__", None), "name", None):
+        return ""
+    path = getattr(main, "__file__", None)
+    if not path:
+        return ""
+    argv0 = sys.argv[0] if sys.argv else ""
+    try:
+        if argv0 and os.path.samefile(path, argv0):
+            return ""
+    except OSError:
+        if argv0 and os.path.normcase(os.path.abspath(path)) == \
+                os.path.normcase(os.path.abspath(argv0)):
+            return ""
+    return (f"__main__ has been replaced by {os.path.basename(path)} (a Streamlit or "
+            f"notebook host?) — a spawned worker would re-execute it")
+
+
 def replay_symbols(fn: Callable[[Any], Any], payloads: Sequence[Any],
                    workers: int | None = None, log: Callable[[str], None] | None = None,
                    label: str = "replay", every: int = 20,
@@ -72,17 +113,34 @@ def replay_symbols(fn: Callable[[Any], Any], payloads: Sequence[Any],
     w = max(1, min(w, n))
     if w == 1:
         return _serial(fn, items, log, label, every)
+    unsafe = _spawn_is_safe()
+    if unsafe:
+        if log:
+            log(f"  {label}: {unsafe} — running serially")
+        return _serial(fn, items, log, label, every)
+    # NEVER `with`: the context manager shuts down with wait=True, and on a pool that
+    # broke during worker bootstrap that join deadlocks BEFORE the except below can
+    # run. A broken pool is abandoned (wait=False) and the work is redone serially —
+    # the replays are pure functions of their payload, so redoing them is free of
+    # consequence beyond the time.
+    ex = ProcessPoolExecutor(max_workers=w)
     try:
         out: list[Any] = []
-        with ProcessPoolExecutor(max_workers=w) as ex:
-            for i, r in enumerate(ex.map(fn, items), 1):
-                out.append(r)
-                _tick(log, label, i, n, every)
+        for i, r in enumerate(ex.map(fn, items), 1):
+            out.append(r)
+            _tick(log, label, i, n, every)
+        ex.shutdown(wait=True)
         return out
     except (BrokenProcessPool, OSError, PermissionError, ImportError) as exc:
+        ex.shutdown(wait=False, cancel_futures=True)
         if log:
             log(f"  {label}: process pool unavailable ({exc}) — running serially")
         return _serial(fn, items, log, label, every)
+    except BaseException:
+        # A real error inside `fn` PROPAGATES (that is the contract), but the pool must
+        # not be left running behind it.
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise
 
 
 def _serial(fn, items, log, label, every) -> list[Any]:

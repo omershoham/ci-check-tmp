@@ -43,7 +43,12 @@ def universe_history(store, start: date, source: str) -> int:
     the engine changing at all: each date's members are re-derived from the store's own
     prices and SEC filings as of THAT date, so a company that was delisted in 2019 is a
     member up to 2019 and absent after — instead of the whole history being scored on
-    the list of survivors that exist today."""
+    the list of survivors that exist today.
+
+    `source` carries the CAP (`broad:1500`). Membership at cap 250 and cap 1500 are two
+    different populations; recording both under a bare `broad` overwrote the smaller
+    history and made every report built on it unreproducible (Phase 7). Re-run this
+    once per cap change."""
     dates = yfinance_live.month_ends(start, date.today())
     n = 0
     for i, d in enumerate(dates, 1):
@@ -96,7 +101,8 @@ def main() -> None:
 
     store = HistoryStore()
     src = universe.configured_source()
-    _log(f"store: {store.root}  (universe.source={src})")
+    mask = universe.membership_source(src)
+    _log(f"store: {store.root}  (universe.source={src}, membership mask={mask})")
     # A store written before Phase 2 is one file per table; convert it before anything
     # reads it, so the first refresh after an upgrade is where the cost is paid and
     # logged rather than inside whatever happened to touch the store first.
@@ -162,8 +168,8 @@ def main() -> None:
 
     if args.universe_history:
         start = date.fromisoformat(args.start)
-        _log(f"universe history: month-ends from {start} (source={src})")
-        n = universe_history(store, start, src)
+        _log(f"universe history: month-ends from {start} (mask={mask})")
+        n = universe_history(store, start, mask)
         _log(f"universe history: {n} membership rows recorded")
     else:
         # Universe membership as of today — the going-forward survivorship record.
@@ -172,7 +178,7 @@ def main() -> None:
         # overwrite a real snapshot with "nothing was investable".
         members = universe.current_universe(store=store)
         if members:
-            store.record_universe(date.today(), members, source=src)
+            store.record_universe(date.today(), members, source=mask)
     _log(f"manifest: {store.manifest()}")
 
 

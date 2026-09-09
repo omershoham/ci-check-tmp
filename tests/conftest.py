@@ -38,6 +38,30 @@ def storage(workspace):
     return _storage
 
 
+@pytest.fixture(autouse=True)
+def _restore_main_module():
+    """Put `sys.modules['__main__']` back after every test.
+
+    Streamlit's AppTest runs the app script by REPLACING the interpreter's `__main__`
+    module with one whose `__file__` is app/dashboard.py, and never restores it. That
+    leak is invisible until something spawns a process: `multiprocessing.spawn` hands
+    each child `__main__.__file__` and the child re-executes it, so after a dashboard
+    test every ProcessPoolExecutor worker tried to run the whole Streamlit dashboard.
+    With CLAUDE_TRADER_HOME pointing at an empty data tree the app hits `st.stop()`,
+    the worker dies during bootstrap, the pool breaks, and the pool's own shutdown
+    deadlocks — which is why the suite hung at the serial-vs-parallel snapshot test
+    (test_data_layer runs right after test_dashboard) and only under a HOME override.
+
+    Autouse and unconditional: the next test to spawn a pool should not have to know
+    which earlier test used Streamlit.
+    """
+    import sys
+    main = sys.modules.get("__main__")
+    yield
+    if main is not None and sys.modules.get("__main__") is not main:
+        sys.modules["__main__"] = main
+
+
 @pytest.fixture
 def curated(monkeypatch):
     """Pin the curated 105-name universe AND the pack that owns the list.

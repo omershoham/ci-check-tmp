@@ -185,7 +185,8 @@ CREATE TABLE IF NOT EXISTS lessons (
 CREATE TABLE IF NOT EXISTS triggers (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol      TEXT NOT NULL,
-    source      TEXT,             -- 'portfolio' | 'research'
+    source      TEXT,             -- 'portfolio' (a name you own) |
+                                  -- 'candidate' (researched, not bought)
     run_id      INTEGER,          -- originating run (portfolio_runs.id or runs.id)
     kind        TEXT NOT NULL,    -- 'price_below' | 'price_above' | 'news_keyword'
     threshold   REAL,             -- for price triggers
@@ -215,7 +216,9 @@ CREATE TABLE IF NOT EXISTS portfolio_summary (
 # Bumped whenever _migrate gains a step. Recorded in the schema_version table so a
 # future non-additive change (a rename needs a copy-table in SQLite) has a real anchor
 # to branch on instead of re-deriving state from PRAGMA every time.
-SCHEMA_VERSION = 4   # 4: screen_scores.blended_pct (percentile form of the composite)
+SCHEMA_VERSION = 5   # 5: screen_scores.rank_prev + signals.catalyst_freshness_days
+                     #    (rank BY CHANGE, not only by level)
+                     # 4: screen_scores.blended_pct (percentile form of the composite)
                      # 3: per-idea horizon + horizon_source on picks,
                      #    research_reports and portfolio_positions
 
@@ -336,6 +339,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # group came from, and give valuation a coarser peer set than ranking.
     _add_col(conn, "tickers", "sector", "TEXT")
     _add_col(conn, "tickers", "industry_group", "TEXT")
+    # Phase 8. WHY NOW, persisted rather than recomputed: a quality screen surfaces the
+    # same names every day, so the board goes stale unless it can say what MOVED.
+    # `rank_prev` is the symbol's rank in the previous run of the SAME universe_source
+    # (NULL = new entrant, which is itself the interesting case); a rank delta computed
+    # on the fly would need both runs' cross-sections to still exist.
+    _add_col(conn, "screen_scores", "rank_prev", "INTEGER")
+    # Days since the newest headline in the scanned set — so an 8/10 catalyst from six
+    # weeks ago decays out of view instead of sitting at the top forever.
+    _add_col(conn, "signals", "catalyst_freshness_days", "REAL")
 
     conn.execute("CREATE TABLE IF NOT EXISTS schema_version ("
                  "version INTEGER PRIMARY KEY, applied_at TEXT)")
@@ -406,6 +418,33 @@ def mark_stale_runs(max_age_hours: float = 3.0) -> int:
             "WHERE status='running' AND datetime(started_at) < datetime('now', ?)",
             (now_iso(), cutoff))
         return int(cur.rowcount or 0) + int(cur2.rowcount or 0)
+
+
+def previous_ranks(run_id: int, universe_source: str | None = None) -> dict[str, int]:
+    """symbol -> rank in the most recent EARLIER run that scored the same universe.
+
+    One query, run once per pipeline run, so `screen_scores.rank_prev` can be written
+    with the rest of the row. Restricted to the same `universe_source` because a rank
+    out of 105 curated names and a rank out of 1,500 broad ones are not the same
+    measurement, and a delta between them would be pure noise dressed as news.
+    Returns {} when there is no earlier comparable run — every name is then new.
+    """
+    with get_conn() as conn:
+        if universe_source:
+            prev = conn.execute(
+                "SELECT id FROM runs WHERE id < ? AND universe_source = ? "
+                "AND EXISTS (SELECT 1 FROM screen_scores s WHERE s.run_id = runs.id) "
+                "ORDER BY id DESC LIMIT 1", (run_id, universe_source)).fetchone()
+        else:
+            prev = conn.execute(
+                "SELECT id FROM runs WHERE id < ? "
+                "AND EXISTS (SELECT 1 FROM screen_scores s WHERE s.run_id = runs.id) "
+                "ORDER BY id DESC LIMIT 1", (run_id,)).fetchone()
+        if not prev:
+            return {}
+        return {r["symbol"]: r["rank"] for r in conn.execute(
+            "SELECT symbol, rank FROM screen_scores WHERE run_id=? AND rank IS NOT NULL",
+            (prev["id"],))}
 
 
 def score_history(symbol: str, limit: int = 12) -> list[tuple[int, float]]:
@@ -486,6 +525,10 @@ def upsert_screen_scores(run_id: int, rows: Iterable[dict[str, Any]]) -> None:
             "blended": r.get("blended"),
             "blended_pct": r.get("blended_pct"),
             "rank": r.get("rank"),
+            # NULL means "not in the previous run of this universe" — a new entrant.
+            # It is never filled in from an older run: a two-run-old rank is not what
+            # "moved since last time" means.
+            "rank_prev": r.get("rank_prev"),
             "tags": json.dumps(r.get("tags", [])),
             "metrics_json": json.dumps(r.get("metrics", {})),
             "score_version": version,
@@ -496,12 +539,13 @@ def upsert_screen_scores(run_id: int, rows: Iterable[dict[str, Any]]) -> None:
         })
     with get_conn() as conn:
         conn.executemany(
-            """INSERT INTO screen_scores(run_id,symbol,quality,deal,blended,blended_pct,rank,tags,metrics_json,score_version,pillar_set)
-               VALUES(:run_id,:symbol,:quality,:deal,:blended,:blended_pct,:rank,:tags,:metrics_json,:score_version,:pillar_set)
+            """INSERT INTO screen_scores(run_id,symbol,quality,deal,blended,blended_pct,rank,rank_prev,tags,metrics_json,score_version,pillar_set)
+               VALUES(:run_id,:symbol,:quality,:deal,:blended,:blended_pct,:rank,:rank_prev,:tags,:metrics_json,:score_version,:pillar_set)
                ON CONFLICT(run_id,symbol) DO UPDATE SET
                  quality=excluded.quality, deal=excluded.deal, blended=excluded.blended,
                  blended_pct=excluded.blended_pct,
-                 rank=excluded.rank, tags=excluded.tags, metrics_json=excluded.metrics_json,
+                 rank=excluded.rank, rank_prev=excluded.rank_prev,
+                 tags=excluded.tags, metrics_json=excluded.metrics_json,
                  score_version=excluded.score_version, pillar_set=excluded.pillar_set""",
             payload,
         )
@@ -521,19 +565,22 @@ def upsert_signals(run_id: int, rows: Iterable[dict[str, Any]]) -> None:
         "hyperscaler_signal": r.get("hyperscaler_signal"),
         "catalyst_json": json.dumps(r["catalyst"]) if r.get("catalyst") else None,
         "signal_version": r.get("signal_version"),
+        "catalyst_freshness_days": r.get("catalyst_freshness_days"),
         "catalysts_json": json.dumps(r.get("catalysts", [])),
         "summary": r.get("summary"),
     } for r in rows]
     with get_conn() as conn:
         conn.executemany(
             """INSERT INTO signals(run_id,symbol,hyperscaler_signal,catalyst_json,
-                                   signal_version,catalysts_json,summary)
+                                   signal_version,catalyst_freshness_days,
+                                   catalysts_json,summary)
                VALUES(:run_id,:symbol,:hyperscaler_signal,:catalyst_json,
-                      :signal_version,:catalysts_json,:summary)
+                      :signal_version,:catalyst_freshness_days,:catalysts_json,:summary)
                ON CONFLICT(run_id,symbol) DO UPDATE SET
                  hyperscaler_signal=excluded.hyperscaler_signal,
                  catalyst_json=excluded.catalyst_json,
                  signal_version=excluded.signal_version,
+                 catalyst_freshness_days=excluded.catalyst_freshness_days,
                  catalysts_json=excluded.catalysts_json, summary=excluded.summary""",
             payload,
         )
@@ -597,9 +644,21 @@ def get_board(run_id: int) -> list[dict[str, Any]]:
         rows = conn.execute(
             """
             SELECT s.symbol, t.name, t.subsector, s.quality, s.deal, s.blended,
-                   s.blended_pct, s.rank, s.tags, s.metrics_json,
+                   s.blended_pct, s.rank, s.rank_prev, s.tags, s.metrics_json,
                    g.hyperscaler_signal, g.catalyst_json, g.signal_version,
+                   g.catalyst_freshness_days,
                    g.catalysts_json AS sig_catalysts, g.summary,
+                   -- Armed / recently-fired CANDIDATE triggers. Deliberately a live
+                   -- fact, not a run-scoped one: "is there a level armed on this name
+                   -- right now" is the question the board is asking, and it is what
+                   -- separates a `watch` from an `avoid`.
+                   (SELECT COUNT(*) FROM triggers tg WHERE tg.symbol = s.symbol
+                      AND tg.source = 'candidate' AND tg.status = 'active')
+                     AS candidate_triggers,
+                   (SELECT COUNT(*) FROM triggers tg WHERE tg.symbol = s.symbol
+                      AND tg.status = 'triggered'
+                      AND date(tg.triggered_at) >= date('now', '-7 days'))
+                     AS fired_triggers,
                    r.rating, r.conviction, r.deal_likelihood, r.thesis, r.chart_pattern,
                    r.metrics_read, r.data_as_of, r.created_at AS research_at,
                    r.horizon, r.horizon_rationale, r.horizon_source, r.quant_horizon,
@@ -678,6 +737,22 @@ def upsert_quotes(rows: Iterable[dict[str, Any]]) -> None:
                ON CONFLICT(symbol) DO UPDATE SET last=excluded.last, updated_at=excluded.updated_at""",
             payload,
         )
+
+
+def quote_map() -> dict[str, float]:
+    """symbol -> last stored quote. The pipeline prices held names off this when the
+    screen has no price for them (ballast ETFs are held but never scored)."""
+    with get_conn() as conn:
+        return {r["symbol"]: r["last"] for r in
+                conn.execute("SELECT symbol, last FROM quotes WHERE last IS NOT NULL")}
+
+
+def stored_holdings() -> list[dict[str, Any]]:
+    """The last broker snapshot. Used when the Gateway is down: a book-fit computed
+    against yesterday's positions is far more useful than none at all, and positions
+    move much more slowly than quotes do."""
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM holdings")]
 
 
 def record_picks(run_id: int, rows: Iterable[dict[str, Any]]) -> None:

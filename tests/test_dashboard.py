@@ -61,6 +61,19 @@ def seeded(storage, monkeypatch):
     return rid
 
 
+def _fresh_db_caches():
+    """Drop the app's memoized DB reads.
+
+    `st.cache_data` is PROCESS-global while every test gets a NEW database whose first
+    run is again id 1, so a test that seeds different rows would otherwise read the
+    previous test's cached board and silently assert against the wrong data. Called
+    only by the tests that mutate after seeding: clearing it in the fixture would also
+    drop the cached price/news downloads and re-pay them once per test.
+    """
+    import streamlit as _st
+    _st.cache_data.clear()
+
+
 def test_dashboard_renders_without_exception(seeded):
     at = AppTest.from_file(APP, default_timeout=120).run()
     assert not at.exception, at.exception
@@ -120,3 +133,54 @@ def test_tag_filter_offers_no_deal_options(seeded):
     assert not at.exception, at.exception
     tag_ms = [ms for ms in at.multiselect if "tag" in (ms.label or "").lower()]
     assert tag_ms and not ({"deal", "both"} & set(tag_ms[0].options))
+
+
+def test_board_shows_why_now_and_book_fit_columns(seeded, storage):
+    """8b/8c reach the board: what MOVED, how fresh the catalyst is, and how the name
+    fits the book. Display only — no score, weight or threshold is involved."""
+    with storage.get_conn() as cn:
+        cn.execute("UPDATE screen_scores SET rank_prev=9 WHERE symbol='VRT'")
+        cn.execute("UPDATE signals SET catalyst_freshness_days=2.5 WHERE symbol='VRT'")
+        cn.execute("UPDATE screen_scores SET metrics_json=json_set(metrics_json, "
+                   "'$.book_fit', json(?)) WHERE symbol='VRT'",
+                   (json.dumps({"symbol": "VRT", "marginal_corr": 0.81, "closest": "NVDA",
+                                "closest_corr": 0.81, "sector": "Information Technology",
+                                "sector_positions": 3, "sector_weight_pct": 34.0,
+                                "sector_weight_after_pct": 41.0,
+                                "max_sector_weight_pct": 40.0, "over_cap": True,
+                                "size_pct": 10.0}),))
+        cn.commit()
+    _fresh_db_caches()
+    at = AppTest.from_file(APP, default_timeout=120).run()
+    assert not at.exception, at.exception
+    board = at.dataframe[0].value
+    assert {"Δrank", "fresh", "fit"} <= set(board.columns)
+    vrt = board[board["symbol"].str.startswith("VRT")].iloc[0]
+    assert vrt["Δrank"] == 8            # rank 1, was 9
+    assert vrt["fresh"] == 2.5
+    assert vrt["fit"] == "0.81↔NVDA · IT 41%⚠"
+
+
+def test_what_changed_tab_ranks_by_change(seeded):
+    at = AppTest.from_file(APP, default_timeout=120).run()
+    assert not at.exception, at.exception
+    sorter = at.radio(key="whynow_sort")
+    assert sorter.options == ["New entrants", "Rank jumps", "Rating upgrades",
+                              "Fresh catalysts"]
+    for opt in sorter.options:
+        at.radio(key="whynow_sort").set_value(opt).run()
+        assert not at.exception, f"{opt}: {at.exception}"
+
+
+def test_a_fired_trigger_is_marked_on_the_board(seeded, storage):
+    storage.replace_triggers("VRT", "candidate", 1,
+                             [{"kind": "price_below", "threshold": 100.0,
+                               "description": "thesis invalidated"}])
+    tid = storage.active_triggers()[0]["id"]
+    storage.fire_trigger(tid, "price 95.00 < 100")
+    _fresh_db_caches()
+    at = AppTest.from_file(APP, default_timeout=120).run()
+    assert not at.exception, at.exception
+    board = at.dataframe[0].value
+    vrt = board[board["symbol"].str.startswith("VRT")].iloc[0]
+    assert "🚨" in vrt["symbol"]
