@@ -170,14 +170,26 @@ def test_thin_data_name_gets_nan_not_a_fabricated_neutral():
 
 def test_thin_data_name_is_scored_on_its_other_pillars_not_dropped():
     """The composite re-normalizes per row: no fundamental data must not read as a
-    BAD fundamental score, and must not remove the name from the board."""
-    m, subs, secs = _thin_universe()
-    techs = {s: {"technical_score": 0.9 if s == "THIN" else 0.2} for s in m}
-    rows = {r["symbol"]: r for r in scoring.score_universe(m, subs, technicals=techs,
-                                                          sectors=secs)}
-    assert len(rows) == len(m)
-    assert rows["THIN"]["blended"] > rows["SW0"]["blended"]     # strong technical wins
-    assert 0.0 <= rows["THIN"]["blended"] <= 1.0
+    BAD fundamental score, and must not remove the name from the board.
+
+    Weights are pinned here rather than inherited from config: the point under test is
+    the per-row re-normalisation, not whatever the shipped technical weight happens to
+    be. (It was 0.35; a deliberate 2026-09-10 re-weighting to 0.20 flipped the ordering
+    and made a config decision look like a scoring regression.)"""
+    from src import config
+    config.set_override("scoring.pillars", {"technical": 0.35, "fundamental": 0.30,
+                                            "sentiment": 0.35, "learned": 0.0,
+                                            "catalyst": 0.0})
+    try:
+        m, subs, secs = _thin_universe()
+        techs = {s: {"technical_score": 0.9 if s == "THIN" else 0.2} for s in m}
+        rows = {r["symbol"]: r for r in scoring.score_universe(m, subs, technicals=techs,
+                                                               sectors=secs)}
+        assert len(rows) == len(m)
+        assert rows["THIN"]["blended"] > rows["SW0"]["blended"]   # strong technical wins
+        assert 0.0 <= rows["THIN"]["blended"] <= 1.0
+    finally:
+        config.clear_overrides()
 
 
 def test_subscore_below_the_floor_is_nan_above_it_is_a_number():

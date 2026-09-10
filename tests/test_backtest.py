@@ -130,3 +130,145 @@ def test_legacy_trial_lines_are_hashed_from_the_fields_they_did_record(tmp_path)
     # A new run of the same config on the CURATED universe is a distinct trial: the
     # legacy line never said which universe it was, so it cannot claim to be the same one.
     assert log_trial(tmp_path, "momentum", old["params"], {}, universe="curated") == 3
+
+
+# ---------------------------------------------------------------- pillar weights
+# `--pillar-weights` (scripts/backtest.py) overrides scoring.pillars for ONE process.
+# Three things have to hold or the override is worse than not having it: it must reach
+# BOTH the replay and the live screen, it must make each weighting a distinct trial
+# EXACTLY once, and asking for the shipped weighting must not count as a new one.
+
+def test_pillar_weights_parse_and_reject_nonsense():
+    from scripts.backtest import parse_pillar_weights
+    assert parse_pillar_weights("technical=0.2,fundamental=0.45,sentiment=0.35") == {
+        "technical": 0.2, "fundamental": 0.45, "sentiment": 0.35}
+    assert parse_pillar_weights(" technical=0 , fundamental=0.65 ") == {
+        "technical": 0.0, "fundamental": 0.65}
+    for bad in ("technical", "tecnical=0.2", "technical=x", "technical=-0.1",
+                "", "technical=0,fundamental=0,sentiment=0"):
+        try:
+            parse_pillar_weights(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad!r} should have been rejected")
+
+
+def test_pillar_weights_override_reaches_replay_and_live_screen(monkeypatch):
+    """One override on the exact dotted path, two consumers. `assert_replayable` is the
+    replay's resolver and `scoring.pillar_set`/`learned_weight` the live screen's, so
+    if both see it the composite cannot be replayed at weights the screen isn't using."""
+    from scripts.backtest import apply_pillar_weights
+    from src import config, scoring
+    from src.backtest import signals
+    monkeypatch.setattr(config, "_OVERRIDES", {}, raising=False)
+    try:
+        canon = apply_pillar_weights("technical=0.1,fundamental=0.55,sentiment=0.35")
+        w = signals.assert_replayable()                       # the replay's path
+        assert (w["technical"], w["fundamental"], w["sentiment"]) == (0.1, 0.55, 0.35)
+        assert config.get("scoring.pillars")["technical"] == 0.1   # the live screen's
+        assert scoring.pillar_set() == "technical,fundamental,sentiment"
+        assert scoring.learned_weight() == 0.0
+        assert canon and canon["technical"] == 0.1 and canon["catalyst"] == 0.0
+        # technical=0 leaves a two-pillar composite, and pillar_set must say so:
+        # a differently-shaped composite is a different partition for pillar_ic.
+        apply_pillar_weights("technical=0.0,fundamental=0.65,sentiment=0.35")
+        assert scoring.pillar_set() == "fundamental,sentiment"
+    finally:
+        config.clear_overrides()
+
+
+def test_pillar_weights_merge_keeps_an_unreplayable_pillar_visible(monkeypatch):
+    """Named weights MERGE over the configured dict. If they replaced it, a config with
+    catalyst > 0 would silently lose it and the replay guard would stop firing."""
+    from scripts.backtest import apply_pillar_weights
+    from src import config
+    from src.backtest import signals
+    monkeypatch.setattr(config, "_OVERRIDES", {}, raising=False)
+    monkeypatch.setattr(config, "load_config", lambda: {
+        "scoring": {"pillars": {"technical": 0.35, "fundamental": 0.30,
+                                "sentiment": 0.35, "catalyst": 0.2}}})
+    try:
+        apply_pillar_weights("technical=0.1,fundamental=0.55")
+        try:
+            signals.assert_replayable()
+        except ValueError as exc:
+            assert "catalyst" in str(exc)
+        else:
+            raise AssertionError("a weighted catalyst pillar must still refuse to replay")
+    finally:
+        config.clear_overrides()
+
+
+def test_shipped_weighting_asked_for_explicitly_is_not_a_new_trial(monkeypatch):
+    """`--pillar-weights` set to what config.yaml already says is the SAME hypothesis.
+    It must return None so no `pillars` key enters the hash — otherwise the baseline
+    stops deduping and every default run after it re-counts as a fresh trial."""
+    from scripts.backtest import apply_pillar_weights
+    from src import config
+    monkeypatch.setattr(config, "_OVERRIDES", {}, raising=False)
+    monkeypatch.setattr(config, "load_config", lambda: {
+        "scoring": {"pillars": {"technical": 0.35, "fundamental": 0.30,
+                                "sentiment": 0.35, "learned": 0.0, "catalyst": 0.0}}})
+    try:
+        assert apply_pillar_weights("technical=0.35,fundamental=0.30,sentiment=0.35") is None
+        assert apply_pillar_weights("technical=0.325,fundamental=0.325") is not None
+    finally:
+        config.clear_overrides()
+
+
+def test_a_weighting_is_one_trial_and_the_default_hash_is_unchanged(tmp_path):
+    """The identity rule. Legacy lines carry no `pillars` key; a default run must hash
+    to exactly what it hashed before the field existed, or all 34 recorded
+    configurations re-count the first time anyone runs the baseline again."""
+    base = {"start": "2016-01-01", "rebalance": "BME", "top_frac": 0.1, "top_n": None,
+            "cost_bps": 15.0}
+    # Absent, and explicitly-None, and the shipped weighting: all the same hash.
+    h = config_hash("composite", base, "broad:1500")
+    assert config_hash("composite", {**base, "pillars": None}, "broad:1500") == h
+    c = {"technical": 0.2, "fundamental": 0.45, "sentiment": 0.35,
+         "learned": 0.0, "catalyst": 0.0}
+    assert config_hash("composite", {**base, "pillars": c}, "broad:1500") != h
+    # ...and two different weightings are two different trials, each counted once.
+    d = {**c, "technical": 0.1, "fundamental": 0.55}
+    assert log_trial(tmp_path, "composite", base, {}, universe="broad:1500") == 1
+    assert log_trial(tmp_path, "composite", {**base, "pillars": c}, {},
+                     universe="broad:1500") == 2
+    assert log_trial(tmp_path, "composite", {**base, "pillars": c}, {},
+                     universe="broad:1500") == 2      # a re-run is verification
+    assert log_trial(tmp_path, "composite", {**base, "pillars": d}, {},
+                     universe="broad:1500") == 3
+    assert n_trial_runs(tmp_path) == 4
+
+
+def test_sentiment_weight_is_not_rank_neutral_when_a_pillar_is_missing():
+    """The structural fact this whole exercise turns on. `composite_3pillar` divides by
+    a PER-ROW weight sum, so a name whose fundamental pillar is NaN is normalized by
+    (wT + wS) while a complete name is normalized by (wT + wF + wS). Changing wS
+    therefore shrinks the two groups toward 0.5 at DIFFERENT rates and reorders them
+    against each other. With no NaN present the ratio rule does hold and the ranking is
+    invariant — both halves are asserted here because only the contrast explains it."""
+    from src.backtest.signals import composite_3pillar
+    d = [pd.Timestamp("2020-01-31")]
+    rng = np.random.default_rng(7)
+    syms = [f"S{i:02d}" for i in range(30)]
+    tech = pd.DataFrame([rng.random(30)], index=d, columns=syms)
+    fund = pd.DataFrame([rng.random(30)], index=d, columns=syms)
+    scored = pd.DataFrame([[True] * 30], index=d, columns=syms)
+    hi = {"technical": 0.35, "fundamental": 0.30, "sentiment": 0.35}
+    lo = {"technical": 0.35, "fundamental": 0.30, "sentiment": 0.10}
+
+    def rk(w, f):   # ranks, rounded first: two weightings that differ only by a
+        s = composite_3pillar(tech, f, scored, w).loc[d[0]]   # rescaling can still land
+        return s.round(12).rank()                             # 1e-17 apart in float64
+
+    assert rk(hi, fund).equals(rk(lo, fund))   # every pillar present -> wS cannot matter
+    thin = fund.copy()
+    thin.loc[d[0], syms[:8]] = np.nan          # 8 of 30 names with no fundamental pillar
+    thin_hi, thin_lo = rk(hi, thin), rk(lo, thin)
+    # ...and once one is missing, it does — by far more than a rounding artefact: the
+    # thin names climb several places against the complete ones.
+    assert (thin_hi - thin_lo).abs().max() >= 2
+    # The reordering is strictly BETWEEN the two groups, never inside either: within a
+    # group the weights are identical, so wS only moves complete names past thin ones.
+    for grp in (syms[:8], syms[8:]):
+        assert thin_hi[grp].rank().equals(thin_lo[grp].rank())

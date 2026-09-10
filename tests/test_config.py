@@ -30,7 +30,11 @@ def test_workspace_home_overrides_and_relocates_data(tmp_path, monkeypatch):
         assert config.get("ibkr.port") == 4002                    # overridden
         assert config.get("ibkr.client_id") == 17                 # default kept (deep merge)
         assert config.get("universe.sectors") == {"only": ["AAA", "BBB"]}  # list replaced, not appended
-        assert config.get("scoring.pillars.technical") == 0.35     # untouched section intact
+        # Untouched section survives the merge. Assert the SHAPE, not a magic number:
+        # pinning a weight here made a deliberate re-weighting look like a merge bug.
+        pillars = config.get("scoring.pillars")
+        assert set(pillars) >= {"technical", "fundamental", "sentiment"}
+        assert abs(sum(pillars.values()) - 1.0) < 1e-9
         assert config.db_path() == tmp_path.resolve() / "data" / "mine.db"
         assert config.cache_dir().is_relative_to(tmp_path.resolve())
     finally:

@@ -4,6 +4,8 @@
     python -m scripts.backtest --signal technical --start 2016-01-01
     python -m scripts.backtest --signal composite --top-frac 0.1 --cost-bps 15
     python -m scripts.backtest --all             # every baseline, one report each
+    python -m scripts.backtest --signal composite \
+        --pillar-weights "technical=0.2,fundamental=0.45,sentiment=0.35"
 
 Reports land under $CLAUDE_TRADER_HOME/data/history/backtests/<name>_<timestamp>/ and
 every run is appended to trials.jsonl. The number of DISTINCT configurations in that
@@ -27,6 +29,68 @@ from src.data.yfinance_live import every_n_trading_days, month_ends
 
 def _log(msg: str) -> None:
     print(f"[backtest] {msg}", flush=True)
+
+
+# Every pillar `scoring.pillars` knows about. `--pillar-weights` may name any of them;
+# `learned` and `catalyst` are accepted only so a typo is rejected rather than silently
+# ignored — giving either one weight still fails `signals.assert_replayable`.
+_PILLAR_KEYS = ("technical", "fundamental", "sentiment", "learned", "catalyst")
+
+
+def parse_pillar_weights(spec: str) -> dict[str, float]:
+    """`"technical=0.2,fundamental=0.45,sentiment=0.35"` -> {..}. Weights are used AS
+    GIVEN, not renormalized: `score_universe` and `composite_3pillar` both divide by a
+    PER-ROW weight sum, so rescaling all of them is not a no-op for a name whose
+    fundamental pillar is NaN. Silently normalizing would change the thing being
+    measured."""
+    out: dict[str, float] = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"--pillar-weights: expected pillar=weight, got {part!r}")
+        k, _, v = part.partition("=")
+        k = k.strip().lower()
+        if k not in _PILLAR_KEYS:
+            raise ValueError(f"--pillar-weights: unknown pillar {k!r} "
+                             f"(known: {', '.join(_PILLAR_KEYS)})")
+        try:
+            w = float(v)
+        except ValueError:
+            raise ValueError(f"--pillar-weights: {k}={v.strip()!r} is not a number") from None
+        if w < 0 or w != w:
+            raise ValueError(f"--pillar-weights: {k} must be >= 0, got {w}")
+        out[k] = w
+    if not out:
+        raise ValueError("--pillar-weights: no weights given")
+    if sum(out.values()) <= 0:
+        raise ValueError("--pillar-weights: the weights sum to 0")
+    return out
+
+
+def apply_pillar_weights(spec: str) -> dict[str, float] | None:
+    """Install `--pillar-weights` as a PROCESS-LOCAL override of `scoring.pillars` and
+    return the canonical form to record in the trial identity — or None when the
+    request is the shipped weighting after all, so that run keeps deduping against the
+    baseline instead of buying a new lottery ticket.
+
+    One override on the exact dotted path is all it takes to reach both consumers:
+    the replay resolves its weights through `signals.assert_replayable` ->
+    `config.get("scoring.pillars")`, and the live screen through
+    `scoring.score_universe` / `learned_weight` / `pillar_set` -> the same call.
+    Named pillars are MERGED over the configured dict rather than replacing it, so a
+    catalyst or learned weight someone put in config.yaml still trips the
+    unreplayable-pillar guard instead of being quietly dropped."""
+    base = dict(config.get("scoring.pillars", {}) or {})
+    merged = {**base, **parse_pillar_weights(spec)}
+    config.set_override("scoring.pillars", merged)
+
+    def _canon(d: dict) -> dict[str, float]:
+        return {k: round(float(d.get(k, 0.0) or 0.0), 6) for k in _PILLAR_KEYS}
+
+    canon = _canon(merged)
+    return None if canon == _canon(base) else canon
 
 
 def build_signal(name: str, store: HistoryStore, syms: list[str], subs: dict[str, str],
@@ -86,7 +150,8 @@ def universe_note(store: HistoryStore, eligible: dict, source: str,
 
 
 def run_one(name: str, store: HistoryStore, start: date, top_frac: float, top_n: int | None,
-            cost_bps: float, horizon_days: int | None = None) -> None:
+            cost_bps: float, horizon_days: int | None = None,
+            pillars: dict[str, float] | None = None) -> None:
     src = universe.configured_source()
     # The eligibility mask is keyed by source AND cap, so a report always runs on the
     # membership recorded for the cap it is configured at. Reading a bare `broad` mask
@@ -125,7 +190,10 @@ def run_one(name: str, store: HistoryStore, start: date, top_frac: float, top_n:
     secs = universe.sector_map(store=store, symbols=syms)
     spec = BacktestSpec(name=name, top_frac=top_frac, top_n=top_n, cost_bps_side=cost_bps,
                         params={"start": str(start),
-                                "rebalance": f"{horizon_days}d" if horizon_days else "BME"})
+                                "rebalance": f"{horizon_days}d" if horizon_days else "BME",
+                                # ONLY when it differs from the shipped weighting: a
+                                # present-and-null key would re-hash every prior trial.
+                                **({"pillars": pillars} if pillars else {})})
     # Read ONLY the scored names plus the report benchmarks. `close_matrix(None)` looked
     # harmless and was not: the engine takes its rebalance calendar from this frame's
     # index, so every unrelated symbol in the store could move a curated backtest's
@@ -152,6 +220,10 @@ def run_one(name: str, store: HistoryStore, start: date, top_frac: float, top_n:
     # The universe tag carries the SIZE CAP too: broad-250, broad-750 and broad-1500
     # are three different populations, so the same signal on them is three hypotheses,
     # not one re-run. `curated` has no cap and needs none.
+    if pillars:
+        # Only ever printed for a non-default weighting, so the default report stays
+        # byte-identical to the recorded baselines.
+        _log(f"{name}: pillar weights {pillars} (this process only)")
     uni_tag = mask   # same tag the eligibility mask is keyed by: one name for one population
     n_prior = n_trials(trials_root)
     this_hash = config_hash(name, params, uni_tag)
@@ -183,6 +255,12 @@ def main() -> None:
     ap.add_argument("--theme", default=None,
                     help="override the theme pack for this run only (e.g. ai_infra). "
                          "A curated universe needs the pack that owns its ticker list.")
+    ap.add_argument("--pillar-weights", default=None,
+                    help='override scoring.pillars for this run only, e.g. '
+                         '"technical=0.2,fundamental=0.45,sentiment=0.35". Weights are '
+                         'used as given (never renormalized) and MERGED over the '
+                         'configured dict. A weighting other than the shipped one is a '
+                         'distinct trial and is counted once.')
     ap.add_argument("--horizon-days", type=int, default=None,
                     help="rebalance AND label horizon in trading days (e.g. 10 swing, "
                          "42 position, 126 long). Omit for the default month-end grid.")
@@ -191,6 +269,12 @@ def main() -> None:
         config.set_override("universe.source", args.universe)
     if args.theme:
         config.set_override("theme", args.theme)
+    pillars = None
+    if args.pillar_weights:
+        try:
+            pillars = apply_pillar_weights(args.pillar_weights)
+        except ValueError as exc:
+            ap.error(str(exc))
     if args.universe or args.theme:
         _log(f"config overrides (this process only): {config.overrides()}")
     if args.horizon_days is not None and args.horizon_days < 1:
@@ -202,7 +286,7 @@ def main() -> None:
         ap.error("--signal or --all required")
     for n in names:
         run_one(n, store, start, args.top_frac, args.top_n, args.cost_bps,
-                horizon_days=args.horizon_days)
+                horizon_days=args.horizon_days, pillars=pillars)
 
 
 if __name__ == "__main__":

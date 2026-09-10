@@ -226,6 +226,14 @@ def _summarize(per: pd.DataFrame, deciles: pd.DataFrame, spec: BacktestSpec,
 # landed in) is bookkeeping, not a new bet on the data.
 _HASH_FIELDS = ("start", "rebalance", "top_frac", "top_n", "cost_bps")
 
+# Fields that join the identity ONLY when they are set. A run at the shipped pillar
+# weights is the same hypothesis as every run logged before `--pillar-weights`
+# existed, so the key must be ABSENT from the payload then, not present-and-null:
+# adding a null would re-hash all 34 configurations in `trials.jsonl` and make the
+# next default run look like a 35th lottery ticket. A run at any OTHER weighting is
+# a genuinely different bet on the data and gets its own hash, exactly once.
+_OPTIONAL_HASH_FIELDS = ("pillars",)
+
 
 def config_hash(name: str, params: dict[str, Any], universe: str | None = None) -> str:
     """Stable short hash of the strategy configuration a trial tested.
@@ -241,6 +249,11 @@ def config_hash(name: str, params: dict[str, Any], universe: str | None = None) 
     byte-identical, plus the horizon grid re-run on a corrected exchange calendar.
     Every Deflated Sharpe here was being penalised for regression testing.
 
+    `pillars` (see `_OPTIONAL_HASH_FIELDS`) is part of the identity when, and only
+    when, `--pillar-weights` asked for something other than the shipped weights: a
+    re-weighted composite is a different signal, but the shipped weighting must keep
+    the hash it has always had or every prior trial re-counts.
+
     `universe` is part of the identity because the same signal on 105 curated names and
     on 1,500 registrant-derived ones are two different hypotheses about two different
     populations. It is None on lines written before the field existed, and stays None
@@ -249,6 +262,8 @@ def config_hash(name: str, params: dict[str, Any], universe: str | None = None) 
     """
     payload = {"name": name, "universe": universe,
                **{k: params.get(k) for k in _HASH_FIELDS}}
+    payload.update({k: params[k] for k in _OPTIONAL_HASH_FIELDS
+                    if params.get(k) is not None})
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
 

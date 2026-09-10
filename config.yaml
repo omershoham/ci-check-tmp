@@ -119,8 +119,18 @@ regime:
 scoring:
   # Three-pillar composite ranking score (balanced; tune for your horizon).
   pillars:
-    technical: 0.35    # RSI, MACD, SMA trend/crosses, 52w position, volume (src/technical.py)
-    fundamental: 0.30  # valuation, cashflow, growth, quality (yfinance)
+    # Changed 2026-09-10 from technical 0.35 / fundamental 0.30, on a pre-registered
+    # six-way comparison over broad-1500, 115 non-overlapping dates. Read the result
+    # honestly: mean rank IC is STATISTICALLY IDENTICAL across every weighting tried
+    # (paired per-date differences all |t| < 1), so this is NOT "the better ranker".
+    # What is unambiguous is arithmetic: turnover 90.7% -> 61.6% per rebalance and cost
+    # drag 1.60% -> 1.09%/yr. The technical pillar's contribution to the composite was
+    # mostly churn. It keeps a real weight because removing it further worsens max
+    # drawdown monotonically (-27.2% -> -33.4% at zero) -- it buys trend control it
+    # does not buy ranking skill. Do not read the t-stat rise (2.52 -> 3.62) as skill:
+    # it is variance reduction from down-weighting a noisy input.
+    technical: 0.20    # RSI, MACD, SMA trend/crosses, 52w position, volume (src/technical.py)
+    fundamental: 0.45  # valuation, cashflow, growth, quality (SEC point-in-time store)
     sentiment: 0.35    # local-LLM news TONE only (events live in the catalyst pillar)
     learned: 0.0       # ML ranking pillar (src/ml). SHIPPED DARK: raise only after
                        # `python -m scripts.train_ranker` reports every kill criterion PASSED.
