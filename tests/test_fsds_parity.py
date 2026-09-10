@@ -201,6 +201,7 @@ def _parity_sample() -> list:
 
 
 @pytest.mark.slow
+@pytest.mark.real_store
 @pytest.mark.skipif(len(_cached_quarters()) < 4,
                     reason="needs cached FSDS ZIPs (scripts.data_refresh --facts-bulk)")
 def test_fsds_matches_companyfacts_on_cached_quarters():
@@ -240,3 +241,81 @@ def test_fsds_matches_companyfacts_on_cached_quarters():
     assert share >= 0.95, (
         f"only {share:.1%} of {len(both)} overlapping facts agree; "
         f"worst:\n{both[~close].head(10)}")
+
+
+# ------------------------------------------------- share classes (the BRK-B case)
+def _shares(**kw):
+    return _num(tag="CommonStockSharesOutstanding", uom="shares", qtrs="0", **kw)
+
+
+def test_per_class_share_rows_are_summed_when_there_is_no_consolidated_row(tmp_path):
+    """Berkshire tags shares ONLY per share class with a non-empty `segments`, so the
+    consolidated-only rule discarded every share row it publishes: no share count, no
+    market cap, no floor pass, and BRK-B was absent from the universe with nothing
+    anywhere saying why."""
+    df = _parse(tmp_path, [_sub()], [
+        _shares(value="1437720", segments="ClassOfStock=EquivalentClassA;"),
+        _shares(value="2156580296", segments="ClassOfStock=EquivalentClassB;"),
+    ])
+    sh = df[df["concept"] == "sharesOutstanding"]
+    assert len(sh) == 1
+    assert sh["val"].iloc[0] == 1437720 + 2156580296
+
+
+def test_a_consolidated_share_row_beats_the_class_breakdown(tmp_path):
+    """Alphabet publishes BOTH the class split and the CIK total
+    (12,211M = 5,835 + 861 + 5,515). Summing on top of the total would double every
+    Alphabet market cap ever computed."""
+    df = _parse(tmp_path, [_sub()], [
+        _shares(value="12211000000"),
+        _shares(value="5835000000", segments="ClassOfStock=CommonClassA;"),
+        _shares(value="861000000", segments="ClassOfStock=CommonClassB;"),
+        _shares(value="5515000000", segments="ClassOfStock=CapitalClassC;"),
+    ])
+    sh = df[df["concept"] == "sharesOutstanding"]
+    assert len(sh) == 1
+    assert sh["val"].iloc[0] == 12_211_000_000
+
+
+def test_a_combined_class_member_is_not_added_to_its_own_parts(tmp_path):
+    """5% of class-split groups carry a "CommonClassAAndClassB" member alongside the
+    individual classes; adding them counts the same shares twice."""
+    df = _parse(tmp_path, [_sub()], [
+        _shares(value="700", segments="ClassOfStock=CommonClassA;"),
+        _shares(value="300", segments="ClassOfStock=CommonClassB;"),
+        _shares(value="1000", segments="ClassOfStock=CommonClassAAndClassB;"),
+    ])
+    sh = df[df["concept"] == "sharesOutstanding"]
+    assert len(sh) == 1 and sh["val"].iloc[0] == 1000
+
+
+def test_only_the_share_class_axis_is_summed(tmp_path):
+    """Every other segment axis slices the SAME shares a different way, so summing it
+    multiplies the count. `EquityComponents` appears on 7,000 share rows a quarter."""
+    df = _parse(tmp_path, [_sub()], [
+        _shares(value="500", segments="EquityComponents=CommonStock;"),
+        _shares(value="500", segments="ClassOfStock=CommonClassB;Restatement=Prior;"),
+    ])
+    assert df.empty
+
+
+def test_the_segments_exception_is_only_for_share_counts(tmp_path):
+    """Relaxing the consolidated rule for anything else re-opens the #1 FSDS trap."""
+    df = _parse(tmp_path, [_sub()], [
+        _num(tag="Revenues", value="60", segments="ClassOfStock=CommonClassA;"),
+        _num(tag="Revenues", value="40", segments="ClassOfStock=CommonClassB;"),
+    ])
+    assert df.empty
+
+
+def test_a_class_breakdown_mixed_with_another_axis_is_not_summed(tmp_path):
+    """Regeneron tags `CommonStockSharesOutstanding` as `ClassOfStock=CommonClassA`
+    (1.8m) AND `EquityComponents=CommonStock` (137.9m) — two different axes over the
+    same shares. "The classes" is then not a partition of anything, and summing the one
+    recognisable axis gave Regeneron a market cap 77x too small. No count is the honest
+    answer; the `no_share_count` check says so out loud."""
+    df = _parse(tmp_path, [_sub()], [
+        _shares(value="1800000", segments="ClassOfStock=CommonClassA;"),
+        _shares(value="137900000", segments="EquityComponents=CommonStock;"),
+    ])
+    assert df.empty or df[df["concept"] == "sharesOutstanding"].empty

@@ -15,7 +15,7 @@ survivorship-aware universe.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
@@ -47,9 +47,52 @@ FLOW_TAGS: dict[str, list[str]] = {
     "cfo": ["NetCashProvidedByUsedInOperatingActivities",
             "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
             "CashFlowsFromUsedInOperatingActivities"],
+    # Capex decides `freeCashflow = cfo - |capex|`. When NO tag here resolves, the
+    # subtraction is skipped and FCF silently BECOMES cash flow from operations — so a
+    # capex-heavy filer reads strongly FCF-positive. Dominion (a regulated utility) and
+    # Digital Realty (a REIT) are the recorded cases: neither uses the standard PP&E
+    # tag, so both were scored on cash flow that had not paid for anything. 211 of the
+    # ~1,475 screened names had no capex tag at all before these fallbacks.
+    #
+    # ORDER MATTERS AND IS NOT COSMETIC. `_best()` picks the tag whose TTM window ends
+    # LATEST and uses this list only to break ties — and a filer that reports two of
+    # these in the same 10-K produces an exact tie. The broadest measure of the same
+    # quantity therefore comes first, so a narrow sub-component (capital improvements,
+    # machinery only) can win only when it is genuinely fresher.
+    #
+    # Excluded on purpose: `CapitalExpendituresIncurredButNotYetPaid` (an accrual
+    # disclosure, not a cash outflow — subtracting it double-counts), the
+    # `PaymentsToAcquireIntangibleAssets`/software family (not PP&E, and the filers
+    # that use it mostly also report PP&E), and `PaymentsToAcquireRealEstate*`
+    # (buying whole buildings is closer to M&A than to maintenance capex; REIT cash
+    # flow is scored on FFO, not FCF, for exactly this reason).
+    #
+    # Also excluded, and this one was MEASURED rather than reasoned: the
+    # `PaymentsToAcquireOther*` pair. "Other property, plant and equipment" is a
+    # RESIDUAL line — whatever did not fit the main one — so wherever a filer reports
+    # both, the residual is the fresher tag and `_best()` hands it the whole capex
+    # number. Alaska Air switched primary tags in 2024 and kept tagging the residual:
+    # including it cut its capex from $1.49B to $216M and moved it 556 ranks UP on a
+    # free-cash-flow number that had just become wrong. A sub-component can never be
+    # the total, so no ordering fixes this — the tag has to go. The ~110 filers whose
+    # ONLY capex tag is a residual now report no capex at all, which the
+    # `capex_tag_missing` check says out loud instead of quietly inventing a figure.
     "capex": ["PaymentsToAcquirePropertyPlantAndEquipment",
+              "PaymentsToAcquirePropertyPlantAndEquipmentIncludingNuclearFuel",
+              "PaymentsToAcquirePropertyPlantAndEquipmentNet",
+              "PaymentsToAcquirePropertyAndEquipment",
               "PaymentsToAcquireProductiveAssets",
-              "PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities"],
+              "PaymentsForProceedsFromProductiveAssets",
+              "PaymentsToAcquireMachineryAndEquipment",
+              "PaymentsToDevelopRealEstateAssets",
+              "PaymentsForCapitalImprovements",
+              "PaymentForPropertyImprovements",
+              "PaymentsToExploreAndDevelopOilAndGasProperties",
+              "PaymentsToAcquireOilAndGasPropertyAndEquipment",
+              "PaymentsToAcquireOilAndGasProperty",
+              "PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities",
+              "PurchaseOfPropertyPlantAndEquipmentIntangibleAssetsOtherThanGoodwill",
+              "InvestmentPropertyAndOtherNoncurrentAssets"],
     "dna": ["DepreciationDepletionAndAmortization", "DepreciationAndAmortization",
             "DepreciationAmortizationAndAccretionNet", "Depreciation",
             "DepreciationAndAmortisationExpense"],
@@ -74,13 +117,34 @@ SHARES_TAG = ("dei", "EntityCommonStockSharesOutstanding")
 # segmented row, so the bulk path has to fall back to the balance sheet. Market cap
 # depends on this, so an empty result here silently removes a name from any valuation
 # screen. Order matters: cover page, then outstanding, then issued, then diluted avg.
+# ORDER IS BY CORRECTNESS OF THE CONCEPT, not by convenience. Market cap needs shares
+# OUTSTANDING. `CommonStockSharesIssued` is a different quantity -- it includes treasury
+# stock -- and for a company that has bought back heavily it is not close: AIG issued
+# 1,906.7M vs 538.1M actually outstanding, Kroger 1,918.0M vs 613.0M, Aflac 1,358.8M vs
+# 513.1M, Marathon 995.0M vs 295.0M. Ranked above the weighted averages it overstated
+# market cap 2-3.5x for 216 of the ~1,500 screened names, which corrupts the liquidity
+# floor and every market-cap-denominated ratio (priceToBook, ev_sales, fcf_yield,
+# net_cash_mcap). A period-average of the RIGHT quantity beats a point-in-time reading
+# of the wrong one, so Issued is now the last resort -- right only when a filer holds no
+# treasury stock, which is exactly when it equals outstanding anyway.
 SHARES_TAGS = ["EntityCommonStockSharesOutstanding",
                "CommonStockSharesOutstanding",
-               "CommonStockSharesIssued",
-               "WeightedAverageNumberOfDilutedSharesOutstanding"]
+               # Both weighted averages measure the RIGHT quantity (outstanding) over a
+               # period. The basic one is also the ONLY share tag Berkshire publishes in
+               # num.txt -- a filer with no instant count and no diluted average is
+               # otherwise invisible to the market-cap floor, see `no_share_count` in
+               # data/quality.py, which exists because that failure leaves no trace.
+               "WeightedAverageNumberOfDilutedSharesOutstanding",
+               "WeightedAverageNumberOfSharesOutstandingBasic",
+               "CommonStockSharesIssued"]   # wrong concept -- last resort only
 
 # Forms that ARE a periodic report (the things a "next earnings date" counts).
 _PERIODIC_FORMS = ("10-K", "10-Q", "20-F", "40-F", "6-K", "8-K")
+
+# A balance-sheet tag whose newest period end is more than this far behind the
+# newest available one has been abandoned by the filer and must not outrank a
+# current tag, however much better its definition is. A year plus a filing lag.
+_INSTANT_STALE_DAYS = 400
 
 _Q_DAYS = (75, 105)      # a fiscal quarter
 _A_DAYS = (340, 380)     # a fiscal year
@@ -125,6 +189,14 @@ def facts_frame(symbol: str, cik: str, cf: dict[str, Any]) -> pd.DataFrame:
         wanted += [(t, concept) for t in tags]
     for concept, tags in INSTANT_TAGS.items():
         wanted += [(t, concept) for t in tags]
+    # The us-gaap share fallbacks, same list the bulk path uses. Without them this path
+    # emitted ONLY the dei cover-page count, so a filer that omits it (or reports it
+    # only per share class, which companyfacts does not carry) arrived with no share
+    # count at all -> null market cap -> silent floor failure. The two ingest paths
+    # must be able to serve the same concepts or a symbol's coverage depends on which
+    # one last touched it.
+    wanted += [(t, "sharesOutstanding") for t in SHARES_TAGS
+               if t != SHARES_TAG[1]]
     for tag, concept in wanted:
         # First namespace that carries this tag wins, so a us-gaap filer never picks up
         # an identically-named IFRS tag (Assets, GrossProfit and ProfitLoss exist in both).
@@ -134,14 +206,20 @@ def facts_frame(symbol: str, cik: str, cf: dict[str, Any]) -> pd.DataFrame:
             if u:
                 units = u
                 break
-        unit = _currency_unit(units)
-        if unit is None:
+        unit = "shares" if concept == "sharesOutstanding" else _currency_unit(units)
+        if unit is None or unit not in units:
             continue
+        # A weighted-average count is tagged as a DURATION; `prepare_symbol` reads the
+        # share count from the instant table only, so it has to be re-stamped as an
+        # instant at its period end (SHARES_TAGS ranks it last, so a real instant still
+        # wins). Same rule the FSDS path applies, for the same reason.
+        as_instant = concept == "sharesOutstanding" and tag.startswith("WeightedAverageNumber")
         for it in units.get(unit, []):
             if it.get("val") is None or not it.get("end") or not it.get("filed"):
                 continue
             rows.append({"symbol": symbol, "cik": str(cik).zfill(10), "concept": concept,
-                         "tag": tag, "unit": unit, "start": it.get("start"),
+                         "tag": tag, "unit": unit,
+                         "start": None if as_instant else it.get("start"),
                          "end": it["end"], "val": float(it["val"]), "filed": it["filed"],
                          "form": it.get("form"), "frame": it.get("frame"),
                          "fy": it.get("fy"), "fp": it.get("fp")})
@@ -305,9 +383,48 @@ def _ttm_prev_tab(qt: _Tab, at: _Tab, as_of: np.datetime64) -> float | None:
     return float(a.val[m][idx])
 
 
-def _instant_tab(it: _Tab, as_of: np.datetime64) -> float | None:
+# A share count cannot be a small fraction of the WEIGHTED AVERAGE share count over
+# the same period — the average is an average OF the outstanding count. Accenture and
+# Estee Lauder are why this exists: both tag a consolidated
+# `CommonStockSharesOutstanding` that is really one share class (Accenture's Class X,
+# 300,673, against 616m weighted-average shares), so a rule that prefers "outstanding"
+# over "weighted average" — which is the right preference everywhere else — hands a
+# $180bn company a $56m market cap. Issued legitimately exceeds outstanding when a
+# filer holds a lot of treasury stock (Moody's is 1.9x), so the band is wide.
+_SHARES_VS_WAVG = (0.5, 4.0)
+_WAVG_TAGS = ("WeightedAverageNumberOfSharesOutstandingBasic",
+              "WeightedAverageNumberOfDilutedSharesOutstanding")
+
+
+def _plausible_share_counts(cands: list, tags: list[str]) -> list:
+    """Drop share-count candidates that contradict the weighted-average count.
+
+    Called AFTER the staleness filter, never before: NextEra's weighted-average tags
+    stop in 2019, before its 4-for-1 split, so an abandoned 482m reference rejected a
+    current and correct 2,085m count and cut its market cap from $174bn to $40bn. A
+    reference that is itself stale is not a reference."""
+    ref = None
+    for want in _WAVG_TAGS:
+        for i, v, _ in cands:
+            if i < len(tags) and tags[i] == want and v > 0:
+                ref = v
+                break
+        if ref:
+            break
+    if not ref:
+        return cands
+    lo, hi = _SHARES_VS_WAVG
+    return [c for c in cands if lo * ref <= c[1] <= hi * ref] or cands
+
+
+def _instant_tab_dated(it: _Tab, as_of: np.datetime64):
+    """(value, period end) of the latest knowable instant for one tag."""
     k = it.knowable(as_of).dedupe_by_end()
-    return float(k.val[-1]) if len(k.end) else None
+    return (float(k.val[-1]), k.end[-1]) if len(k.end) else (None, None)
+
+
+def _instant_tab(it: _Tab, as_of: np.datetime64) -> float | None:
+    return _instant_tab_dated(it, as_of)[0]
 
 
 @dataclass
@@ -316,6 +433,10 @@ class PreparedFacts:
     flows: dict[str, list[tuple[_Tab, _Tab]]]      # concept -> [(quarters, annual)] in tag order
     instants: dict[str, list[_Tab]]                # concept -> [tab] in tag order
     currency: str = "USD"                          # the filer's own statement currency
+    # concept -> the tag NAME behind each instants[] entry, parallel to that list.
+    # `inst()` needs it to find the weighted-average share count it sanity-checks
+    # against; without it the list is positional and anonymous.
+    instant_tags: dict[str, list[str]] = field(default_factory=dict)
 
 
 def _statement_currency(sym_facts: pd.DataFrame) -> str:
@@ -351,16 +472,19 @@ def prepare_symbol(sym_facts: pd.DataFrame) -> PreparedFacts:
                  "val": pd.Series(dtype=float), "filed": pd.Series(dtype="datetime64[ns]")}))))
         if lst:
             flows[concept] = lst
+    itags: dict[str, list[str]] = {}
     for concept, tags in list(INSTANT_TAGS.items()) + [("sharesOutstanding", SHARES_TAGS)]:
         g = sym_facts[(sym_facts["concept"] == concept) & (sym_facts["start"].isna())]
-        lst = []
+        lst, names = [], []
         for tag in tags:
             gt = g[g["tag"] == tag]
             if not gt.empty:
                 lst.append(_Tab.from_df(gt.assign(start=pd.NaT)))
+                names.append(tag)
         if lst:
             insts[concept] = lst
-    return PreparedFacts(flows, insts, _statement_currency(sym_facts))
+            itags[concept] = names
+    return PreparedFacts(flows, insts, _statement_currency(sym_facts), itags)
 
 
 def raw_asof_prepared(pf: PreparedFacts, as_of: date, price: float | None,
@@ -401,11 +525,52 @@ def raw_asof_prepared(pf: PreparedFacts, as_of: date, price: float | None,
         return _ttm_prev_tab(qt, at, ts) if prev else _ttm_tab(qt, at, ts)
 
     def inst(concept: str) -> float | None:
-        for it in pf.instants.get(concept, []):
-            v = _instant_tab(it, ts)
-            if v is not None:
-                return v
-        return None
+        """Highest-priority tag among those that are CURRENT; a stale tag never wins.
+
+        Two failure modes have to be avoided at once, and picking either extreme
+        causes the other:
+
+        * Pure list order (what this did before) is the MSFT stale-tag bug one level
+          down: filers abandon a balance-sheet tag and it keeps returning its last
+          value forever. Amcor kept a single 2019 `CommonStockSharesOutstanding` row
+          of 13,001 ahead of a current `CommonStockSharesIssued` of 462m; Prudential
+          kept a 2013 row of 2,000,000 ahead of 666m. Both market caps were wrong by
+          four orders of magnitude and both names dropped below the liquidity floor
+          with no trace.
+        * Pure recency breaks the other way, because these tags are not alternative
+          spellings of one quantity: shares ISSUED includes treasury stock and shares
+          OUTSTANDING does not, so whichever happened to be tagged last would win and
+          the answer would flip between two genuinely different numbers. Reinsurance
+          Group is the case — SEC's own data carries a mis-scaled
+          `CommonStockSharesIssued` of 8.5e13 for 2026 next to a correct
+          `CommonStockSharesOutstanding` of 8.5e7.
+
+        So: freshness is a QUALIFIER, not the ranking. Everything within
+        `_INSTANT_STALE_DAYS` of the newest available period end is "current", and
+        among those the SHARES_TAGS/INSTANT_TAGS order — which encodes which tag is
+        the better definition — decides. A tag only loses on age when it is more than
+        a year behind, which is what "abandoned" looks like.
+
+        Zero is not a share count: Moody's tags `CommonStockSharesOutstanding` as 0 on
+        every filing (its real figure is issued minus treasury), and 0 is not None, so
+        it was returned as the answer and the market cap became undefined.
+        """
+        positive_only = concept == "sharesOutstanding"
+        tags = pf.instant_tags.get(concept, [])
+        cands = []
+        for i, it in enumerate(pf.instants.get(concept, [])):
+            v, e = _instant_tab_dated(it, ts)
+            if v is None or e is None or (positive_only and v <= 0):
+                continue
+            cands.append((i, v, e))
+        if not cands:
+            return None
+        newest = max(e for _, _, e in cands)
+        cutoff = newest - np.timedelta64(_INSTANT_STALE_DAYS, "D")
+        current = [c for c in cands if c[2] >= cutoff] or cands
+        if positive_only:
+            current = _plausible_share_counts(current, tags)
+        return min(current, key=lambda c: c[0])[1]
 
     if not pf.flows and not pf.instants:
         return None
@@ -577,16 +742,33 @@ def raw_asof(sym_facts: pd.DataFrame, as_of: date, price: float | None,
         return _ttm_prev(gt, ts) if prev else _ttm(gt, ts)
 
     def inst(concept: str) -> float | None:
+        # Same rule as inst() in the fast path: a tag more than a year behind the
+        # newest one is abandoned and cannot win; among current tags, list order.
         g = by.get(concept)
         if g is None:
             return None
+        positive_only = concept == "sharesOutstanding"
+        cands, tags = [], []
         for tag in INSTANT_TAGS.get(concept, []) + SHARES_TAGS:
             gt = g[g["tag"] == tag]
-            if not gt.empty:
-                v = _instant(gt, ts)
-                if v is not None:
-                    return v
-        return None
+            if gt.empty:
+                continue
+            v = _instant(gt, ts)
+            if v is None or (positive_only and v <= 0):
+                continue
+            e = gt[gt["end"] <= ts]["end"].max()
+            if pd.isna(e):
+                continue
+            cands.append((len(tags), v, e))
+            tags.append(tag)
+        if not cands:
+            return None
+        newest = max(e for _, _, e in cands)
+        cutoff = newest - pd.Timedelta(days=_INSTANT_STALE_DAYS)
+        current = [c for c in cands if c[2] >= cutoff] or cands
+        if positive_only:
+            current = _plausible_share_counts(current, tags)
+        return min(current, key=lambda c: c[0])[1]
 
     rev, rev_prev = flow("totalRevenue"), flow("totalRevenue", prev=True)
     ni, ni_prev = flow("netIncome"), flow("netIncome", prev=True)

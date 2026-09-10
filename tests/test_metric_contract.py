@@ -311,3 +311,28 @@ def test_family_score_empty_and_nonempty_branches_agree_on_the_denominator():
     df2 = pd.DataFrame({"fcf_yield": [0.05, 0.03], "fcf_margin": [None, None]}, index=idx)
     _, _, n_cols2 = scoring._family_score(df2, scoring._CASHFLOW, None, None, "universe", 0)
     assert list(n_cols2) == [1.0, 1.0], "only fcf_yield is rankable here"
+
+
+# ---------------------------------------------------- XBRL tag-list hygiene
+# A missing comma between two adjacent string literals in a tag list is not a syntax
+# error -- Python concatenates them. The result is one tag name that matches nothing in
+# any filing, so BOTH intended tags go silently dead and every filer that used either
+# one loses that concept. It happened once, in FLOW_TAGS["capex"], and the only symptom
+# was a slightly larger `capex_tag_missing` count in the data-quality report.
+def test_no_tag_name_is_two_names_glued_together():
+    from src.data import sec_facts as SF
+
+    lists = {f"FLOW_TAGS[{k!r}]": v for k, v in SF.FLOW_TAGS.items()}
+    lists |= {f"INSTANT_TAGS[{k!r}]": v for k, v in SF.INSTANT_TAGS.items()}
+    lists["SHARES_TAGS"] = SF.SHARES_TAGS
+
+    # Real us-gaap/IFRS element names are long, but not THIS long: the longest tag the
+    # SEC taxonomy actually publishes is comfortably under 80 characters.
+    offenders = {name: [t for t in tags if len(t) > 80] for name, tags in lists.items()}
+    offenders = {k: v for k, v in offenders.items() if v}
+    assert not offenders, f"implausibly long tag names (missing comma?): {offenders}"
+
+    for name, tags in lists.items():
+        assert len(tags) == len(set(tags)), f"{name} has duplicate tags"
+        for t in tags:
+            assert t and t[0].isupper() and t.isalnum(), f"{name}: malformed tag {t!r}"

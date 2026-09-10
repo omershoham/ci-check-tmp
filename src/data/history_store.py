@@ -106,7 +106,9 @@ def _filed_quarters(filed: pd.Series) -> pd.Series:
 
 class HistoryStore:
     def __init__(self, root: Path | None = None):
-        self.root = Path(root) if root else (config.HOME / "data" / "history")
+        # `config.history_root()` and not `config.HOME/...`: a function is a seam the
+        # test suite can redirect, a constant is not. See config.history_root.
+        self.root = Path(root) if root else Path(config.history_root())
         self.prices_dir = self.root / "prices" / "daily"
         self.facts_dir = self.root / "fundamentals" / "facts"
         self.snap_dir = self.root / "fundamentals" / "snapshots"
@@ -547,10 +549,14 @@ class HistoryStore:
         return self.refresh_facts_manifest()
 
     def facts(self, symbols: list[str] | None = None, start: date | None = None,
-              end: date | None = None) -> pd.DataFrame:
+              end: date | None = None, columns: list[str] | None = None) -> pd.DataFrame:
         """Long fact frame. `start`/`end` bound the FILING date (the only date a PIT
         consumer may bound on) and are restated as `filed_quarter` bounds so whole
-        quarters are pruned; the labels sort chronologically as strings."""
+        quarters are pruned; the labels sort chronologically as strings.
+
+        `columns` projects at the scanner, the same way `prices()` does — a whole-store
+        scan that only wants (symbol, concept, filed) should not materialise 13 columns
+        over millions of rows."""
         self._ensure_layout()
         filters: list = []
         if symbols:
@@ -561,11 +567,13 @@ class HistoryStore:
         if end:
             filters += [("filed_quarter", "<=", _quarter_label(pd.Timestamp(end))),
                         ("filed", "<=", pd.Timestamp(end))]
-        df = self._read_parts(self.facts_dir, _QUARTER_PART, filters=filters or None)
+        df = self._read_parts(self.facts_dir, _QUARTER_PART, columns=columns,
+                              filters=filters or None)
         if df.empty:
             return df
         for c in ("start", "end", "filed"):
-            df[c] = pd.to_datetime(df[c])
+            if c in df.columns:
+                df[c] = pd.to_datetime(df[c])
         return df.reset_index(drop=True)
 
     def shares_asof(self, symbols: list[str] | None, as_of: date) -> pd.Series:
@@ -585,12 +593,39 @@ class HistoryStore:
         if symbols:
             filters.append(("symbol", "in", sorted(set(symbols))))
         df = self._read_parts(self.facts_dir, _QUARTER_PART,
-                              columns=["symbol", "end", "val", "filed"], filters=filters)
+                              columns=["symbol", "tag", "end", "val", "filed"],
+                              filters=filters)
         if df.empty:
             return pd.Series(dtype=float, name="sharesOutstanding")
-        last = (df.sort_values(["symbol", "filed", "end"], kind="stable")
-                  .groupby("symbol", sort=True).tail(1))
-        return last.set_index("symbol")["val"].astype(float).rename("sharesOutstanding")
+        # The same tag-selection rule the snapshot path uses, applied per symbol. It
+        # used to take whichever row was filed last, ignoring WHICH tag it came from —
+        # so this function and `sec_facts.raw_asof_prepared` could disagree about the
+        # same company on the same date. They are the two halves of one decision: this
+        # one decides whether a name passes the market-cap floor at all, that one
+        # prices every multiple once it has. Accenture is the case: a consolidated
+        # `CommonStockSharesOutstanding` row that is really its Class X count (300,673)
+        # is the most recently filed, so the floor priced a $180bn company at $31m and
+        # dropped it from the universe, while the snapshot had it right.
+        from . import sec_facts as SF
+        per_tag = (df.sort_values(["symbol", "tag", "end", "filed"], kind="stable")
+                     .groupby(["symbol", "tag"], sort=False)
+                     .agg(val=("val", "last"), end=("end", "last")).reset_index())
+        per_tag = per_tag[per_tag["val"] > 0]
+        order = {t: i for i, t in enumerate(SF.SHARES_TAGS)}
+        out: dict[str, float] = {}
+        for sym, g in per_tag.groupby("symbol", sort=True):
+            g = g.assign(_o=g["tag"].map(order)).dropna(subset=["_o"])
+            if g.empty:
+                continue
+            g = g.sort_values("_o")
+            newest = g["end"].max()
+            cur = g[g["end"] >= newest - pd.Timedelta(days=SF._INSTANT_STALE_DAYS)]
+            cands = [(i, float(v), e) for i, (v, e)
+                     in enumerate(zip(cur["val"], cur["end"]))]
+            cands = SF._plausible_share_counts(cands, list(cur["tag"]))
+            if cands:
+                out[sym] = min(cands, key=lambda c: c[0])[1]
+        return pd.Series(out, dtype=float).rename("sharesOutstanding")
 
     # ----------------------------------------------------------- snapshots
     def _snapshot_years(self) -> list[int]:

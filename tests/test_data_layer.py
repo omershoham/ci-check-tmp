@@ -250,3 +250,216 @@ def test_snapshot_replay_is_identical_serial_and_parallel(tmp_path, facts):
     one = SF.build_snapshots(store, ["TST", "TST2"], dates, log=lambda m: None, workers=1)
     many = SF.build_snapshots(store, ["TST", "TST2"], dates, log=lambda m: None, workers=2)
     assert not one.empty and one.equals(many)
+
+
+# ---------------------------------------------------------------- test isolation
+def test_the_default_history_store_lives_inside_pytest_tmp(tmp_path_factory):
+    """`HistoryStore()` with no root must never resolve to the user's real data.
+
+    It used to: the constructor read `config.HOME` directly, so `record_universe` in
+    the offline pipeline test appended a row to `$CLAUDE_TRADER_HOME/data/history`.
+    Cloning this repo and running the suite mutated your own store.
+    """
+    base = tmp_path_factory.getbasetemp().resolve()
+    assert base in HistoryStore().root.resolve().parents
+
+
+def test_a_store_outside_the_tmp_tree_fails_loudly(tmp_path):
+    """The redirect above is a default; this is the enforcement.
+
+    A helper that builds its own path from `config.HOME`, or a store constructed
+    before the fixture ran, would slip past the monkeypatch — and the damage is
+    invisible, because the write succeeds and the suite still passes.
+    """
+    import pathlib
+    with pytest.raises(AssertionError, match="OUTSIDE pytest's tmp tree"):
+        HistoryStore(pathlib.Path.home() / "definitely-not-a-test-store")
+
+
+# ------------------------------------------------------------------------- capex
+def _quarters(concept, tag, vals, year=2024):
+    """Four quarters of one tag, filed ~40 days after each period end."""
+    ends = [(f"{year}-01-01", f"{year}-03-31", f"{year}-05-09"),
+            (f"{year}-04-01", f"{year}-06-30", f"{year}-08-08"),
+            (f"{year}-07-01", f"{year}-09-30", f"{year}-11-07"),
+            (f"{year}-10-01", f"{year}-12-31", f"{year + 1}-02-20")]
+    return _flow(concept, tag, [(s, e, v, f) for (s, e, f), v in zip(ends, vals)])
+
+
+def _prepared(rows):
+    """Prepared facts for a synthetic filer. Revenue is always present because
+    `raw_asof_prepared` returns None outright when nothing core is knowable."""
+    rows = rows + _quarters("totalRevenue", "Revenues", [1000, 1000, 1000, 1000])
+    df = pd.DataFrame(rows)
+    for c in ("start", "end", "filed"):
+        df[c] = pd.to_datetime(df[c])
+    return sec_facts.prepare_symbol(df)
+
+
+def test_a_utility_capex_tag_is_subtracted_from_operating_cash_flow(tmp_path):
+    """Dominion reports capex as `...IncludingNuclearFuel`, Digital Realty as
+    `PaymentsToDevelopRealEstateAssets`. With neither in FLOW_TAGS, `freeCashflow`
+    silently BECAME cash flow from operations, so a capex-heavy utility and a REIT both
+    read strongly FCF-positive — a wrong number, not a missing one."""
+    for tag in ("PaymentsToAcquirePropertyPlantAndEquipmentIncludingNuclearFuel",
+                "PaymentsToDevelopRealEstateAssets", "PaymentsForCapitalImprovements"):
+        pf = _prepared(_quarters("cfo", "NetCashProvidedByUsedInOperatingActivities",
+                                 [100, 100, 100, 100])
+                       + _quarters("capex", tag, [30, 30, 30, 30]))
+        raw = sec_facts.raw_asof_prepared(pf, date(2025, 3, 31), price=10.0)
+        assert raw["cfo"] == 400 and raw["freeCashflow"] == 400 - 120, tag
+
+
+def test_capex_falls_back_to_cash_flow_only_when_no_tag_resolves(tmp_path):
+    """The behaviour the fallbacks exist to stop, pinned so it cannot come back
+    silently: with no capex tag at all, FCF is CFO and nothing says so."""
+    pf = _prepared(_quarters("cfo", "NetCashProvidedByUsedInOperatingActivities",
+                             [100, 100, 100, 100]))
+    raw = sec_facts.raw_asof_prepared(pf, date(2025, 3, 31), price=10.0)
+    assert raw["freeCashflow"] == raw["cfo"] == 400
+
+
+def test_the_freshest_capex_tag_wins_and_ties_go_to_list_order(tmp_path):
+    """`_best()` picks the tag whose TTM ends LATEST — so a filer that switched tags is
+    read correctly, and one that reports two tags in the SAME filing produces an exact
+    tie that `FLOW_TAGS` order must break toward the broader measure. Getting that
+    backwards would make a narrow sub-component (capital improvements) out-rank total
+    PP&E and UNDERSTATE capex for names that were previously right."""
+    old = _quarters("capex", "PaymentsToAcquirePropertyPlantAndEquipment",
+                    [30, 30, 30, 30], year=2023)
+    new = _quarters("capex", "PaymentsForCapitalImprovements", [50, 50, 50, 50],
+                    year=2024)
+    pf = _prepared(_quarters("cfo", "NetCashProvidedByUsedInOperatingActivities",
+                             [100, 100, 100, 100]) + old + new)
+    raw = sec_facts.raw_asof_prepared(pf, date(2025, 3, 31), price=10.0)
+    assert raw["freeCashflow"] == 400 - 200                       # freshest tag wins
+
+    tie = (_quarters("cfo", "NetCashProvidedByUsedInOperatingActivities",
+                     [100, 100, 100, 100])
+           + _quarters("capex", "PaymentsForCapitalImprovements", [10, 10, 10, 10])
+           + _quarters("capex", "PaymentsToAcquirePropertyPlantAndEquipment",
+                       [30, 30, 30, 30]))
+    raw = sec_facts.raw_asof_prepared(_prepared(tie), date(2025, 3, 31), price=10.0)
+    assert raw["freeCashflow"] == 400 - 120                       # broadest tag wins
+
+
+def test_companyfacts_emits_the_us_gaap_share_fallbacks(tmp_path):
+    """Both ingest paths must be able to serve the same concepts. This one used to emit
+    ONLY the dei cover-page count, so a filer that omits it arrived with no share count
+    at all -> null market cap -> silent liquidity-floor failure."""
+    cf = {"facts": {"us-gaap": {
+        "CommonStockSharesOutstanding": {"units": {"shares": [
+            {"end": "2024-09-30", "val": 1000, "filed": "2024-11-07", "form": "10-Q"}]}},
+        "WeightedAverageNumberOfSharesOutstandingBasic": {"units": {"shares": [
+            {"start": "2024-07-01", "end": "2024-09-30", "val": 990,
+             "filed": "2024-11-07", "form": "10-Q"}]}}}}}
+    df = sec_facts.facts_frame("TST", "1", cf)
+    sh = df[df["concept"] == "sharesOutstanding"]
+    assert set(sh["tag"]) == {"CommonStockSharesOutstanding",
+                              "WeightedAverageNumberOfSharesOutstandingBasic"}
+    # A weighted average is tagged as a duration; `prepare_symbol` reads the share
+    # count from the INSTANT table only, so it has to be re-stamped or it is dropped.
+    assert sh["start"].isna().all()
+    assert sec_facts.prepare_symbol(df).instants["sharesOutstanding"]
+
+
+def _shares_row(tag, end, val, filed):
+    return {"symbol": "TST", "cik": "0000000001", "concept": "sharesOutstanding",
+            "tag": tag, "unit": "shares", "start": None, "end": end, "val": val,
+            "filed": filed, "form": "10-Q", "frame": None, "fy": None, "fp": None}
+
+
+def _shares(rows):
+    df = pd.DataFrame(rows + _quarters("totalRevenue", "Revenues", [1, 1, 1, 1]))
+    for c in ("start", "end", "filed"):
+        df[c] = pd.to_datetime(df[c])
+    pf = sec_facts.prepare_symbol(df)
+    return sec_facts.raw_asof_prepared(pf, date(2026, 9, 10), price=1.0
+                                       )["sharesOutstanding"]
+
+
+def test_an_abandoned_share_tag_cannot_outrank_a_current_one():
+    """Pure list order is the MSFT stale-tag bug one level down. Amcor kept a single
+    2019 `CommonStockSharesOutstanding` row of 13,001 ahead of a current
+    `CommonStockSharesIssued` of 462m — a market cap four orders of magnitude out, and
+    the name silently below the liquidity floor."""
+    assert _shares([
+        _shares_row("CommonStockSharesOutstanding", "2019-03-31", 13_001, "2019-05-01"),
+        _shares_row("CommonStockSharesIssued", "2026-03-31", 462e6, "2026-05-07"),
+    ]) == 462e6
+
+
+def test_a_zero_share_count_is_not_a_share_count():
+    """Moody's tags `CommonStockSharesOutstanding` as 0 on every filing. Zero is not
+    None, so it was returned as the answer and the market cap became undefined."""
+    assert _shares([
+        _shares_row("CommonStockSharesOutstanding", "2026-03-31", 0.0, "2026-04-23"),
+        _shares_row("CommonStockSharesIssued", "2026-03-31", 342.9e6, "2026-04-23"),
+    ]) == 342.9e6
+
+
+def test_a_share_count_far_below_the_weighted_average_is_rejected():
+    """Accenture's consolidated `CommonStockSharesOutstanding` is really its Class X
+    count (300,673) against 616m weighted-average shares. A count cannot be a
+    thousandth of the average OF that count, so a $180bn company was priced at $56m.
+
+    The fallthrough lands on the weighted average, NOT on `CommonStockSharesIssued`:
+    issued includes treasury stock and is a different quantity from outstanding, so a
+    period average of the right number beats a point reading of the wrong one. For
+    Accenture the two are 616.2m and 680.5m against ~625m actually outstanding."""
+    assert _shares([
+        _shares_row("CommonStockSharesOutstanding", "2026-05-31", 300_673, "2026-06-18"),
+        _shares_row("CommonStockSharesIssued", "2026-05-31", 680.5e6, "2026-06-18"),
+        _shares_row("WeightedAverageNumberOfSharesOutstandingBasic", "2026-05-31",
+                    616.2e6, "2026-06-18"),
+    ]) == 616.2e6
+
+
+def test_issued_shares_are_the_last_resort_not_a_peer_of_outstanding():
+    """Issued includes treasury stock. Ranked above the weighted averages it overstated
+    market cap 2-3.5x on 216 of ~1,500 screened names -- AIG 1,906.7m issued vs 538.1m
+    outstanding, Kroger 1,918.0m vs 613.0m, Aflac 1,358.8m vs 513.1m. It is still a
+    valid last resort: a filer holding no treasury stock has issued == outstanding."""
+    rows = [
+        _shares_row("CommonStockSharesIssued", "2026-03-31", 1906.7e6, "2026-05-01"),
+        _shares_row("WeightedAverageNumberOfSharesOutstandingBasic", "2026-03-31",
+                    538.1e6, "2026-05-01"),
+    ]
+    assert _shares(rows) == 538.1e6
+    # ...but with nothing better available, issued is used rather than nothing.
+    assert _shares(rows[:1]) == 1906.7e6
+
+
+def test_a_stale_weighted_average_is_not_used_as_the_plausibility_reference():
+    """NextEra's weighted-average tags stop in 2019, BEFORE its 4-for-1 split. Using
+    an abandoned 482m reference rejected a current, correct 2,085m count and cut its
+    market cap from $174bn to $40bn — the plausibility check turning into the bug it
+    exists to catch."""
+    assert _shares([
+        _shares_row("CommonStockSharesOutstanding", "2026-03-31", 2.085e9, "2026-04-25"),
+        _shares_row("WeightedAverageNumberOfSharesOutstandingBasic", "2019-09-30",
+                    481.9e6, "2019-10-25"),
+    ]) == 2.085e9
+
+
+def test_shares_asof_and_the_snapshot_path_agree_on_the_same_facts(tmp_path):
+    """These two are the halves of one decision: `shares_asof` decides whether a name
+    passes the market-cap floor at all, `raw_asof_prepared` prices every multiple once
+    it has. `shares_asof` used to take whichever row was filed LAST regardless of tag,
+    so Accenture's Class X count (300,673, the most recent filing) dropped a $180bn
+    company from the universe while its snapshot had 680m."""
+    store = HistoryStore(tmp_path / "hist")
+    rows = [
+        _shares_row("CommonStockSharesOutstanding", "2026-05-31", 300_673, "2026-06-18"),
+        _shares_row("CommonStockSharesIssued", "2026-05-31", 680.5e6, "2026-06-18"),
+        _shares_row("WeightedAverageNumberOfSharesOutstandingBasic", "2026-05-31",
+                    616.2e6, "2026-06-18"),
+    ]
+    df = pd.DataFrame(rows + _quarters("totalRevenue", "Revenues", [1, 1, 1, 1]))
+    for c in ("start", "end", "filed"):
+        df[c] = pd.to_datetime(df[c])
+    store.upsert_facts(df)
+    floor = store.shares_asof(["TST"], date(2026, 9, 10))["TST"]
+    snap = sec_facts.raw_asof_prepared(sec_facts.prepare_symbol(df), date(2026, 9, 10),
+                                       price=1.0)["sharesOutstanding"]
+    assert floor == snap == 616.2e6

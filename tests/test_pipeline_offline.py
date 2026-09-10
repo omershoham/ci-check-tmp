@@ -9,6 +9,7 @@ weeks in Aug-Sep 2026.
 from __future__ import annotations
 
 import json
+from datetime import date
 
 import pytest
 
@@ -94,6 +95,20 @@ def offline(monkeypatch, workspace, curated):
     monkeypatch.setattr(learning, "learning_block", lambda sym=None: "")
     monkeypatch.setattr(pipeline.time, "sleep", lambda s: None)
     return workspace
+
+
+def test_the_run_writes_universe_membership_into_the_temp_store(offline, workspace):
+    """Stage 0 records today's membership. It must land in the TEST store.
+
+    This test is the one that used to write `source="curated"` straight into the
+    user's real `data/history` on every `pytest` run — see conftest._no_real_store.
+    """
+    from src.data.history_store import HistoryStore
+    from src import pipeline as _pipeline
+    _pipeline.run("light")
+    store = HistoryStore()
+    assert workspace in store.root.resolve().parents or store.root.resolve() == workspace
+    assert store.universe_asof(date.today(), source="curated")
 
 
 def test_deep_run_offline_records_degraded_health(offline, storage):

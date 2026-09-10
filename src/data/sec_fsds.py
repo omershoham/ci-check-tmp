@@ -123,6 +123,93 @@ def download_quarter(q: str, force: bool = False, timeout: int = 600) -> Path | 
     return path
 
 
+def _is_class_only(segments: pd.Series) -> pd.Series:
+    """True for a segments string whose ONLY axis is the share class.
+
+    `segments` is a ";"-joined list of `Axis=Member` pairs. `ClassOfStock` is the one
+    axis whose members partition the company's shares, so its parts sum to the total.
+    Every other axis on a share tag (`EquityComponents`, `ConsolidatedEntities`,
+    `Restatement`, `LegalEntity`...) slices the SAME shares a different way and summing
+    it would multiply the count. Requiring EVERY axis to be `ClassOfStock` — not merely
+    one of them — is what keeps "Class B, as previously reported" out of the sum.
+    """
+    s = segments.fillna("")
+    parts = s.str.rstrip(";").str.split(";")
+    return s.ne("") & parts.apply(
+        lambda ps: all(p.split("=", 1)[0] == "ClassOfStock" for p in ps if p))
+
+
+def _fold_share_classes(df: pd.DataFrame) -> pd.DataFrame:
+    """Resolve share rows down to one consolidated count per filing + period.
+
+    Berkshire is the case this exists for: it tags shares ONLY per class with a
+    non-empty `segments`, so the consolidated-only PIT rule discarded every share row
+    it publishes — no share count, no market cap, no floor pass, and BRK-B was absent
+    from the universe with nothing anywhere saying why.
+
+    Three rules, each of which a real filing breaks if it is missing:
+
+      * A consolidated row WINS whenever one exists. Alphabet publishes both the class
+        breakdown and the CIK total (12,211M = 5,835 + 861 + 5,515); summing on top of
+        the total would double every Alphabet market cap ever computed.
+      * A class breakdown is used ONLY when every segmented row for that filing and
+        period sits on the `ClassOfStock` axis. Regeneron is why: its
+        `CommonStockSharesOutstanding` is tagged `ClassOfStock=CommonClassA` (1.8m) and
+        `EquityComponents=CommonStock` (137.9m). Those are two different axes over the
+        same shares, so "the classes" is not a partition of anything — summing the one
+        recognisable axis gave Regeneron 1.8m shares and a market cap 77x too small.
+        When the axes are mixed, the honest answer is no share count at all.
+      * Within a usable group, a member naming two classes at once
+        ("CommonClassAAndClassB") is dropped when the individual classes are also
+        present — 5% of class groups carry both, and adding them counts the same
+        shares twice.
+
+    CAVEAT, recorded because it is a real inaccuracy: the sum is of SHARE COUNTS, and
+    classes with unequal economics do not add up to an economic share count. Berkshire
+    is the extreme (an A share is 1,500 B shares); its filings happen to report both
+    classes in "equivalent" units, so the sum is right to within 0.07%, but a filer
+    with genuinely unequal classes would produce a market cap in the wrong proportion.
+    That is still strictly better than the name being invisible.
+    """
+    if df.empty or "segments" not in df.columns:
+        return df
+    is_sh = df["concept"] == "sharesOutstanding"
+    seg = df["segments"].fillna("")
+    # Non-share rows must still be consolidated-only: relaxing that for anything else
+    # re-opens the #1 FSDS trap (segment revenue summed into the total).
+    rest = df[~is_sh & seg.eq("")]
+    sh = df[is_sh]
+    if sh.empty:
+        return rest.reset_index(drop=True)
+    seg = seg.loc[sh.index]
+    key = ["adsh", "tag", "end"]
+    cons = sh[seg.eq("")]
+    cls = sh[seg.ne("")]
+    if cls.empty:
+        return pd.concat([rest, cons], ignore_index=True)
+
+    ktup = cls[key].apply(tuple, axis=1)
+    have_cons = set(map(tuple, cons[key].itertuples(index=False, name=None)))
+    cls, ktup = cls[~ktup.isin(have_cons)], ktup[~ktup.isin(have_cons)]
+    if cls.empty:
+        return pd.concat([rest, cons], ignore_index=True)
+
+    # A group is usable only if EVERY one of its segmented rows is class-only.
+    class_only = _is_class_only(cls["segments"])
+    usable = {k for k, ok in class_only.groupby(ktup).all().items() if ok}
+    keep = ktup.isin(usable)
+    cls, ktup = cls[keep], ktup[keep]
+    if cls.empty:
+        return pd.concat([rest, cons], ignore_index=True)
+
+    combined = cls["segments"].fillna("").str.contains("And", case=True)
+    singles = set(map(tuple, cls.loc[~combined, key].itertuples(index=False, name=None)))
+    cls = cls[~(combined & ktup.isin(singles))]
+    agg = {c: "first" for c in cls.columns if c not in key + ["val"]}
+    folded = cls.groupby(key, as_index=False).agg({**agg, "val": "sum"})
+    return pd.concat([rest, cons, folded[df.columns]], ignore_index=True)
+
+
 def _submissions(z: zipfile.ZipFile) -> pd.DataFrame:
     with z.open("sub.txt") as fh:
         sub = pd.read_csv(fh, sep="\t", dtype=str, usecols=[
@@ -154,7 +241,15 @@ def _numbers(z: zipfile.ZipFile, keep_tags: set[str],
                 continue
             # Consolidated figures only: a non-empty segments/coreg row is a slice of
             # the company, and summing those into the total corrupts every ratio.
-            c = c[c["segments"].fillna("").eq("") & c["coreg"].fillna("").eq("")]
+            # The ONE exception is the share count, where the "slices" are share
+            # CLASSES and their sum IS the consolidated total — see `_fold_share_classes`.
+            # Segmented SHARE rows are carried through and resolved later by
+            # `_fold_share_classes`, which needs to see the rows on OTHER axes too:
+            # whether a share-class breakdown is the whole company or a fragment can
+            # only be decided by looking at its siblings.
+            keep = c["coreg"].fillna("").eq("") & (
+                c["segments"].fillna("").eq("") | c["tag"].isin(SF.SHARES_TAGS))
+            c = c[keep]
             c = c[c["version"].fillna("").str.split("/").str[0].isin(_NS)]
             c = c[c["value"].notna()]
             if not c.empty:
@@ -213,6 +308,7 @@ def parse_quarter(zip_path: Path, keep_ciks: set[str] | None = None,
     is_shares = df["concept"] == "sharesOutstanding"
     df = df[(is_shares & df["uom"].eq("shares"))
             | (~is_shares & df["uom"].str.fullmatch(r"[A-Z]{3}", na=False))]
+    df = _fold_share_classes(df)
 
     if cik_to_symbol:
         df["symbol"] = df["cik"].map(cik_to_symbol)

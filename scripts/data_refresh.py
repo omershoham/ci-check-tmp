@@ -94,6 +94,8 @@ def main() -> None:
                     help="explicit first price date; overrides the incremental window "
                          "(use it to backfill full history for a symbol subset)")
     ap.add_argument("--start", default="2015-01-01", help="first snapshot month-end")
+    ap.add_argument("--no-quality", action="store_true",
+                    help="skip the data-quality gate that normally runs after a rebuild")
     args = ap.parse_args()
     broad_only = (args.registrants or args.shares_bulk or args.screen_prices
                   or args.universe_history)
@@ -180,6 +182,22 @@ def main() -> None:
         if members:
             store.record_universe(date.today(), members, source=mask)
     _log(f"manifest: {store.manifest()}")
+
+    # A refresh is exactly when the store can silently get worse — a tag list changed,
+    # a quarter parsed differently, a cohort stopped resolving — so the gate runs HERE,
+    # unprompted, rather than waiting for someone to notice a number on the board. It
+    # reports and does not raise: a refresh that already wrote good data must not be
+    # undone by a check, and the exit code belongs to `scripts.data_quality`.
+    if not args.no_quality:
+        from src.data import quality
+        rep = quality.run(store)
+        c = rep.counts()
+        _log(f"quality: {c['critical']} critical, {c['error']} error, {c['warn']} warn "
+             f"({rep.seconds:.1f}s)")
+        for f in rep.blocking():
+            _log(f"quality BLOCKING: {f.line()}")
+        for check, info in list(rep.by_check().items())[:12]:
+            _log(f"  {info['severity']:8} {check:28} n={info['n']}")
 
 
 if __name__ == "__main__":

@@ -126,6 +126,18 @@ def cache_dir() -> Path:
     return p
 
 
+def history_root() -> Path:
+    """Where the point-in-time parquet store lives.
+
+    A FUNCTION, not a module constant, for the same reason `db_path` and `cache_dir`
+    are: those two are the seam the test suite redirects into a temp directory, and the
+    history store had no such seam — `HistoryStore()` read `config.HOME` directly at
+    construction, so `pytest` wrote real universe-membership rows into the user's own
+    store. Anyone who cloned this repo and ran the suite mutated their own data.
+    """
+    return abs_path(get("paths.history", "data/history"))
+
+
 def sweep_cache(max_age_days: int = 7) -> int:
     """Delete date-stamped cache files older than max_age_days (the cache accrues
     ~300 files/day and nothing else ever prunes it). Returns files removed."""

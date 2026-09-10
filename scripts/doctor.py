@@ -175,6 +175,26 @@ def check_history_store() -> None:
     sn = man.get("snapshots") or {}
     _rec(OK if sn else WARN, "PIT snapshots",
          f"{sn.get('rows')} rows, {sn.get('dates')} month-ends to {sn.get('last')}" if sn else "none built")
+    # Plausibility of the DATA, not just its presence. Every data bug this project has
+    # found (a 338% gross margin, a filer at 9 fact rows, an EUR reporter discarded
+    # whole) left the manifest looking perfectly healthy. Cheap enough to run here:
+    # ~2s over 5,800 symbols. `python -m scripts.data_quality` prints the detail.
+    try:
+        from src.data import quality
+        rep = quality.run(HistoryStore())
+        c, block = rep.counts(), rep.blocking()
+        # FAIL only on the store-wide failures (`quality.BLOCKING`): doctor answers
+        # "can I run today?", and a handful of impossible microcap ratios does not
+        # stop a run while a store that lost a third of its facts does.
+        _rec(FAIL if block else (WARN if c["critical"] or c["error"] else OK),
+             "data quality",
+             f"{c['critical']} critical, {c['error']} error, {c['warn']} warn "
+             f"in {rep.seconds:.1f}s"
+             + (f" — BLOCKING: {', '.join(sorted({f.check for f in block}))}" if block
+                else " — `python -m scripts.data_quality` for detail"))
+    except Exception as exc:  # noqa: BLE001
+        _rec(WARN, "data quality", f"gate could not run: {exc}")
+
     from src import universe
     reg = man.get("registrants") or {}
     if reg:
