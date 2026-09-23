@@ -239,5 +239,6 @@ ibkr:
 
 schedule:
   # Run times live in the Windows scheduled tasks (scripts/setup_windows_tasks.ps1
-  # -DeepTime/-LightTime): deep ~07:00 ET, light ~16:15 ET (convert to your local time).
+  # -DeepTime/-LightTime), in the machine's local time. Suggested: deep ~07:00 ET
+  # (US pre-market), light ~16:15 ET (just after the close) — convert to your timezone.
   skip_when_market_closed: true  # skip weekends + NYSE holidays (run_daily checks before running)

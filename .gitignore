@@ -61,3 +61,6 @@ desktop.ini
 
 # Personal documents dropped in the repo root must never be committed (README: code and config only)
 *.pdf
+
+# Private preflight denylist (your real name/emails) - must never be committed
+.preflight_denylist*

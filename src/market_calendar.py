@@ -2,8 +2,10 @@
 holidays. Uses pandas_market_calendars; falls back to a weekday-only check if the
 library is unavailable.
 
-The deep (~07:00 ET) and light (~16:15 ET) runs both fall on
-the same calendar date in US time, so checking today's local date is correct.
+The suggested run times (deep ~07:00 ET, light ~16:15 ET) both fall on the same
+calendar date in US time. If you schedule runs from a timezone where that stops
+being true (e.g. east of UTC+7 for the light run), check the US date instead of
+the local one.
 """
 from __future__ import annotations
 

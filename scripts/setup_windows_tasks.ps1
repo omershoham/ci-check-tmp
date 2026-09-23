@@ -14,9 +14,9 @@
 # Run this from the project root in an elevated PowerShell:
 #   .\scripts\setup_windows_tasks.ps1
 #
-# Times default to 14:00 (deep = US pre-market open) and 23:15 (light = after US close),
-# in the machine's LOCAL time (the defaults above assume one particular timezone; adjust for
-# your timezone). Pass -DeepTime / -LightTime to change.
+# Times are in the machine's LOCAL time. Aim for deep ~07:00 ET (US pre-market) and
+# light ~16:15 ET (just after the close), converted to your timezone, and pass them
+# as -DeepTime / -LightTime. The defaults below are only placeholders.
 # Keep these in sync with schedule.* in config.yaml.
 
 param(
