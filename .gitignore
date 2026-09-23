@@ -31,7 +31,8 @@ data/cache/
 # Point-in-time history store, backtest reports, trained models, trials log —
 # tens of MB, fully regenerable with `python -m scripts.data_refresh`.
 data/history/
-data/history_*/        # set-aside copies of old stores (e.g. data/history_pre_broad_20260923)
+# set-aside copies of old stores (e.g. data/history_pre_broad_20260923)
+data/history_*/
 
 # Weekly digests — these name your ACTUAL holdings and target weights.
 data/digests/
