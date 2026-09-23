@@ -1095,7 +1095,11 @@ with tab_board:
                 _sz = ""
                 _pmv = sum((quote_map.get(s) or 0) * (h_.get("position") or 0)
                            for s, h_ in holdings.items())
-                if _pmv and lv.get("atr") and lv.get("price"):
+                # math.isfinite, not truthiness: NaN is truthy, and a short price
+                # history yields atr=NaN, which crashed int() and killed the page.
+                import math as _math
+                _ok = lambda v: isinstance(v, (int, float)) and _math.isfinite(v) and v > 0  # noqa: E731
+                if _ok(_pmv) and _ok(lv.get("atr")) and _ok(lv.get("price")):
                     _risk_pct = config.get("policy.risk_per_position_pct", 1.0)
                     _risk_dollars = _pmv * _risk_pct / 100
                     _shares = int(_risk_dollars / (2 * lv["atr"]))
