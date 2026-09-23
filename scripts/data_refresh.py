@@ -111,6 +111,19 @@ def main() -> None:
     store.migrate_layout(log=_log)
 
     if args.registrants:
+        # The registrant ladder reads `sub.txt` from the CACHED FSDS quarterly ZIPs to
+        # decide who files financial statements. On a fresh machine that cache is empty,
+        # every registrant fails the "files financials" rung, and the step crashed with
+        # KeyError 'sic' on an empty frame. Fetch any missing quarters first (a no-op
+        # when the cache is warm; ~50-100 MB per quarter the first time).
+        qs = sec_fsds.quarters_between(args.from_quarter)
+        missing = [q for q in qs if not (sec_fsds.cache_dir() / f"{q}.zip").exists()]
+        if missing:
+            _log(f"registrants: downloading {len(missing)} FSDS quarters first "
+                 f"({missing[0]} .. {missing[-1]})")
+            for i, q in enumerate(missing, 1):
+                ok = sec_fsds.download_quarter(q) is not None
+                _log(f"  fsds {q} {'ok' if ok else 'not published'} ({i}/{len(missing)})")
         res = registrants.refresh_registrants(store, log=_log)
         _log(f"registrants: {res['rows']} rows -> {res['path']}")
         _log(f"registrants funnel: {res['funnel']}")
