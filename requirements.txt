@@ -8,7 +8,7 @@ pyyaml>=6.0
 python-dotenv>=1.0
 pandas_market_calendars>=4.0
 plotly>=5.22
-streamlit>=1.36
+streamlit>=1.64.0
 streamlit-autorefresh>=1.0
 # IBKR (optional at runtime; pipeline degrades gracefully if Gateway is offline)
 ib_async>=1.0
