@@ -15,9 +15,25 @@ from . import Response
 class AnthropicAPIProvider:
     name = "anthropic_api"
     supports_sessions = False
+    supports_web_search = True      # server-side web_search tool
 
     def __init__(self, client=None):
         self._client = client
+
+    @property
+    def model_label(self) -> str:
+        return str(config.get("claude.model", "claude-opus-4-8"))
+
+    def ready(self) -> tuple[bool, str]:
+        if self._client is not None:
+            return True, f"injected client · {self.model_label}"
+        try:
+            import anthropic  # noqa: F401
+        except ImportError:
+            return False, "llm.provider=anthropic_api needs `pip install anthropic`"
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            return False, "ANTHROPIC_API_KEY is not set (put it in .env)"
+        return True, f"Anthropic API key set · {self.model_label}"
 
     def _get_client(self):
         if self._client is None:

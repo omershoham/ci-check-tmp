@@ -105,8 +105,11 @@ weeks. Every report carries its prompt version and model.
 - **Data-quality gate**: ratio bounds, internal consistency (impossible margins, share-count
   jumps, negative revenue), currency masking, staleness and per-sector coverage against a
   stored baseline — run on every data refresh; critical findings fail `doctor`.
-- **Pluggable LLM providers**: Claude Code subscription (headless CLI) or the Anthropic API;
-  Ollama for the local stage.
+- **Bring your own model**: a Claude Code subscription (headless CLI), the Anthropic API, or
+  any OpenAI-compatible endpoint — OpenAI, OpenRouter, Gemini, DeepSeek, or a fully local
+  Ollama / LM Studio server. Providers that cannot browse get prompts adapted to work from
+  the screening context only, and their calls are tracked separately (`[no-web]`) so the
+  track record never mixes the two. Ollama runs the local news stage.
 - **Leak-checked history**: `scripts/preflight_public.ps1` scans files, every past file
   version, commit messages and commit identities before anything is pushed.
 
@@ -115,7 +118,7 @@ weeks. Every report carries its prompt version and model.
 ```powershell
 python -m venv .venv; .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-copy .env.example .env               # add your Claude token and an SEC contact email
+copy .env.example .env               # add your LLM credential and an SEC contact email
 python -m scripts.doctor             # tells you what is missing
 python -m pytest tests -q
 ```

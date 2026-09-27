@@ -90,8 +90,9 @@ def offline(monkeypatch, workspace, curated):
                                       "note": "IB Gateway/TWS offline"})   # IBKR OFFLINE
     monkeypatch.setattr(deep_research, "_run_claude", _fake_claude)
     monkeypatch.setattr(deep_research, "auth_status",
-                        lambda: {"claude_on_path": True, "oauth_token_set": True,
-                                 "api_key_set": False})
+                        lambda: {"provider": "claude_cli", "ready": True, "detail": "fake",
+                                 "web_search": True, "claude_on_path": True,
+                                 "oauth_token_set": True, "api_key_set": False})
     monkeypatch.setattr(learning, "learning_block", lambda sym=None: "")
     monkeypatch.setattr(pipeline.time, "sleep", lambda s: None)
     return workspace
@@ -286,3 +287,26 @@ def test_book_fit_reaches_a_finalists_research_context(offline, storage, monkeyp
     fits = [r for r in board.values() if (r.get("metrics") or {}).get("book_fit")]
     assert fits and risk.candidate_fit_badge(fits[0]["metrics"]["book_fit"]) \
         .endswith("IT 41%⚠")
+
+
+def test_deep_run_with_an_unready_provider_fails_research_health(offline, storage, monkeypatch):
+    """A provider that is not configured must surface as a FAILED research stage that
+    names the provider and the reason — not as an unexplained crash or a silent 'ok'."""
+    monkeypatch.setattr(deep_research, "auth_status",
+                        lambda: {"provider": "openai_compat", "ready": False,
+                                 "detail": "set llm.openai_compat.model", "web_search": None})
+    pipeline.run("deep")
+    hz = health.RunHealth.from_json(storage.list_runs(1)[0]["health_json"])
+    st = hz.stage("research")
+    assert st.status == health.FAILED
+    assert "openai_compat" in st.note and "llm.openai_compat.model" in st.note
+
+
+def test_offline_provider_research_is_ok_but_says_so(offline, storage, monkeypatch):
+    monkeypatch.setattr(deep_research, "auth_status",
+                        lambda: {"provider": "openai_compat", "ready": True,
+                                 "detail": "fake", "web_search": False})
+    pipeline.run("deep")
+    hz = health.RunHealth.from_json(storage.list_runs(1)[0]["health_json"])
+    assert hz.stage("research").status == health.OK
+    assert "no web search" in hz.stage("research").note

@@ -531,12 +531,13 @@ def run(mode: str = "deep") -> int:
                           if r["symbol"] in holdings_map and r["symbol"] not in fsyms]
             finalists += held_extra
             auth = deep_research.auth_status()
-            _log(f"Claude auth: {auth}")
+            _log(f"LLM provider: {auth.get('provider')} — {auth.get('detail')}")
             _log(f"deep research on {len(finalists)} names "
                  f"({len(top_finalists)} top + {len(held_extra)} held); "
                  f"finalist sectors: {fmix}")
-            if not auth.get("claude_on_path") or not auth.get("oauth_token_set"):
-                hz.failed("research", "claude CLI missing or CLAUDE_CODE_OAUTH_TOKEN unset")
+            if not auth.get("ready"):
+                hz.failed("research", f"LLM provider '{auth.get('provider')}' not ready: "
+                                      f"{auth.get('detail')}")
             # Overall wall-clock budget so a run of slow/timing-out finalists can't blow
             # past the Task Scheduler limit and leave the run stuck 'running'. 0 = no cap.
             budget = float(config.get("claude.deep_run_budget_seconds", 5400))
@@ -607,7 +608,10 @@ def run(mode: str = "deep") -> int:
                 hz.degraded("research", f"{n_unrated}/{done} research calls returned no "
                                         f"rating (timeouts/parse failures)")
             else:
-                hz.ok("research", f"{done}/{len(finalists)} researched")
+                hz.ok("research", f"{done}/{len(finalists)} researched"
+                      + ("" if auth.get("web_search") else
+                         " — offline provider (no web search): reports rest on the screening"
+                         " context only"))
 
             # CANDIDATE TRIGGERS (8a): arm levels on researched names you do NOT own.
             # Held names are excluded because the portfolio deep-dive already supervises

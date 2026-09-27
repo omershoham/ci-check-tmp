@@ -3,8 +3,24 @@
 ## Requirements
 
 - Python 3.11+
-- The [Claude Code](https://claude.com/claude-code) CLI, logged in (`claude` on `PATH`) —
-  or an Anthropic API key with `llm.provider: anthropic_api`
+- One LLM for the research stage (`llm.provider` in `config.yaml`):
+  - `claude_cli` (default) — the [Claude Code](https://claude.com/claude-code) CLI, logged
+    in, on your subscription. Web search included; the only provider for the dashboard's
+    Investigate mode.
+  - `anthropic_api` — an Anthropic API key. Web search included.
+  - `openai_compat` — any OpenAI-compatible endpoint. Pick a `preset` (`openai`,
+    `openrouter`, `gemini`, `deepseek`, `ollama`, `lmstudio`), set `model`, and put the
+    matching key in `.env` (local servers need none). Plain chat endpoints cannot browse:
+    research then works from the screening context only, recency validation is skipped,
+    and reports are labelled `[no-web]`. Set `web_search: true` only for a model that
+    really searches (e.g. an OpenRouter `:online` model).
+
+  ```yaml
+  # fully local, no API key, no cost:
+  llm:
+    provider: openai_compat
+    openai_compat: {preset: ollama, model: "qwen3.5:9b"}
+  ```
 - Optional: [Ollama](https://ollama.com) with the model named in `config.yaml`
   (`local_llm.model`, default `qwen3.5:9b`) for the news/catalyst stage. Without it the
   pipeline still runs; the sentiment pillar is neutral and the run's health says so.
@@ -19,7 +35,8 @@ python -m venv .venv
 pip install -r requirements.txt
 
 copy .env.example .env                  # macOS/Linux: cp
-claude setup-token                      # paste into .env as CLAUDE_CODE_OAUTH_TOKEN
+# then add the credential for your llm.provider to .env, e.g.
+claude setup-token                      # claude_cli: paste into .env as CLAUDE_CODE_OAUTH_TOKEN
 ```
 
 Set `SEC_CONTACT_EMAIL` in `.env`: SEC EDGAR's fair-access policy wants a contact address

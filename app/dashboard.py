@@ -538,7 +538,14 @@ def candlestick_fig(df: pd.DataFrame, symbol: str, levels: dict | None = None,
 # ----------------------------------------------------------------- chat (all tabs)
 @st.dialog("💬 Ask Claude about your portfolio & the analysis", width="large")
 def chat_dialog():
-    st.caption("Runs on your Claude subscription. Not financial advice.")
+    from src import llm as _llm
+    try:
+        _prov = _llm.get_provider()
+        _prov_web = _llm.supports_web_search(_prov)
+        _prov_label = f"{_llm.provider_name()} · {_llm.model_label(_prov)}"
+    except Exception:  # noqa: BLE001 — a misconfigured provider must not kill the dialog
+        _prov, _prov_web, _prov_label = None, False, _llm.provider_name()
+    st.caption(f"Runs on your configured LLM ({_prov_label}). Not financial advice.")
     _mode = st.radio("Mode", ["⚡ Quick", "🔬 Investigate"], horizontal=True,
                      key="chat_mode", label_visibility="collapsed",
                      help="Quick: answers in ~20s from a snapshot of the system state. "
@@ -548,8 +555,15 @@ def chat_dialog():
                           "question.")
     _deep = _mode.startswith("🔬")
     _c1, _c2 = st.columns([3, 1])
-    _use_web = (_c1.toggle("🌐 Allow web search (slower)", value=False, key="chat_web")
-                if not _deep else True)
+    if _deep:
+        _use_web = True
+    elif _prov_web:
+        _use_web = _c1.toggle("🌐 Allow web search (slower)", value=False, key="chat_web")
+    else:
+        # Don't offer a switch the provider cannot honour.
+        _use_web = False
+        _c1.caption("🌐 Web search unavailable with this provider — answers use the "
+                    "system's stored state only.")
     _allow_fix = False
     if _deep:
         # Read-only by default: web headlines flow into the prompt, so a shell-capable

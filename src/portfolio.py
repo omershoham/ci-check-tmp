@@ -131,7 +131,12 @@ def run() -> int:
                               "weight_pct": weights.get(sym)})
 
         n_noact = sum(1 for p in positions if p.get("action") is None)
-        n_noval = sum(1 for p in positions if (p.get("validation") or {}).get("is_current") is None)
+        # A validation SKIPPED because the provider cannot browse is a configuration
+        # choice, not a failure — only count the ones that were attempted and came back
+        # empty.
+        n_noval = sum(1 for p in positions
+                      if (p.get("validation") or {}).get("is_current") is None
+                      and not (p.get("validation") or {}).get("skipped"))
         if positions and n_noact == len(positions):
             hz.failed("research", f"0/{len(positions)} deep dives returned an action")
         elif n_noact:

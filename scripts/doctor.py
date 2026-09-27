@@ -81,13 +81,24 @@ def check_config() -> None:
 
 
 def check_auth() -> None:
-    _rec(OK if config.oauth_token() else FAIL, "CLAUDE_CODE_OAUTH_TOKEN",
-         "set in .env" if config.oauth_token() else "missing — run `claude setup-token`")
-    _rec(FAIL if config.api_key_is_set() else OK, "ANTHROPIC_API_KEY",
-         "SET — this forces per-token API billing; unset it" if config.api_key_is_set()
-         else "unset (subscription path)")
-    _rec(OK if shutil.which("claude") else FAIL, "claude CLI",
-         shutil.which("claude") or "not on PATH")
+    """Provider-aware: only the checks the CONFIGURED provider needs can fail."""
+    from src import llm
+    name = llm.provider_name()
+    ok, detail = llm.readiness()
+    _rec(OK if ok else FAIL, f"LLM provider ({name})", detail)
+    if name == "claude_cli":
+        # Subscription path: an ANTHROPIC_API_KEY in the environment would switch the
+        # CLI to per-token billing. For anthropic_api it is the credential itself.
+        _rec(WARN if config.api_key_is_set() else OK, "ANTHROPIC_API_KEY",
+             "SET — Claude Code bills per token when it sees this (the provider strips it "
+             "from its subprocess, but unset it anyway)" if config.api_key_is_set()
+             else "unset (subscription path)")
+    if ok:
+        web = llm.supports_web_search()
+        _rec(OK if web else WARN, "research web access",
+             "yes" if web else "NO — research rests on the screening context only; recency "
+             "validation is skipped. Set llm.openai_compat.web_search: true only for a model "
+             "that really browses")
     sec = os.environ.get("SEC_CONTACT_EMAIL") or config.get("news.sec_contact")
     _rec(OK if sec else WARN, "SEC contact",
          "set" if sec else "unset — EDGAR throttles anonymous callers (see .env.example)")

@@ -202,10 +202,28 @@ technical:
   rs_benchmark: SMH     # relative-strength peer benchmark ("leadership" = beating the theme)
 
 llm:
-  # claude_cli   = headless `claude -p` on your Claude Code SUBSCRIPTION (default; the only
-  #                provider with --resume sessions and file/shell tools for Investigate mode)
-  # anthropic_api = official SDK with ANTHROPIC_API_KEY (bring your own key, per-token billing)
+  # Which model does the deep research (finalists, red team, portfolio dives, reflection):
+  #   claude_cli    = headless `claude -p` on your Claude Code SUBSCRIPTION (default; the only
+  #                   provider with --resume sessions and file/shell tools for Investigate mode)
+  #   anthropic_api = official SDK with ANTHROPIC_API_KEY (bring your own key, per-token billing)
+  #   openai_compat = any OpenAI-compatible endpoint: OpenAI, OpenRouter, Gemini, DeepSeek, or
+  #                   a local Ollama / LM Studio server (see the block below)
+  # `python -m scripts.doctor` tells you whether the chosen provider is ready.
   provider: claude_cli
+  openai_compat:
+    preset: openai          # openai | openrouter | gemini | deepseek | ollama | lmstudio
+    model: ""               # REQUIRED for openai_compat: a model id your endpoint serves
+    base_url: null          # overrides the preset's URL
+    api_key_env: null       # env var with the key; overrides the preset ("" = no key, e.g. local)
+    # A plain chat endpoint cannot browse. Leave false unless this model really searches the
+    # web (e.g. an OpenRouter ":online" model). When false, prompts are adapted to work from
+    # the screening context only, recency validation is skipped, and reports are labelled
+    # "[no-web]" so their track record is kept apart from web-researched calls.
+    web_search: false
+    temperature: 0.2        # null to omit (some reasoning models reject it)
+    max_tokens: 8000
+    max_tokens_param: max_tokens   # newer OpenAI reasoning models need max_completion_tokens
+    extra_headers: {}
 
 claude:
   # Runs on the Claude Code subscription via CLAUDE_CODE_OAUTH_TOKEN.

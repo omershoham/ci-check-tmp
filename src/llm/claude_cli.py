@@ -61,6 +61,21 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 class ClaudeCLIProvider:
     name = "claude_cli"
     supports_sessions = True
+    supports_web_search = True      # the CLI's WebSearch/WebFetch tools
+
+    @property
+    def model_label(self) -> str:
+        # Unchanged from before providers existed, so every historical report's
+        # `model` value stays comparable with new ones.
+        return str(config.get("claude.model", "claude-opus-4-8"))
+
+    def ready(self) -> tuple[bool, str]:
+        exe = shutil.which("claude")
+        if not exe:
+            return False, "the `claude` CLI is not on PATH (install Claude Code, or pick another llm.provider)"
+        if not config.oauth_token():
+            return False, "CLAUDE_CODE_OAUTH_TOKEN is unset — run `claude setup-token` and put it in .env"
+        return True, f"claude CLI at {exe} · subscription token set · {self.model_label}"
 
     def complete(self, prompt: str, *, tools: str | None = None, timeout: float | None = None,
                  extra_args: list[str] | None = None, model: str | None = None) -> Response:

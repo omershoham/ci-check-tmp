@@ -8,6 +8,7 @@ falls back to per-token API usage. NOTE: we deliberately do NOT use `--bare`
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from datetime import date
 from typing import Any
@@ -53,9 +54,16 @@ def horizon_menu_text() -> str:
 
 
 def _stamp(report: dict) -> dict:
-    """Attach the prompt/model provenance to a parsed report."""
+    """Attach the prompt/model provenance to a parsed report. The model label comes from
+    the provider that actually ran (src/llm.model_label): a Claude run records exactly
+    what it always did; an offline run is tagged "[no-web]", so calibration can never
+    pool a browsing analyst with one that could not check anything."""
     report["prompt_version"] = PROMPT_VERSION
-    report["model"] = config.get("claude.model", "claude-opus-4-8")
+    try:
+        from . import llm as _llm
+        report["model"] = _llm.model_label()
+    except Exception:  # noqa: BLE001 — provenance must never fail a report
+        report["model"] = config.get("claude.model", "claude-opus-4-8")
     return report
 
 
@@ -144,11 +152,72 @@ Output ONLY a single JSON object, no prose before or after, with exactly these k
 
 
 def auth_status() -> dict[str, Any]:
+    """Provider-aware readiness for the research stage. `ready`/`detail` come from the
+    configured provider (src/llm); the claude_* keys are kept for the dashboard/doctor
+    and for anyone reading old logs."""
+    from . import llm as _llm
+    ok, detail = _llm.readiness()
     return {
+        "provider": _llm.provider_name(),
+        "ready": ok,
+        "detail": detail,
+        "web_search": _llm.supports_web_search() if ok else None,
         "claude_on_path": shutil.which("claude") is not None,
         "oauth_token_set": bool(config.oauth_token()),
         "api_key_set": config.api_key_is_set(),
     }
+
+
+# ---------------------------------------------------------------- offline providers
+# A provider that cannot browse (a plain OpenAI-compatible chat endpoint, a local
+# model) must not be told to "use web search": it cannot comply, and a model asked for
+# CURRENT prices and news it cannot fetch will confabulate them from memory. The
+# templates stay untouched — so the web-capable path is byte-identical to before —
+# and these rewrites are applied at send time instead. tests/test_llm_offline.py pins
+# that every pattern still matches its template, so template drift fails loudly.
+_OFFLINE_CONTEXT_RULE = (
+    "You have NO web access. Work ONLY from the dated context in this prompt (screening "
+    "metrics, recent\nheadlines and filings) plus general knowledge of the business. Your "
+    "memory of prices and news is\nSTALE: never state a current price, event or figure that "
+    "is not in the context, and flag anything\nthat depends on information you cannot verify.")
+_OFFLINE_REWRITES: list[tuple[re.Pattern, str]] = [
+    # board research
+    (re.compile(r"Use web search to find information that is CURRENT AS OF TODAY \([0-9-]+\) — "
+                r"latest price, news\nand filings from the last few days/weeks\. Do NOT rely on "
+                r"memory; verify with current sources and\nnote the date of the data you use\."),
+     _OFFLINE_CONTEXT_RULE),
+    (re.compile(r"Also read the CHART SETUP from recent price action \(use web data\):"),
+     "Also read the CHART SETUP from the price/indicator context above (you cannot fetch charts):"),
+    # portfolio deep dive
+    (re.compile(r"Use web search to gather the LATEST information \(price, news, filings,\n"
+                r"analyst views from the last few weeks\)\. Cite the date of each key fact you rely on\."),
+     "You have NO web access: use only the position data and context below plus general\n"
+     "knowledge of the business. Do not invent recent news, prices or analyst views; say where\n"
+     "current information would change the call. In `sources` list only items that appear in\n"
+     "this prompt (an empty list otherwise) — never invent URLs."),
+    # red team
+    (re.compile(r"Use web search to find the STRONGEST current bear\ncase —"),
+     "From the thesis, the stated risks and what you know of the business, sector and\n"
+     "valuation, build the STRONGEST bear case —"),
+    # weekly reflection (learning.py)
+    (re.compile(r"For the worst calls, use web search to understand what ACTUALLY happened after your call\n"),
+     "For the worst calls, work out from the thesis and the graded outcome what most likely went wrong\n"),
+]
+_OFFLINE_FALLBACK_NOTE = (
+    "NOTE: you have no web access. Ignore any instruction below to search or browse the web; "
+    "rely only on the context provided and say when information may be stale.\n\n")
+
+
+def _offline(prompt: str) -> str:
+    """Adapt a prompt for a provider without web search (see _OFFLINE_REWRITES). Any
+    web instruction a future template adds and no rewrite covers gets a blunt notice up
+    front rather than silently reaching a model that cannot comply."""
+    out = prompt
+    for pat, rep in _OFFLINE_REWRITES:
+        out = pat.sub(rep, out)
+    if re.search(r"(?i)\bweb search\b|\buse web data\b|\bsearch the web\b", out):
+        out = _OFFLINE_FALLBACK_NOTE + out
+    return out
 
 
 def _balanced_span(text: str, start: int) -> tuple[int, int] | None:
@@ -219,8 +288,11 @@ def _run_claude(prompt: str, allowed_tools: str | None = None,
     supports them.
     """
     from . import llm as _llm
-    resp = _llm.get_provider().complete(prompt, tools=allowed_tools, timeout=timeout,
-                                        extra_args=extra_args)
+    provider = _llm.get_provider()
+    if not _llm.supports_web_search(provider):
+        prompt = _offline(prompt)
+    resp = provider.complete(prompt, tools=allowed_tools, timeout=timeout,
+                             extra_args=extra_args)
     return resp.text, resp.raw
 
 
@@ -583,6 +655,15 @@ def deep_dive_holding(symbol: str, name: str, subsector: str, holding: dict,
 
 
 def validate_recency(symbol: str, report: dict) -> dict[str, Any]:
+    # Recency validation IS a web lookup ("is this still true today?"). Without web
+    # access the honest answer is "not checked" — asking a model to verify against its
+    # own memory would just return a confident yes.
+    from . import llm as _llm
+    if not _llm.supports_web_search():
+        return {"is_current": None, "stale_items": [], "confidence": None,
+                "checked_as_of": date.today().isoformat(),
+                "note": "skipped: the configured LLM provider has no web access",
+                "skipped": True}
     compact = {k: report.get(k) for k in
                ("action", "thesis_health", "valuation", "add_level", "trim_level",
                 "catalysts", "data_as_of")}
