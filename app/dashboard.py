@@ -1051,10 +1051,13 @@ with tab_board:
                     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
                     # sys.executable = the interpreter serving this dashboard (the venv's),
                     # so the launch works wherever the venv lives, not only .venv\Scripts.
+                    # The Windows flags are 0 on POSIX; there a new session is what detaches
+                    # the child, so a Ctrl-C to the terminal running Streamlit spares it.
                     subprocess.Popen([sys.executable,
                                       "-m", "scripts.research_one",
                                       "--run-id", str(run_id), "--symbol", pick],
                                      cwd=str(ROOT), env=env, creationflags=flags,
+                                     start_new_session=os.name != "nt",
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     st.toast(f"Deep analysis started for {pick} (~1–2 min)", icon="🔬")
                     st.rerun()
@@ -1288,7 +1291,8 @@ with tab_port:
             env = os.environ.copy(); env["PYTHONIOENCODING"] = "utf-8"
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
             subprocess.Popen([str(PY), "-m", "scripts.portfolio_deepdive"], cwd=str(ROOT), env=env,
-                             creationflags=flags, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                             creationflags=flags, start_new_session=os.name != "nt",
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             st.success("Started — runs in the background (~10–15 min). The page auto-updates when done.")
     with bcol2:
         if running:

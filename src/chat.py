@@ -9,6 +9,7 @@ specific to THIS portfolio and THIS analysis, not generic market chat.
 from __future__ import annotations
 
 import json
+import sys
 from datetime import date
 from typing import Any
 
@@ -173,7 +174,7 @@ YOUR TOOLS AND THE TERRAIN:
   score_version), research_reports (thesis/rating/conviction/red_team_json/raw),
   portfolio_runs, portfolio_positions (action/conviction/weight_pct/target_weight_pct/
   invalidation), portfolio_summary (risk_json/ballast_json), triggers, picks, lessons,
-  holdings, quotes, watchlist. Query via: .venv/Scripts/python.exe -c "import sqlite3; ..."
+  holdings, quotes, watchlist. Query via: {python} -c "import sqlite3; ..."
 - CODE: src/*.py — scoring.py (pillar math), technical.py (indicators), learning.py
   (grading/calibration/IC), performance.py (forward returns), risk.py, regime.py,
   triggers.py, deep_research.py (all research prompts), news.py, local_llm.py.
@@ -234,8 +235,10 @@ def investigate(question: str, session_id: str | None = None,
         prompt = question[:4000]
         extra = ["--resume", session_id]
     else:
+        # sys.executable, not a hardcoded `.venv/Scripts/python.exe`: that path exists
+        # only on Windows (POSIX venvs use bin/python) and only for a venv named .venv.
         prompt = _INVESTIGATE_SYSTEM.format(
-            root=str(config.ROOT), today=date.today().isoformat(),
+            root=str(config.ROOT), today=date.today().isoformat(), python=sys.executable,
             corrections_block=_CORRECTIONS_ALLOWED if allow_corrections else _CORRECTIONS_READONLY,
             context=build_context(), question=question[:4000])
         extra = []

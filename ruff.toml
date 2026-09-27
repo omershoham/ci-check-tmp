@@ -1,0 +1,7 @@
+# Lint for what breaks at runtime, not for style: syntax errors (E9), invalid
+# comparisons (F63), misplaced control flow (F7) and undefined names (F82). A wider
+# rule set would mean a mass reformat first; widen it deliberately, one rule at a time.
+target-version = "py311"
+
+[lint]
+select = ["E9", "F63", "F7", "F82"]

@@ -35,6 +35,7 @@ below was never reached. Two changes: `_spawn_is_safe()` refuses the pool when
 """
 from __future__ import annotations
 
+import multiprocessing
 import os
 import sys
 from concurrent.futures import ProcessPoolExecutor
@@ -123,7 +124,12 @@ def replay_symbols(fn: Callable[[Any], Any], payloads: Sequence[Any],
     # run. A broken pool is abandoned (wait=False) and the work is redone serially —
     # the replays are pure functions of their payload, so redoing them is free of
     # consequence beyond the time.
-    ex = ProcessPoolExecutor(max_workers=w)
+    # `spawn` on EVERY platform, not just where it is the default (Windows, macOS). Linux
+    # defaults to `fork`, and forking a process that already runs threads (the IBKR
+    # daemon, yfinance timeouts, Streamlit) can deadlock the child on a lock some other
+    # thread held — and it would make the Linux pool a different animal from the one
+    # the rules above were written for.
+    ex = ProcessPoolExecutor(max_workers=w, mp_context=multiprocessing.get_context("spawn"))
     try:
         out: list[Any] = []
         for i, r in enumerate(ex.map(fn, items), 1):
