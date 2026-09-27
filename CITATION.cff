@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software or its measurements, please cite it as below."
+type: software
+title: "Agentic Trader: an advisory US-equity research agent that grades its own calls"
+authors:
+  - family-names: Shoham
+    given-names: Omer
+license: MIT
+repository-code: "https://github.com/omershoham/claude-trader"
+abstract: >-
+  An advisory-only US stock research system. A quant screen on point-in-time SEC
+  fundamentals and a survivorship-aware universe narrows ~1,500 stocks to a shortlist,
+  a local LLM classifies news into a fixed catalyst vector, and an LLM researches the
+  finalists. Every recommendation is graded forward, net of costs, against the
+  equal-weight universe and a screen-only control; backtests report a Deflated Sharpe
+  ratio against every configuration tried. It never places trades.
+keywords:
+  - quantitative finance
+  - point-in-time data
+  - backtesting
+  - large language models
+  - equity research
+  - SEC EDGAR

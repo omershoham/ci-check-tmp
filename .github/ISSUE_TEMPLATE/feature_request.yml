@@ -1,0 +1,51 @@
+name: Feature request
+description: Suggest an improvement, a signal, a data source or a provider.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This project is advisory only: requests for order placement or trade execution will be closed.
+        A new signal or data source is judged on how it will be *measured* — see the research
+        rules in CONTRIBUTING.md.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What you would like to see. Rough is fine.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Quant screen / scoring
+        - New signal or pillar
+        - Data source / point-in-time store
+        - Backtest harness / grading
+        - LLM research / providers
+        - News / local LLM
+        - Dashboard
+        - Setup / docs / platform support
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: measurement
+    attributes:
+      label: How would we know it works?
+      description: |
+        For signals and data: is the data point-in-time (knowable on the scored date)?
+        How would it be backtested, and what result would make you drop it?
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

@@ -1,0 +1,72 @@
+name: Data quality
+description: A wrong, missing or stale number from a free data source (SEC, prices, universe).
+labels: [data-quality]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Free data has real errors: split-adjusted prices against unadjusted share counts,
+        restated or mis-tagged filings, tickers that map to the wrong company, delisted names
+        missing from history. These are bugs here. The more precise the report, the faster
+        it can become a check in the data-quality gate (`python -m scripts.data_quality`).
+  - type: input
+    id: symbol
+    attributes:
+      label: Symbol
+      placeholder: XOM
+    validations:
+      required: true
+  - type: input
+    id: date
+    attributes:
+      label: Date
+      description: The as-of / scored date where the value is wrong (YYYY-MM-DD).
+      placeholder: "2024-03-29"
+    validations:
+      required: true
+  - type: input
+    id: metric
+    attributes:
+      label: Metric or field
+      placeholder: shares_outstanding / revenue_ttm / market_cap / close / universe membership
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Where the value came from
+      options:
+        - SEC Financial Statement Data Sets (bulk)
+        - SEC companyfacts (XBRL API)
+        - SEC registrants / ticker map
+        - Prices (yfinance)
+        - Point-in-time universe history
+        - Dashboard display
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: expected
+    attributes:
+      label: Expected value
+    validations:
+      required: true
+  - type: input
+    id: actual
+    attributes:
+      label: Actual value
+    validations:
+      required: true
+  - type: input
+    id: link
+    attributes:
+      label: Source link
+      description: The filing on EDGAR (or other primary source) that shows the correct value, and when it was filed.
+      placeholder: https://www.sec.gov/Archives/edgar/data/...
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Split, merger, CIK change, restatement, fiscal-year quirk? `doctor` or `data_quality` output if relevant (redacted).

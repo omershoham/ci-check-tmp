@@ -1,0 +1,95 @@
+name: Bug report
+description: Something crashed, hung, or produced a wrong result.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. If the problem is a wrong number from a free data source
+        (a bad share count, a missing filing, a split error), the **Data quality** form fits better.
+
+        **Redact before pasting.** Logs and `doctor` output can contain broker account numbers,
+        holdings, local paths and tokens. Never paste the contents of `.env`.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, what you got instead.
+      placeholder: |
+        Ran `python -m scripts.run_daily --mode light`; expected a board, got ...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands. Does it reproduce with `python -m scripts.demo`?
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Windows 11 / macOS 15 / Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12.4"
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: llm.provider
+      options:
+        - claude_cli
+        - anthropic_api
+        - openai_compat
+        - not relevant / not configured
+    validations:
+      required: true
+  - type: input
+    id: preset
+    attributes:
+      label: openai_compat preset and model (if used)
+      placeholder: ollama / qwen3.5:9b
+  - type: dropdown
+    id: universe
+    attributes:
+      label: universe.source
+      options:
+        - broad
+        - curated
+        - demo (python -m scripts.demo)
+    validations:
+      required: true
+  - type: textarea
+    id: health
+    attributes:
+      label: Run health
+      description: The run's health badge and any `degraded` stage notes (dashboard header, or the "last run" line of `doctor`).
+      render: text
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`python -m scripts.doctor` output"
+      description: Redact account numbers, holdings, usernames in paths and anything token-like first.
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Traceback or log excerpt
+      description: Only the relevant lines, redacted.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues.
+          required: true
+        - label: I removed tokens, account numbers, holdings and personal paths from everything above.
+          required: true

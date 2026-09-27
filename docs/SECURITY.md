@@ -84,4 +84,12 @@ address, from any machine.
 
 ## Reporting a vulnerability
 
-Please open a private security advisory on the repository rather than a public issue.
+Please don't open a public issue. Use GitHub's private vulnerability reporting: the
+repository's **Security** tab → **Report a vulnerability**. The report is visible only to
+the maintainer until a fix is published.
+
+Useful to include: what an attacker could reach (credentials, holdings, the dashboard, the
+Investigate agent's tools), the steps or input that trigger it, and the affected commit.
+Things in scope include anything that could leak `.env` or portfolio data, prompt injection
+from news headlines that escapes the read-only defaults, and any path by which the broker
+connection could place an order.
