@@ -47,6 +47,18 @@ python -m scripts.doctor                # checks everything below; fix what it f
 python -m pytest tests -q               # offline suite (fake LLM, broker and data)
 ```
 
+## Try it first: the demo
+
+```powershell
+python -m scripts.demo                 # build, run a light pass, open http://localhost:8502
+python -m scripts.demo --research      # + LLM research on the top 3 (needs llm.provider)
+python -m scripts.demo --reset         # start the demo workspace over
+```
+
+Everything lives in `./demo` (its own `config.yaml`, database and data store); your real
+workspace is never touched. Set `SEC_CONTACT_EMAIL` first if you can — SEC throttles
+anonymous callers.
+
 ## Build the point-in-time data store
 
 The broad universe (the default, `universe.source: broad`) is built from SEC filings. Run

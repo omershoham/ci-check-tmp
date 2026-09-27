@@ -145,6 +145,8 @@ def main() -> None:
         for sym, cik in cikmap.items():
             if sym in want:
                 cik_to_symbol.setdefault(str(cik).zfill(10), sym)
+        for pcik, sym in sec_facts.predecessor_ciks(want).items():
+            cik_to_symbol.setdefault(pcik, sym)
         _log(f"shares (bulk): {len(cik_to_symbol)} CIKs from {args.from_quarter}")
         res = sec_fsds.refresh_shares_bulk(store, cik_to_symbol,
                                            start_quarter=args.from_quarter,
@@ -166,6 +168,11 @@ def main() -> None:
         _log("facts: fetching SEC companyfacts (one request per CIK)")
         res = sec_facts.refresh_facts(store, syms, log=_log)
         _log(f"facts: {res}")
+        if src != "broad":
+            # Sectors for a hand-picked list: the registrant table that serves the broad
+            # universe is never built here. One request per NEW name, then cached.
+            res = registrants.refresh_symbol_sics(store, syms, log=_log)
+            _log(f"sectors: {res}")
 
     if args.facts_bulk:
         _log(f"facts (bulk): FSDS quarters from {args.from_quarter}")

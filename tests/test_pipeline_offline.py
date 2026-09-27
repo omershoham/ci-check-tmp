@@ -310,3 +310,14 @@ def test_offline_provider_research_is_ok_but_says_so(offline, storage, monkeypat
     hz = health.RunHealth.from_json(storage.list_runs(1)[0]["health_json"])
     assert hz.stage("research").status == health.OK
     assert "no web search" in hz.stage("research").note
+
+
+def test_a_broker_switched_off_in_config_is_not_a_degraded_run(offline, storage, monkeypatch):
+    """No broker by choice (the demo, a user without IBKR) is not missing data: the
+    broker stage is ok and says it is disabled, instead of flagging every run."""
+    from src import config
+    monkeypatch.setitem(config._OVERRIDES, "ibkr.enabled", False)
+    pipeline.run("light")
+    hz = health.RunHealth.from_json(storage.list_runs(1)[0]["health_json"])
+    assert hz.stage("broker").status == health.OK
+    assert "disabled" in hz.stage("broker").note

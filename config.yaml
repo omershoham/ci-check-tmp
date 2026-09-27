@@ -31,6 +31,12 @@ universe:
     adv_window: 20               # sessions averaged for dollar volume
     screen_price_days: 400       # calendar-day price window the floor is computed on
 
+  # Registrants that changed CIK in a holding-company reorganization: the ticker map
+  # follows the NEW CIK, whose SEC history starts at the reorganization, so the old
+  # CIK's filings are merged in (src/data/sec_facts.py::_with_predecessors).
+  cik_predecessors:
+    XOM: ["0000034088"]          # ExxonMobil Holdings Corp (2026) <- Exxon Mobil Corp
+
   # Hard liquidity/size floor applied BEFORE scoring (Q&A: "standard floor")
   liquidity_floor:
     min_market_cap: 300000000      # $300M

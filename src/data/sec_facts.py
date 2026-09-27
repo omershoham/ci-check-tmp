@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-from .. import news, parallel
+from .. import config, news, parallel
 from ..analytics.metrics import derive
 
 _CF_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
@@ -240,6 +240,48 @@ def facts_frame(symbol: str, cik: str, cf: dict[str, Any]) -> pd.DataFrame:
     return df
 
 
+def predecessor_ciks(symbols=None) -> dict[str, str]:
+    """{predecessor CIK: symbol} from `universe.cik_predecessors` (see below), for the
+    bulk paths' CIK -> symbol maps, which are otherwise built from the ticker map and
+    so only know a reorganized company's NEW registrant."""
+    want = set(symbols) if symbols is not None else None
+    out: dict[str, str] = {}
+    for sym, preds in (config.get("universe.cik_predecessors", {}) or {}).items():
+        if want is not None and sym not in want:
+            continue
+        for pcik in ([preds] if isinstance(preds, str) else preds or []):
+            out.setdefault(str(pcik).zfill(10), sym)
+    return out
+
+
+def _with_predecessors(sym: str, cik: str, df: pd.DataFrame,
+                       pause: float = 0.15) -> pd.DataFrame:
+    """Prepend a predecessor registrant's history (`universe.cik_predecessors`).
+
+    A holding-company reorganization gives a company a NEW CIK and the SEC ticker map
+    follows it, so companyfacts for the ticker restarts from one filing: Exxon's 2026
+    reorganization left XOM with a single 10-Q under ExxonMobil Holdings Corp
+    (0002115436) and every trailing-twelve-month metric undefined, while 30 years of
+    history sit under Exxon Mobil Corp (0000034088). Nothing in SEC's data links the
+    two, so the link is configured. The predecessor contributes only filings made
+    BEFORE the successor's first, so no period is counted twice."""
+    preds = (config.get("universe.cik_predecessors", {}) or {}).get(sym) or []
+    if isinstance(preds, str):
+        preds = [preds]
+    parts = [df]
+    first = df["filed"].min() if not df.empty else None
+    for pcik in preds:
+        pcf = fetch_companyfacts(str(pcik).zfill(10), pause=pause)
+        if not pcf:
+            continue
+        old = facts_frame(sym, cik, pcf)       # stored under the successor's CIK
+        if first is not None and not old.empty:
+            old = old[old["filed"] < first]
+        parts.append(old)
+    parts = [p for p in parts if not p.empty]
+    return pd.concat(parts, ignore_index=True) if len(parts) > 1 else df
+
+
 def refresh_facts(store, symbols: list[str], pause: float = 0.15,
                   log=print) -> dict[str, int]:
     """Fetch companyfacts for each symbol with a known CIK; replace its rows in the store."""
@@ -254,7 +296,7 @@ def refresh_facts(store, symbols: list[str], pause: float = 0.15,
         if not cf:
             missing.append(sym)
             continue
-        df = facts_frame(sym.upper(), cik, cf)
+        df = _with_predecessors(sym.upper(), cik, facts_frame(sym.upper(), cik, cf), pause)
         if df.empty:
             empty.append(sym)
             continue
@@ -395,14 +437,37 @@ _SHARES_VS_WAVG = (0.5, 4.0)
 _WAVG_TAGS = ("WeightedAverageNumberOfSharesOutstandingBasic",
               "WeightedAverageNumberOfDilutedSharesOutstanding")
 
+# No listed company that can clear a market-cap floor has fewer than 10,000 shares
+# (Seaboard, among the fewest, has ~1m). A smaller value is a units error, and it must
+# go BEFORE it can serve as the weighted-average reference: McDonald's 2026 10-Q tags
+# its weighted averages as 709.9 / 711.1 (millions, filed as units), and as the
+# reference those rejected the correct 707.6m cover-page count as "implausible" and
+# priced a $200bn company at $220k.
+_MIN_SHARE_COUNT = 1e4
+# A count measured more than two years before the as-of date says nothing about today.
+# Visa's only undimensioned cover-page counts are from 2010 (it has tagged per share
+# class since), and "latest available" handed it a 16-year-old number. No count beats
+# a wrong one: a missing market cap is visible, a stale one looks like data.
+_SHARES_MAX_AGE_DAYS = 730
 
-def _plausible_share_counts(cands: list, tags: list[str]) -> list:
+
+def _plausible_share_counts(cands: list, tags: list[str], as_of=None) -> list:
     """Drop share-count candidates that contradict the weighted-average count.
 
     Called AFTER the staleness filter, never before: NextEra's weighted-average tags
     stop in 2019, before its 4-for-1 split, so an abandoned 482m reference rejected a
     current and correct 2,085m count and cut its market cap from $174bn to $40bn. A
-    reference that is itself stale is not a reference."""
+    reference that is itself stale is not a reference.
+
+    Two absolute guards run first and, unlike the band below, may leave nothing: a
+    count under `_MIN_SHARE_COUNT` (a units error) and, given `as_of`, a count
+    measured more than `_SHARES_MAX_AGE_DAYS` earlier."""
+    cands = [c for c in cands if c[1] >= _MIN_SHARE_COUNT]
+    if as_of is not None:
+        oldest = np.datetime64(pd.Timestamp(as_of), "D") - np.timedelta64(_SHARES_MAX_AGE_DAYS, "D")
+        cands = [c for c in cands if np.datetime64(pd.Timestamp(c[2]), "D") >= oldest]
+    if not cands:
+        return []
     ref = None
     for want in _WAVG_TAGS:
         for i, v, _ in cands:
@@ -569,7 +634,9 @@ def raw_asof_prepared(pf: PreparedFacts, as_of: date, price: float | None,
         cutoff = newest - np.timedelta64(_INSTANT_STALE_DAYS, "D")
         current = [c for c in cands if c[2] >= cutoff] or cands
         if positive_only:
-            current = _plausible_share_counts(current, tags)
+            current = _plausible_share_counts(current, tags, as_of=ts)
+            if not current:
+                return None
         return min(current, key=lambda c: c[0])[1]
 
     if not pf.flows and not pf.instants:
@@ -767,7 +834,9 @@ def raw_asof(sym_facts: pd.DataFrame, as_of: date, price: float | None,
         cutoff = newest - pd.Timedelta(days=_INSTANT_STALE_DAYS)
         current = [c for c in cands if c[2] >= cutoff] or cands
         if positive_only:
-            current = _plausible_share_counts(current, tags)
+            current = _plausible_share_counts(current, tags, as_of=ts)
+            if not current:
+                return None
         return min(current, key=lambda c: c[0])[1]
 
     rev, rev_prev = flow("totalRevenue"), flow("totalRevenue", prev=True)

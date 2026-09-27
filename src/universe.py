@@ -165,6 +165,19 @@ def sector_map(rows: list[dict[str, Any]] | None = None, store=None,
             for s in missing:
                 if m.get(s):
                     out[s] = m[s]
+    # A curated setup has no registrant table (it never downloads the bulk archives);
+    # `data_refresh` caches a per-name SIC lookup for exactly that case.
+    missing = [s for s in symbols if not out.get(s)]
+    if missing:
+        try:
+            sics = registrants.load_symbol_sics(store or HistoryStore())
+        except Exception:  # noqa: BLE001
+            sics = pd.DataFrame()
+        if not sics.empty:
+            m = dict(zip(sics["symbol"], sics["sector"]))
+            for s in missing:
+                if m.get(s) and m[s] != "Unknown":
+                    out[s] = m[s]
     return {s: out.get(s) or "Unknown" for s in symbols}
 
 

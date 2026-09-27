@@ -116,8 +116,20 @@ weeks. Every report carries its prompt version and model.
 ## Quick start
 
 ```powershell
-python -m venv .venv; .\.venv\Scripts\Activate.ps1
+python -m venv .venv; .\.venv\Scripts\Activate.ps1   # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
+python -m scripts.demo               # a working board in ~4 minutes, free data, no keys
+```
+
+The demo builds a sandboxed workspace (`./demo`) for ~35 US large caps — five years of
+prices and SEC filings — runs the quant screen and opens the dashboard on
+http://localhost:8502. No broker and no API key needed; Ollama is used for the news stage
+if it is running. `--research` adds LLM research on the top three with your configured
+provider.
+
+For your own setup:
+
+```powershell
 copy .env.example .env               # add your LLM credential and an SEC contact email
 python -m scripts.doctor             # tells you what is missing
 python -m pytest tests -q

@@ -195,6 +195,34 @@ def enrich(symbols: list[str], throttle: float = 0.4,
     return out
 
 
+def fill_missing_market_caps(metrics: dict[str, dict], max_names: int = 25,
+                             fetch=None) -> list[str]:
+    """Yahoo's live market cap for names the SEC store could not size. Returns them.
+
+    For a HAND-PICKED list only. Some filers publish no usable undimensioned share
+    count at all -- Visa has tagged its cover-page count per share class since 2010,
+    and companyfacts drops dimensioned facts -- so the store has no market cap, the
+    floor cannot be verified, and a name the user chose on purpose vanishes. The live
+    screen can ask Yahoo; the backtest never does (this is not point-in-time), and the
+    broad universe keeps failing such names because there the PIT floor is the point.
+
+    Bounded: more than `max_names` unsized names means the store is thin, which a
+    Yahoo loop would hide rather than fix."""
+    todo = [s for s, m in metrics.items()
+            if m.get("price") and not m.get("marketCap")]
+    if not todo or len(todo) > max_names:
+        return []
+    got = (fetch or fetch_many)(todo, use_cache=True, progress=False)
+    filled = []
+    for sym in todo:
+        cap = (got.get(sym) or {}).get("marketCap")
+        if cap and cap == cap and float(cap) > 0:
+            metrics[sym]["marketCap"] = float(cap)
+            metrics[sym]["marketCap_source"] = "yahoo"
+            filled.append(sym)
+    return filled
+
+
 def floor_thresholds() -> dict[str, float]:
     """The three config numbers the floor is made of, in one place."""
     floor = config.get("universe.liquidity_floor", {}) or {}

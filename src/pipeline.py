@@ -246,6 +246,14 @@ def run(mode: str = "deep") -> int:
         # two things SEC filings genuinely lack, for ~50 names instead of all of them.
         storage.set_progress(run_id, f"stage 1/4: fundamentals for {len(syms)} names")
         metrics_all = fundamentals.from_store(store, syms, date.today())
+        yahoo_sized: list[str] = []
+        if not broad:
+            try:
+                yahoo_sized = fundamentals.fill_missing_market_caps(metrics_all)
+            except Exception as exc:  # noqa: BLE001 - a fallback, never a reason to fail
+                _log(f"market-cap fallback failed: {exc}")
+            if yahoo_sized:
+                _log(f"no SEC share count, sized from Yahoo: {', '.join(yahoo_sized)}")
         metrics = {s: m for s, m in metrics_all.items() if fundamentals.passes_floor(m)}
         _log(f"passed liquidity floor: {len(metrics)}")
         n_snap = sum(1 for m in metrics_all.values() if not m.get("error"))
@@ -261,7 +269,9 @@ def run(mode: str = "deep") -> int:
                                         f"`scripts.data_refresh --facts-bulk --snapshots`")
         else:
             hz.ok("fundamentals", f"{len(metrics)}/{len(syms)} passed floor; "
-                                  f"SEC snapshot coverage {cov:.0%}")
+                                  f"SEC snapshot coverage {cov:.0%}"
+                                  + (f"; market cap from Yahoo for {len(yahoo_sized)} "
+                                     f"(no SEC share count)" if yahoo_sized else ""))
         storage.upsert_tickers([
             {"symbol": s, "name": m.get("name", s), "subsector": subs.get(s, ""),
              "sector": by_symbol.get(s, {}).get("sector") or secs.get(s),
@@ -480,6 +490,11 @@ def run(mode: str = "deep") -> int:
         if ib["connected"]:
             hz.ok("broker", f"IBKR connected; {len(ib['holdings'])} holdings, "
                             f"{len(ib['quotes'])} quotes")
+        elif not config.get("ibkr.enabled", True):
+            # Switched off on purpose (no broker, or the demo): nothing is missing that
+            # was expected, so this is not a degraded run — but it still says so.
+            hz.ok("broker", f"IBKR disabled in config — no holdings overlay; "
+                            f"{len(fresh)} quotes via yfinance")
         else:
             hz.degraded("broker", f"IBKR offline ({ib['note']}) — holdings from last "
                                   f"snapshot, {len(fresh)} quotes via yfinance fallback; "

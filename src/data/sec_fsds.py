@@ -355,6 +355,8 @@ def refresh_facts_bulk(store, symbols: list[str] | None = None,
         if symbols is not None and sym not in set(symbols):
             continue
         cik_to_symbol.setdefault(str(cik).zfill(10), sym)
+    for pcik, sym in SF.predecessor_ciks(symbols).items():
+        cik_to_symbol.setdefault(pcik, sym)
     keep_ciks = set(cik_to_symbol) if symbols is not None else None
 
     quarters = quarters_between(start_quarter, end_quarter)

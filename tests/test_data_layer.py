@@ -53,7 +53,7 @@ def facts():
         ("2023-12-31", 1000, "2024-02-25"), ("2024-09-30", 1200, "2024-11-07")])
     shares = [dict(r, unit="shares") for r in _inst("sharesOutstanding",
               "EntityCommonStockSharesOutstanding",
-              [("2024-02-15", 50, "2024-02-25"), ("2024-10-31", 52, "2024-11-07")])]
+              [("2024-02-15", 50e6, "2024-02-25"), ("2024-10-31", 52e6, "2024-11-07")])]
     df = pd.DataFrame(rev + ni + assets + shares)
     for c in ("start", "end", "filed"):
         df[c] = pd.to_datetime(df[c])
@@ -87,12 +87,12 @@ def test_point_in_time_never_uses_unfiled_facts(facts):
 def test_raw_asof_and_derive_end_to_end(facts):
     raw = sec_facts.raw_asof(facts, date(2024, 12, 15), price=20.0, ma50=19.0, ma200=18.0)
     assert raw["totalRevenue"] == 580 and raw["netIncome"] == 58
-    assert raw["sharesOutstanding"] == 52 and raw["marketCap"] == 20.0 * 52
+    assert raw["sharesOutstanding"] == 52e6 and raw["marketCap"] == 20.0 * 52e6
     assert raw["totalAssets"] == 1200
     assert abs(raw["revenueGrowth"] - (580 / 460 - 1)) < 1e-9
     m = derive(raw, as_of=date(2024, 12, 15))
-    assert abs(m["trailingPE"] - (20.0 * 52 / 58)) < 1e-9
-    assert abs(m["priceToSalesTrailing12Months"] - (20.0 * 52 / 580)) < 1e-9
+    assert abs(m["trailingPE"] - (20.0 * 52e6 / 58)) < 1e-9
+    assert abs(m["priceToSalesTrailing12Months"] - (20.0 * 52e6 / 580)) < 1e-9
     assert abs(m["returnOnAssets"] - 58 / 1200) < 1e-9
     assert abs(m["mom_50"] - 20 / 19) < 1e-9
     assert m["profitable"] is True
@@ -210,8 +210,8 @@ def test_shares_asof_never_sees_the_future(tmp_path, facts):
     store = HistoryStore(tmp_path / "hist")
     store.upsert_facts(facts)
     # the 2024-10-31 count was filed 2024-11-07: invisible the day before, served after
-    assert store.shares_asof(["TST"], date(2024, 11, 6)).loc["TST"] == 50
-    assert store.shares_asof(["TST"], date(2024, 11, 8)).loc["TST"] == 52
+    assert store.shares_asof(["TST"], date(2024, 11, 6)).loc["TST"] == 50e6
+    assert store.shares_asof(["TST"], date(2024, 11, 8)).loc["TST"] == 52e6
     assert store.shares_asof(["TST"], date(2024, 2, 1)).empty
     assert store.facts_quarters() == ["2023q2", "2023q3", "2023q4", "2024q1", "2024q2",
                                       "2024q3", "2024q4"]
@@ -440,6 +440,36 @@ def test_a_stale_weighted_average_is_not_used_as_the_plausibility_reference():
         _shares_row("WeightedAverageNumberOfSharesOutstandingBasic", "2019-09-30",
                     481.9e6, "2019-10-25"),
     ]) == 2.085e9
+
+
+def test_a_units_error_cannot_serve_as_the_plausibility_reference():
+    """McDonald's 2026 10-Q tags its weighted averages as 709.9 / 711.1 — millions,
+    filed as units. As the reference they rejected the correct 707.6m cover-page count
+    and a $200bn company was priced at $220k."""
+    assert _shares([
+        _shares_row("EntityCommonStockSharesOutstanding", "2026-06-30", 707_641_531,
+                    "2026-08-07"),
+        _shares_row("WeightedAverageNumberOfDilutedSharesOutstanding", "2026-06-30",
+                    711.1, "2026-08-07"),
+        _shares_row("WeightedAverageNumberOfSharesOutstandingBasic", "2026-06-30",
+                    709.9, "2026-08-07"),
+        _shares_row("CommonStockSharesIssued", "2025-12-31", 1.6606e9, "2026-02-20"),
+    ]) == 707_641_531
+
+
+def test_a_share_count_years_old_is_no_share_count(tmp_path):
+    """Visa's only undimensioned cover-page counts are from 2010 (it tags per share
+    class since). "Latest available" handed it a 16-year-old number; a missing count
+    is visible, a stale one looks like data. Both selection paths must agree."""
+    rows = [_shares_row("EntityCommonStockSharesOutstanding", "2010-01-27", 469.3e6,
+                        "2010-02-03")]
+    assert _shares(rows) is None
+    store = HistoryStore(tmp_path / "hist")
+    df = pd.DataFrame(rows + _quarters("totalRevenue", "Revenues", [1, 1, 1, 1]))
+    for c in ("start", "end", "filed"):
+        df[c] = pd.to_datetime(df[c])
+    store.upsert_facts(df)
+    assert "TST" not in store.shares_asof(["TST"], date(2026, 9, 10)).index
 
 
 def test_shares_asof_and_the_snapshot_path_agree_on_the_same_facts(tmp_path):

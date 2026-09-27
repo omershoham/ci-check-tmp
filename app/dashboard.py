@@ -836,7 +836,11 @@ with tab_board:
             st.rerun()
     st.caption("Tap a tile to filter the board · 🔬 = deep-researched by Claude")
     if not holdings:
-        st.info("IBKR not connected for this run — holdings/quotes overlay unavailable.")
+        if config.get("ibkr.enabled", True):
+            st.info("IBKR not connected for this run — holdings/quotes overlay unavailable.")
+        else:
+            st.caption("No broker configured (`ibkr.enabled: false`) — the board is the "
+                       "screen alone; the Portfolio tab needs IBKR.")
 
     q = st.session_state.get("quick", "all")
     if q == "buys":

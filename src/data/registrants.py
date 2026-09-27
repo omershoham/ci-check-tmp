@@ -72,6 +72,8 @@ _FUND_ONLY_FORMS = {"N-CSR", "N-CSRS", "N-Q", "24F-2NT", "N-30D", "NT-NCSR"}
 _REGISTRANTS = "registrants.parquet"
 _SUB_INDEX = "sub_index.parquet"
 _SUB_INDEX_META = "sub_index.json"
+_SYMBOL_SICS = "symbol_sics.parquet"
+_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 
 
 def _log_noop(msg: str) -> None:
@@ -278,6 +280,72 @@ def refresh_registrants(store, force_exchange: bool = False,
     df.to_parquet(path, index=False)
     store._touch_manifest("registrants", len(df), {"funnel": funnel})
     return {"rows": len(df), "funnel": funnel, "path": str(path)}
+
+
+def symbol_sics_path(store) -> Path:
+    return store.root / "universe" / _SYMBOL_SICS
+
+
+def load_symbol_sics(store) -> pd.DataFrame:
+    """symbol -> SIC, sector, industry group for names looked up one by one."""
+    path = symbol_sics_path(store)
+    if not path.exists():
+        return pd.DataFrame(columns=["symbol", "cik", "sic", "sector", "industry_group"])
+    return pd.read_parquet(path)
+
+
+def fetch_sic(cik: str, timeout: float = 15) -> str | None:
+    """A filer's SIC code from its SEC submissions JSON (None when unavailable)."""
+    try:
+        resp = requests.get(_SUBMISSIONS_URL.format(cik=str(cik).zfill(10)),
+                            headers=news._sec_headers(), timeout=timeout)
+        resp.raise_for_status()
+        sic = resp.json().get("sic")
+    except Exception:  # noqa: BLE001 - one unresolved name is not a failed refresh
+        return None
+    return (str(sic).strip() or None) if sic else None
+
+
+def refresh_symbol_sics(store, symbols: list[str], pause: float = 0.12,
+                        fetch: Callable[[str], str | None] | None = None,
+                        cikmap: dict[str, str] | None = None,
+                        log: Callable[[str], None] = _log_noop) -> dict[str, int]:
+    """SIC -> sector for a HAND-PICKED list, one submissions request per new name.
+
+    The registrant table is built from the bulk FSDS archives, which a curated setup
+    never downloads, so every curated name used to land in sector "Unknown" -- and
+    since valuation is ranked inside a sector, a whole board ranked its multiples as
+    one undifferentiated peer group. SIC is close to constant, so a name is fetched
+    once and cached; later refreshes only look up names that are new."""
+    import time
+    have = load_symbol_sics(store)
+    known = set(have["symbol"]) if not have.empty else set()
+    todo = [s.upper() for s in dict.fromkeys(symbols) if s.upper() not in known]
+    if not todo:
+        return {"fetched": 0, "cached": len(known), "unresolved": 0}
+    cikmap = cikmap if cikmap is not None else news._ticker_cik_map()
+    fetch = fetch or fetch_sic
+    rows, unresolved = [], []
+    for sym in todo:
+        cik = cikmap.get(sym)
+        sic = fetch(cik) if cik else None
+        if fetch is fetch_sic and cik:
+            time.sleep(pause)
+        if not sic:
+            unresolved.append(sym)
+            continue
+        rows.append({"symbol": sym, "cik": cik, "sic": sic})
+    if rows:
+        new = pd.DataFrame(rows)
+        cls = sic_sectors.classify_frame(new["sic"], symbols=new["symbol"])
+        new = pd.concat([new, cls], axis=1)
+        out = pd.concat([have, new], ignore_index=True) if not have.empty else new
+        path = symbol_sics_path(store)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        out.drop_duplicates("symbol", keep="last").to_parquet(path, index=False)
+    if unresolved:
+        log(f"  no SIC for: {unresolved}")
+    return {"fetched": len(rows), "cached": len(known), "unresolved": len(unresolved)}
 
 
 def load_registrants(store) -> pd.DataFrame:

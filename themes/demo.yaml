@@ -1,0 +1,42 @@
+# Demo theme pack — used by `python -m scripts.demo`.
+#
+# A small, recognizable cross-section of US large caps so a first run finishes in
+# minutes on free data. It is a DEMO universe: hand-picked, survivors only, and far
+# too small for the ranking statistics to mean much. The real default is the broad
+# SEC-registrant universe (see docs/SETUP.md).
+
+name: Demo Board
+description: >-
+  Thirty-odd well-known US large caps across sectors, for a quick first run.
+
+actors:
+  - large enterprise customers
+  - government and regulators
+  - major distribution partners
+
+prompt_fragments:
+  analyst_role: >-
+    an equity research analyst covering US large-cap equities
+  catalyst_emphasis: >-
+    Judge each catalyst on its own materiality to THIS company's revenue or
+    multiple; do not privilege any one sector's storyline.
+
+subsectors:
+  technology:
+    label: Technology
+    symbols: [AAPL, MSFT, NVDA, AVGO, ORCL, CRM, AMD, ADBE]
+  communication:
+    label: Communication
+    symbols: [GOOGL, META, NFLX, DIS]
+  consumer:
+    label: Consumer
+    symbols: [AMZN, TSLA, COST, WMT, HD, PG, KO, PEP, MCD]
+  financials:
+    label: Financials
+    symbols: [JPM, V, MA, GS]
+  healthcare:
+    label: Health Care
+    symbols: [LLY, UNH, JNJ, MRK, ABBV]
+  energy_industrials:
+    label: Energy & Industrials
+    symbols: [XOM, CVX, CAT, GE, BA]

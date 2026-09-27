@@ -622,7 +622,7 @@ class HistoryStore:
             cur = g[g["end"] >= newest - pd.Timedelta(days=SF._INSTANT_STALE_DAYS)]
             cands = [(i, float(v), e) for i, (v, e)
                      in enumerate(zip(cur["val"], cur["end"]))]
-            cands = SF._plausible_share_counts(cands, list(cur["tag"]))
+            cands = SF._plausible_share_counts(cands, list(cur["tag"]), as_of=ts)
             if cands:
                 out[sym] = min(cands, key=lambda c: c[0])[1]
         return pd.Series(out, dtype=float).rename("sharesOutstanding")
