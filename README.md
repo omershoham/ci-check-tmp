@@ -41,9 +41,16 @@ http://localhost:8502. It never touches your real workspace.
   configure (see [Bring your own model](#bring-your-own-model)).
 - `--reset` starts the demo over.
 
-<!-- TODO(docker): once the image is published, add a one-line alternative here, e.g.
-     docker run -p 8502:8502 <image>
-     Do not document it until the image exists. -->
+Or with Docker (the dashboard is then at http://localhost:8502):
+
+```bash
+docker build -t claude-trader .
+docker run --rm -it -p 8502:8502 -e SEC_CONTACT_EMAIL=you@example.com \
+    -v claude-trader-demo:/data claude-trader
+```
+
+Add `--skip-data` to re-run on the data already in the volume. Details:
+[docs/SETUP.md](docs/SETUP.md#docker).
 
 ## Why this exists
 
@@ -228,6 +235,7 @@ hour on the first run), the daily pipeline, the dashboard, backtests and configu
 - [docs/SETUP.md](docs/SETUP.md): install, data store, running, configuration
 - [docs/COMPARISON.md](docs/COMPARISON.md): detailed, sourced comparison with similar projects
 - [docs/SECURITY.md](docs/SECURITY.md): what never leaves your machine, and the leak check
+- [CONTRIBUTING.md](CONTRIBUTING.md): dev setup, research rules for new signals, theme packs, LLM providers
 - [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md): the plan and progress log
 - [docs/CODE_REVIEW_3.md](docs/CODE_REVIEW_3.md): architecture review
 
