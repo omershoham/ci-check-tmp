@@ -1,0 +1,55 @@
+# Keep secrets, personal data and machine-local state OUT of the build context.
+# Mirrors .gitignore's sensitive entries: anything not in git has no business in an
+# image either. Credentials are passed at run time with `docker run -e ...`.
+#
+# Unlike .gitignore, a bare pattern here matches at the context ROOT only, so anything
+# that can appear at any depth is written `**/...`. `data/` and `demo/` stay root-only
+# on purpose: `src/data/` is code.
+
+# Secrets (OAuth token, API keys, SEC contact address)
+**/.env
+**/.env.*
+!.env.example
+**/.preflight_denylist*
+
+# Databases (positions, research, P&L) incl. WAL/SHM sidecars
+**/*.db
+**/*.db-*
+**/*.sqlite*
+
+# Workspace state: data store, caches, digests (they name real holdings), demo workspace
+data/
+demo/
+
+# Run logs (can contain broker account numbers and holdings)
+logs/
+**/*.log
+**/*.err
+
+# Machine-local tooling and parked Windows shortcuts
+**/.claude/
+scripts/disabled_startup/
+**/*.lnk
+
+# Personal documents
+**/*.pdf
+
+# VCS, virtualenvs, caches, editor/OS noise
+.git/
+.venv/
+venv/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.egg-info/
+**/.pytest_cache/
+.vscode/
+.idea/
+**/.DS_Store
+**/Thumbs.db
+**/desktop.ini
+
+# The Docker files themselves
+Dockerfile
+.dockerignore
+docker-compose.yml

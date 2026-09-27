@@ -245,7 +245,11 @@ def run(mode: str = "deep") -> int:
         # the backtest consume two different data sources. `enrich()` below adds the
         # two things SEC filings genuinely lack, for ~50 names instead of all of them.
         storage.set_progress(run_id, f"stage 1/4: fundamentals for {len(syms)} names")
-        metrics_all = fundamentals.from_store(store, syms, date.today())
+        # Display names: the broad universe's registrant names are already local;
+        # curated names come from SEC's ticker file. Yahoo's wins for the shortlist.
+        metrics_all = fundamentals.from_store(
+            store, syms, date.today(),
+            names={r["symbol"]: r["name"] for r in uni if r.get("name")})
         yahoo_sized: list[str] = []
         if not broad:
             try:
@@ -272,12 +276,14 @@ def run(mode: str = "deep") -> int:
                                   f"SEC snapshot coverage {cov:.0%}"
                                   + (f"; market cap from Yahoo for {len(yahoo_sized)} "
                                      f"(no SEC share count)" if yahoo_sized else ""))
-        storage.upsert_tickers([
-            {"symbol": s, "name": m.get("name", s), "subsector": subs.get(s, ""),
-             "sector": by_symbol.get(s, {}).get("sector") or secs.get(s),
-             "industry_group": by_symbol.get(s, {}).get("industry_group")}
-            for s, m in metrics.items()
-        ])
+        def _ticker_rows(names_: list[str]) -> list[dict]:
+            return [{"symbol": s, "name": metrics[s].get("name", s),
+                     "subsector": subs.get(s, ""),
+                     "sector": by_symbol.get(s, {}).get("sector") or secs.get(s),
+                     "industry_group": by_symbol.get(s, {}).get("industry_group")}
+                    for s in names_ if s in metrics]
+
+        storage.upsert_tickers(_ticker_rows(list(metrics)))
 
         # Technical pillar for all passed-floor names (batch price-history download).
         # Light mode recomputes fresh (use_cache=False): its whole purpose is a price/
@@ -361,6 +367,10 @@ def run(mode: str = "deep") -> int:
         for sym, extra in enriched.items():
             if sym in metrics:
                 metrics[sym].update({k: v for k, v in extra.items() if k != "error"})
+        # The board reads names from the tickers table, written above BEFORE `.info`
+        # ran: without this re-write Yahoo's name never reached the board at all.
+        storage.upsert_tickers(_ticker_rows([s for s, e in enriched.items()
+                                             if e.get("name")]))
         if enrich_syms and n_enr_err > 0.2 * len(enrich_syms):
             hz.degraded("fundamentals", f"{n_enr_err}/{len(enrich_syms)} `.info` "
                                         f"enrichment calls failed (Yahoo throttling?) — "

@@ -103,8 +103,30 @@ def fetch_many(symbols: list[str], throttle: float = 0.4,
     return out
 
 
+def display_names(symbols: list[str],
+                  known: dict[str, str] | None = None) -> dict[str, str]:
+    """symbol -> presentable company name, with no per-name network call.
+
+    `known` (e.g. the broad universe's registrant names, already local) wins; the rest
+    come from SEC's ticker file (`news._ticker_name_map`, one cached request a day).
+    A name neither knows is simply absent - the caller falls back to the ticker.
+    Yahoo's `.info` name, where `enrich()` reaches, is merged over this later."""
+    from . import news
+    out = {s: news.display_name(str(known[s])) for s in symbols
+           if known and known.get(s)}
+    if len(out) < len(symbols):
+        try:
+            sec = news._ticker_name_map()
+        except Exception:  # noqa: BLE001 - a display name is never a reason to fail
+            sec = {}
+        out.update({s: sec[s.upper()] for s in symbols
+                    if s not in out and sec.get(s.upper())})
+    return {s: n for s, n in out.items() if n}
+
+
 def from_store(store, symbols: list[str], as_of: date | None = None,
-               extra: dict[str, dict] | None = None) -> dict[str, dict]:
+               extra: dict[str, dict] | None = None,
+               names: dict[str, str] | None = None) -> dict[str, dict]:
     """The screen's metrics for `symbols`, read from the point-in-time SEC store.
 
     THIS REPLACES `fetch_many` AS THE SCREEN'S INPUT. The old stage 1 made one
@@ -117,6 +139,8 @@ def from_store(store, symbols: list[str], as_of: date | None = None,
     snapshot (price x as-filed shares), the next earnings date from filing cadence
     (`sec_facts.next_earnings_estimate`). `extra` overrides per symbol - that is how
     `enrich()`'s forward P/E and exact earnings timestamp get in for the shortlist.
+    `name` is the SEC registrant name (`display_names`, seeded with `names`), so the
+    board shows a company rather than its ticker for names `enrich()` never reaches.
 
     Always returns one dict per symbol; a name the store cannot serve comes back with
     `error` set, so the floor drops it instead of it vanishing without a trace."""
@@ -131,9 +155,10 @@ def from_store(store, symbols: list[str], as_of: date | None = None,
         earn = pd.Series(dtype="datetime64[ns]")
     snap_rows = snap.to_dict("index") if not snap.empty else {}
     liq_rows = liq.to_dict("index") if not liq.empty else {}
+    label = display_names(symbols, names)
     out: dict[str, dict] = {}
     for sym in symbols:
-        m: dict[str, Any] = {"symbol": sym, "name": sym}
+        m: dict[str, Any] = {"symbol": sym, "name": label.get(sym, sym)}
         row = snap_rows.get(sym)
         if row:
             m.update({k: (None if v != v else v) for k, v in row.items()

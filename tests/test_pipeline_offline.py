@@ -20,7 +20,7 @@ SYMS = ["NVDA", "AMD", "AVGO", "TSM", "VRT", "ANET", "GOOGL", "AMZN", "MSFT", "C
         "IREN", "META"]
 
 
-def _fake_metrics(store, symbols, as_of=None, extra=None):
+def _fake_metrics(store, symbols, as_of=None, extra=None, names=None):
     """Stands in for the SEC-store read that stage 1 now does. Names outside the test
     set come back with `error`, i.e. "no snapshot" — which is what drives the
     fundamentals stage to DEGRADED on coverage."""
@@ -193,6 +193,17 @@ def test_light_run_skips_research(offline, storage):
     assert len(storage.get_board(rid)) == len(SYMS)
 
 
+def test_yahoos_name_reaches_the_board(offline, storage, monkeypatch):
+    """The tickers table the board reads was written BEFORE `.info` enrichment, so even
+    a shortlisted name showed its ticker; the enriched name must now land there."""
+    monkeypatch.setattr(fundamentals, "enrich", lambda syms, **k: {
+        s: ({"name": "NVIDIA Corporation"} if s == "NVDA" else {}) for s in syms})
+    rid = pipeline.run("light")
+    names = {r["symbol"]: r["name"] for r in storage.get_board(rid)}
+    assert names["NVDA"] == "NVIDIA Corporation"
+    assert names["AMD"] == "AMD"                  # un-enriched: the store's name stands
+
+
 def test_deep_run_arms_candidate_triggers_and_a_later_run_fires_them(offline, storage,
                                                                      monkeypatch):
     """Phase 8's gate: a researched name you do NOT own gets an armed level, is labelled
@@ -223,7 +234,7 @@ def test_deep_run_arms_candidate_triggers_and_a_later_run_fires_them(offline, st
 
     # A second run with the tape 40 points lower: the level trips and the board says so.
     monkeypatch.setattr(fundamentals, "from_store",
-                        lambda store, symbols, as_of=None, extra=None: {
+                        lambda store, symbols, as_of=None, extra=None, names=None: {
                             s: {**v, "price": (v.get("price") or 100.0) - 40.0}
                             for s, v in _fake_metrics(store, symbols).items()})
     rid2 = pipeline.run("light")

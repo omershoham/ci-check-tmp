@@ -59,6 +59,47 @@ Everything lives in `./demo` (its own `config.yaml`, database and data store); y
 workspace is never touched. Set `SEC_CONTACT_EMAIL` first if you can — SEC throttles
 anonymous callers.
 
+On a headless machine add `--no-browser`, and `--host 0.0.0.0` to serve the dashboard to
+other machines (the default, `127.0.0.1`, is this machine only).
+
+## Docker
+
+The image runs the same demo — no Python install, nothing written outside a Docker volume:
+
+```bash
+docker build -t claude-trader .
+docker run --rm -it -p 8502:8502 -e SEC_CONTACT_EMAIL=you@example.com \
+    -v claude-trader-demo:/data claude-trader
+# then open http://localhost:8502   (Ctrl+C, or `docker stop`, to quit)
+```
+
+- `SEC_CONTACT_EMAIL` is required in practice: SEC refuses requests whose User-Agent has
+  no contact address, and the data store is built from SEC filings. Use your own address;
+  nothing is baked into the image.
+- The workspace (config, database, data store) lives in the `claude-trader-demo` volume
+  at `/data`. Re-run the pipeline on the existing data, or start over:
+
+  ```bash
+  docker run --rm -it -p 8502:8502 -e SEC_CONTACT_EMAIL=you@example.com \
+      -v claude-trader-demo:/data claude-trader --skip-data
+  docker run --rm -it -p 8502:8502 -e SEC_CONTACT_EMAIL=you@example.com \
+      -v claude-trader-demo:/data claude-trader --reset
+  docker run --rm claude-trader --help          # every demo option
+  ```
+
+- Anything after the image name is passed to `scripts.demo`; the image already supplies
+  `--home /data --host 0.0.0.0 --no-browser`. Port 8502 busy on the host? Map another
+  one: `-p 8600:8502`, then open http://localhost:8600.
+- Prefer a named volume as above. A bind mount (`-v "$PWD/demo-data:/data"`) works too,
+  but the container runs as a non-root user (uid 10001), so the host directory must be
+  writable by that uid.
+- The container is the free light pass: no Ollama (the news pillar is neutral and the
+  run's health says so), no broker, and no `--research` — the default `claude_cli`
+  provider needs the Claude Code CLI, which the image does not include.
+- The build context excludes `.env*` (except `.env.example`), `data/`, `demo/`, logs,
+  databases and other local state (see `.dockerignore`), so building from your real
+  checkout does not copy secrets or holdings into the image.
+
 ## Build the point-in-time data store
 
 The broad universe (the default, `universe.source: broad`) is built from SEC filings. Run

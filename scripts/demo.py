@@ -4,6 +4,8 @@
     python -m scripts.demo --research      # also run LLM research on the top 3 (uses your llm.provider)
     python -m scripts.demo --reset         # wipe the demo workspace first
     python -m scripts.demo --no-dashboard  # build + run only
+    python -m scripts.demo --host 0.0.0.0 --no-browser   # serve to other machines
+                                           # (what the Docker image runs)
 
 What it does:
   1. creates an isolated workspace (./demo by default, or --home) with its own
@@ -91,10 +93,15 @@ def main() -> None:
     ap.add_argument("--home", default=str(DEFAULT_HOME), help="demo workspace directory")
     ap.add_argument("--research", action="store_true",
                     help="also run LLM research on the top finalists (uses llm.provider)")
-    ap.add_argument("--reset", action="store_true", help="delete the demo workspace first")
+    ap.add_argument("--reset", action="store_true", help="empty the demo workspace first")
     ap.add_argument("--no-dashboard", action="store_true", help="don't launch the dashboard")
     ap.add_argument("--skip-data", action="store_true",
                     help="reuse the existing demo data store (re-run the pipeline only)")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="address the dashboard binds to (default 127.0.0.1, this machine "
+                         "only; 0.0.0.0 serves every interface, e.g. inside a container)")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="don't open a browser tab (headless machines, containers)")
     args = ap.parse_args()
 
     home = Path(args.home).expanduser().resolve()
@@ -102,9 +109,17 @@ def main() -> None:
         raise SystemExit("[demo] --home must not be the repo root (that is your real workspace)")
     if args.reset and home.exists():
         _say(f"resetting {home}")
-        shutil.rmtree(home)
+        # Empty it rather than delete it: a container's /data is a mount point, which
+        # cannot itself be removed.
+        for child in home.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
     home.mkdir(parents=True, exist_ok=True)
 
+    # A refused local connection returns at once, so this is harmless where Ollama
+    # cannot exist (a container): the news pillar is then neutral and health says so.
     use_ollama = _port_open("127.0.0.1", 11434)
     (home / "config.yaml").write_text(demo_config(args.research, use_ollama), encoding="utf-8")
     env = {**os.environ, "CLAUDE_TRADER_HOME": str(home), "PYTHONIOENCODING": "utf-8",
@@ -144,10 +159,10 @@ def main() -> None:
         return
     _say(f"opening the dashboard at http://localhost:{PORT}  (Ctrl+C to stop)")
     cmd = [sys.executable, "-m", "streamlit", "run", str(ROOT / "app" / "dashboard.py"),
-           "--server.port", str(PORT), "--server.address", "127.0.0.1",
+           "--server.port", str(PORT), "--server.address", args.host,
            "--server.headless", "true", "--browser.gatherUsageStats", "false"]
     proc = subprocess.Popen(cmd, cwd=ROOT, env=env)
-    for _ in range(60):
+    for _ in range(0 if args.no_browser else 60):
         if _port_open("127.0.0.1", PORT):
             webbrowser.open(f"http://localhost:{PORT}")
             break

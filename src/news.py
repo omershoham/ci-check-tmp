@@ -62,6 +62,20 @@ def google_news(query: str, limit: int = 8) -> list[dict[str, Any]]:
 
 
 @lru_cache(maxsize=1)
+def _company_tickers() -> dict[str, dict]:
+    """SEC's company_tickers.json ({"0": {"cik_str", "ticker", "title"}, ...}), fetched
+    at most once per process; {} on failure. The two maps below each keep their own
+    daily cache file, so on a warm day this is never called at all."""
+    try:
+        resp = requests.get("https://www.sec.gov/files/company_tickers.json",
+                            headers=_sec_headers(), timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+@lru_cache(maxsize=1)
 def _ticker_cik_map() -> dict[str, str]:
     """Ticker -> zero-padded CIK, cached for the day (and memoised per process).
 
@@ -73,15 +87,78 @@ def _ticker_cik_map() -> dict[str, str]:
             return json.loads(cf.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             pass
-    try:
-        resp = requests.get("https://www.sec.gov/files/company_tickers.json",
-                            headers=_sec_headers(), timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:  # noqa: BLE001
+    data = _company_tickers()
+    if not data:
         return {}
     mapping = {row["ticker"].upper(): f"{int(row['cik_str']):010d}"
                for row in data.values()}
+    try:
+        cf.write_text(json.dumps(mapping), encoding="utf-8")
+    except OSError:
+        pass
+    return mapping
+
+
+# Corporate suffixes and short joining words: capitalised/lower-cased rather than kept
+# as acronyms by `display_name`'s "three letters or fewer is an acronym" rule.
+_NAME_WORDS = {"INC": "Inc", "CO": "Co", "LTD": "Ltd", "PLC": "plc", "LLC": "LLC",
+               "LP": "LP", "NV": "NV", "SA": "SA", "AG": "AG", "SE": "SE",
+               "OF": "of", "AND": "and", "THE": "the", "FOR": "for", "ON": "on"}
+
+
+def display_name(title: str) -> str:
+    """An SEC registrant title made presentable: "COSTCO WHOLESALE CORP /NEW" ->
+    "Costco Wholesale Corp". Mixed-case words ("Apple", "AbbVie") are the filer's own
+    spelling and kept; all-caps words are capitalised, except the ones that are almost
+    always acronyms: two letters or none of them vowels (GE, CVS), or carrying digits
+    or symbols (3M, AT&T). Imperfect by design - Yahoo's name wins where it exists."""
+    import re
+    t = re.sub(r"\s+/[A-Z]{2,4}/?\s*$", "", (title or "").strip())  # "/DE/", "/NEW"
+    words = []
+    for i, w in enumerate(t.split()):
+        core = w.strip(".,")
+        if core != core.upper():
+            words.append(w)
+        elif core in _NAME_WORDS:
+            new = _NAME_WORDS[core]
+            new = new[0].upper() + new[1:] if i == 0 else new
+            words.append(w.replace(core, new))
+        elif (len(core) <= 2 or not set(core) & set("AEIOU")
+              or not core.replace("-", "").replace(".", "").isalpha()):
+            words.append(w)
+        else:
+            words.append("-".join(p.capitalize() for p in w.split("-")))
+    return " ".join(words)
+
+
+@lru_cache(maxsize=1)
+def _ticker_name_map() -> dict[str, str]:
+    """Ticker -> presentable company name from SEC's ticker file, cached for the day.
+
+    The board's fallback display name for every name Yahoo's `.info` never reaches
+    (all but the shortlist). Names change rarely, so offline the newest cached copy of
+    ANY date is used before giving up; {} only when there has never been one."""
+    cache = config.cache_dir()
+    cf = cache / f"sec_ticker_names_{date.today().isoformat()}.json"
+    if cf.exists():
+        try:
+            return json.loads(cf.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    data = _company_tickers()
+    if not data:
+        for old in sorted(cache.glob("sec_ticker_names_*.json"), reverse=True):
+            try:
+                return json.loads(old.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+        return {}
+    mapping: dict[str, str] = {}
+    for row in data.values():
+        tk = str(row.get("ticker") or "").upper()
+        # The file lists a company's primary ticker first; keep that row's title.
+        if tk and tk not in mapping and row.get("title"):
+            mapping[tk] = display_name(str(row["title"]))
     try:
         cf.write_text(json.dumps(mapping), encoding="utf-8")
     except OSError:
