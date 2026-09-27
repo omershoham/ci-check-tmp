@@ -74,3 +74,16 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests -q
+
+  docker:
+    name: docker (build + smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      # The demo image is documented in the README; build it and run its CLI so a broken
+      # Dockerfile fails here instead of on a first-time user's machine. No data is fetched.
+      - run: docker build -t claude-trader-ci .
+      - run: docker run --rm claude-trader-ci --help
+      - name: Imports resolve inside the image
+        run: docker run --rm --entrypoint python claude-trader-ci -c "import src.pipeline, src.data.history_store, lightgbm, streamlit; print('ok')"
