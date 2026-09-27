@@ -67,3 +67,6 @@ desktop.ini
 
 # Demo workspace created by `python -m scripts.demo` (its own DB and data store)
 demo/
+
+# Agent worktrees (Claude Code) - nested checkouts, never part of the repo
+.claude/worktrees/
